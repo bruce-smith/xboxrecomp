@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import config
 from .engine import DisasmEngine, Instruction
-from .loader import BinaryImage, SectionInfo
+from .loader import BinaryImage, SectionInfo, DATA_SECTION_NAMES
 from .xrefs import XRefTracker
 from .labels import LabelManager, Label, LabelType
 
@@ -700,6 +700,19 @@ class FunctionDetector:
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
+            # Only the conventional data sections hold pointer tables -- a
+            # vtable, a callback array. Every other section is either library
+            # code or a resource blob (models, textures, environment data), and
+            # a dword inside one of those is not a function address; it merely
+            # happens to fall inside the code VA range. Scanning them is not
+            # free: Blinx 2's MDL*/M*/G* sections produced 14,549 such "hits",
+            # each becoming a callable alias whose body starts mid-function and
+            # so cannot rebuild the frame its prologue never pushed. That alias
+            # then ran with a garbage this/esi and crashed in the destructor it
+            # reached. Half-Life 2's 4,892 real ones live in .rdata/.data, which
+            # this still covers.
+            if sec.name not in DATA_SECTION_NAMES:
+                continue
             data = self.image.get_section_data(sec)
             if not data:
                 continue
