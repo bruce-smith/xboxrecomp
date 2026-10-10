@@ -1105,6 +1105,11 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
+/* The runtime's private region and main-stack size; see xbox_memory_layout.h.
+ * Moved above the image by xbox_MemoryLayoutInit when the image reaches it. */
+uint32_t g_xbox_rt_base    = XBOX_RT_DEFAULT_BASE;
+uint32_t g_xbox_stack_size = 8 * 1024 * 1024;
+
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
  * big the block is, and how big the per-thread structure slot 0 points
@@ -2120,7 +2125,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Initialize the Xbox stack for recompiled code.
      * The stack area lives at XBOX_STACK_BASE in Xbox address space.
      * g_esp is the global stack pointer shared by all translated functions.
+     *
+     * First, keep the runtime's region off the image (xbox_memory_layout.h):
+     * if the image's end (base + SizeOfImage, which is what the Xbox loader
+     * reserves) reaches the default region, move the region to the first
+     * 64 KB boundary above it.
      */
+    if (xbe_size >= 0x110) {
+        uint32_t img_base = *(const uint32_t *)(xbe + 0x104);
+        uint32_t img_size = *(const uint32_t *)(xbe + 0x10C);
+        uint32_t img_end  = img_base + img_size;
+
+        if (img_end > XBOX_RT_DEFAULT_BASE) {
+            g_xbox_rt_base    = (img_end + 0xFFFFu) & ~0xFFFFu;
+            g_xbox_stack_size = 1024 * 1024;
+            fprintf(stderr, "  Image ends at 0x%08X, past 0x%08X: runtime "
+                    "region moved to 0x%08X (stack %u KB, heap from 0x%08X)\n",
+                    img_end, XBOX_RT_DEFAULT_BASE, g_xbox_rt_base,
+                    XBOX_STACK_SIZE / 1024, XBOX_HEAP_BASE);
+        }
+    }
+
     g_esp = XBOX_STACK_TOP;
     fprintf(stderr, "  Stack: %u KB at Xbox VA 0x%08X (ESP = 0x%08X)\n",
             XBOX_STACK_SIZE / 1024, XBOX_STACK_BASE, g_esp);
@@ -2164,7 +2189,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
+        #define FAKE_PRCB_VA XBOX_RT_VA(0x00761000u)  /* zeroed KPCR Prcb stand-in */
         memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
         MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
         #undef FAKE_PRCB_VA
@@ -2175,8 +2200,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * to its data area. We allocate a fake structure at 0x00760000
          * (in the BSS area) and a data buffer at 0x00700000.
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        #define FAKE_TLS_VA     XBOX_RT_VA(0x00760000u)  /* Fake TLS structure */
+        #define FAKE_RWDATA_VA  XBOX_RT_VA(0x00700000u)  /* RW engine data area */
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
@@ -2210,8 +2235,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        #define FAKE_TLS_BLOCK_VA  XBOX_RT_VA(0x00770000u)  /* image TLS data */
+        #define FAKE_TLS_THREAD_VA XBOX_RT_VA(0x00770200u)  /* what slot 0 points at */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2840,7 +2865,7 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+static uint32_t g_heap_next;   /* 0 until first use: XBOX_HEAP_BASE is set at load */
 
 static int g_heap_alloc_count = 0;
 
@@ -3273,6 +3298,8 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     }
 
     /* Align the next pointer */
+    if (!g_heap_next)
+        g_heap_next = XBOX_HEAP_BASE;
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {

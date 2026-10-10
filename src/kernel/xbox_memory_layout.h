@@ -237,7 +237,7 @@ void xbox_WatchInit(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+#define XBOX_KERNEL_DATA_BASE   XBOX_RT_VA(0x00740000u)
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -322,7 +322,30 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+/* The runtime's private region: the fake KTHREAD/PRCB/TLS blocks, the
+ * kernel data exports, then the main stack, then the heap. They used to sit
+ * at fixed VAs from 0x00700000 up, which is only safe while the image ends
+ * below that. Blinx 2's image runs to 0x0303AC20 (12 MB of .data BSS alone
+ * ends at 0x0103DB40), so the main stack, the TLS block and every heap
+ * allocation (the CRT heap included) landed on the game's own BSS and model
+ * sections. Heap blocks are zero-filled on allocation, so each one wiped
+ * whatever game data it overlapped, and the stack and the CRT heap traded
+ * writes. That surfaced as a main-thread esp inside the CRT heap and a
+ * zeroed TLS pointer, faulting in XAPI SetLastError.
+ *
+ * Now the region moves above the image when the image reaches it; every
+ * address keeps its offset from g_xbox_rt_base. For an image that ends below
+ * 0x00700000 nothing changes. XBOX_RT_VA() maps a historical address into the
+ * current region. */
+#define XBOX_RT_DEFAULT_BASE 0x00700000u
+extern uint32_t g_xbox_rt_base;
+#define XBOX_RT_VA(va)      (g_xbox_rt_base + ((uint32_t)(va) - XBOX_RT_DEFAULT_BASE))
+
+/* 8 MB by default. When the region is relocated it shrinks to 1 MB -- still
+ * 16x the 64 KB the XBE asks for its main thread (PE stack commit) -- so the
+ * heap keeps the RAM a big image leaves over. */
+extern uint32_t g_xbox_stack_size;
+#define XBOX_STACK_SIZE     g_xbox_stack_size
 
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.
@@ -360,7 +383,7 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     0x00780000
+#define XBOX_STACK_BASE     XBOX_RT_VA(0x00780000u)
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
