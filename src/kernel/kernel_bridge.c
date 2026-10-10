@@ -514,7 +514,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  int suspended)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -522,7 +523,13 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    /* CreateSuspended maps onto a suspended host thread; the title's
+     * NtResumeThread on the handle token releases it. Starting it anyway broke
+     * Blinx 2: its audio init creates three threads suspended and stores each
+     * handle only after CreateThread returns, so the audio thread ran early,
+     * self-suspended on a handle that was still 0, and spun on the failure. */
+    th = CreateThread(NULL, 0, bridge_thread_main, s,
+                      suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -551,6 +558,7 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t xbox_handle_ptr = STACK_ARG(0);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
+    int      create_suspended = (STACK_ARG(7) & 0xFF) != 0;   /* BOOLEAN */
     uint32_t start_routine   = STACK_ARG(9);
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
@@ -558,8 +566,9 @@ static void bridge_PsCreateSystemThreadEx(void)
                         && (g_thread_call_count == 0);
     g_thread_call_count++;
 
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            g_thread_call_count, start_routine, start_context1, start_context2);
+    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X%s\n",
+            g_thread_call_count, start_routine, start_context1, start_context2,
+            create_suspended ? " (suspended)" : "");
     fflush(stderr);
 
     /* Write a fake handle to the output pointer */
@@ -633,7 +642,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    create_suspended);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -7819,7 +7829,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, 0);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
