@@ -1853,6 +1853,20 @@ static void bridge_KeBugCheckEx(void)
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
 static void bridge_NtYieldExecution(void)
 {
+    /* RECOMP_YIELD_TRACE=1 names the first 8 yield call sites (spin hunting). */
+    static unsigned dbg_yield_n;
+    static int dbg_yield_on = -1;
+    if (dbg_yield_on < 0) {
+        const char *e = getenv("RECOMP_YIELD_TRACE");
+        dbg_yield_on = e && *e == '1';
+    }
+    if (dbg_yield_on && dbg_yield_n < 8) {
+        fprintf(stderr, "  [YIELD] guest retaddr=0x%08X esp=0x%08X "
+                        "(caller of xbox_NtYieldExecution)\n",
+                (unsigned)BRIDGE_MEM32(g_esp), g_esp);
+        fflush(stderr);
+        dbg_yield_n++;
+    }
     g_eax = (uint32_t)xbox_NtYieldExecution();
 }
 
