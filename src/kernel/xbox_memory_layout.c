@@ -1967,7 +1967,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         int sections_short = 0;
         size_t total_bytes = 0;
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
+        /* Sanity cap against a corrupt header only; the loop below is also
+         * bounded by the file size. This used to be 64, which a real title
+         * exceeds: Blinx 2 has 73 sections, and the last 9 (MDLYP, MDLTT,
+         * MDLKF, MSHIP, MDLBEN, COMTNK, MDLTNK, MOTP0, $$XTIMAGE --
+         * 0x02C68D60..0x0303AC20, ~4 MB of models and motions) were never
+         * loaded, so the game read zeros where its stage data should be. */
+        if (num_sections > 1024) num_sections = 1024;
 
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
