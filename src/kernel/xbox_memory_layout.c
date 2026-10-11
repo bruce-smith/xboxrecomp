@@ -3282,6 +3282,14 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 
 int xbox_ContiguousOwnsPhys(uint32_t phys)
 {
+    /* Physical page 0 as well. The kernel keeps it out of every allocator
+     * and XAPI's USB stack carves its pool from it by hand (base
+     * 0x80001000 minus what is left), so XInput handles and their report
+     * buffers live at 0x80000xxx -- physical 0x0xxx. The arena used to start
+     * at 0x1000 and the old "below the high-water mark" test covered the page
+     * by accident; with the arena above the image it has to be said. */
+    if (phys && phys < 0x1000u)
+        return 1;
     return phys >= g_contig_lo && phys < g_contig_next - XBOX_CONTIG_BASE;
 }
 

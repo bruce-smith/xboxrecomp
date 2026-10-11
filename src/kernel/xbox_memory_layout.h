@@ -93,7 +93,8 @@ void xbox_SetMapSize(size_t bytes);
 void xbox_SetContigLayout(uint32_t bytes, int above_image);
 
 /* Whether a physical address lies in the range the contiguous arena has
- * handed out: [arena start, high-water). Device models resolving a bus
+ * handed out: [arena start, high-water), plus physical page 0, which XAPI's
+ * USB stack uses as its own pool. Device models resolving a bus
  * address use this to decide it lives in the contiguous window. */
 int xbox_ContiguousOwnsPhys(uint32_t phys);
 
