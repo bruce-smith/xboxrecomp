@@ -2292,18 +2292,32 @@ static int kernel_raise_interrupt(uint32_t vector)
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static LARGE_INTEGER freq;
+    static long long next, period;
+    LARGE_INTEGER now;
 
-    if (enabled < 0)
+    if (enabled < 0) {
         enabled = getenv("RECOMP_VBLANK") != NULL;
+        QueryPerformanceFrequency(&freq);
+        period = freq.QuadPart / 60;
+    }
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    /* A fixed 60 Hz cadence on the performance counter. This used to be
+     * "next = now + 16" on GetTickCount64: the timer thread wakes every
+     * ~15.6 ms (Sleep(10) at the default timer resolution) and the tick
+     * counter moves in 15.6 ms steps, so 16 ms after a tick always meant two
+     * ticks later -- 32 Hz, and a title that waits for two vblanks a frame
+     * (Blinx 2) ran at half speed. Advancing the deadline by the period keeps
+     * the average at 60 even though each wake is a little late; a long stall
+     * resynchronises instead of firing a burst. */
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < next)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    next += period;
+    if (now.QuadPart - next > 4 * period)
+        next = now.QuadPart + period;
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
