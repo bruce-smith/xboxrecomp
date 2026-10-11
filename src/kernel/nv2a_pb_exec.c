@@ -326,6 +326,10 @@ static struct {
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
+    /* Face culling: CULL_FACE_ENABLE, CULL_FACE (0x404 front, 0x405 back,
+     * 0x408 both), FRONT_FACE (0x900 CW, 0x901 CCW). */
+    uint32_t cull_enable, cull_face, front_face;
+    uint32_t tris_culled;
     uint32_t zeta_offset, zstencil_clear;
 } s_gpu;
 
@@ -2119,6 +2123,30 @@ static void xfq_end(void)
     s_xfq.on = 0;
 }
 
+/* Back-face culling, on the screen-space signed area (y down, so a
+ * clockwise triangle on screen has area > 0). It was ignored, so every
+ * back face was drawn as well: wasted fill on closed meshes and, where a
+ * back face lies on or just under a front one, a z-fight.
+ * RECOMP_NO_CULL=1 turns it off for A/B comparisons. */
+static int cull_triangle(float area)
+{
+    static int no_cull = -1;
+    int cw = area > 0.0f, front;
+
+    if (no_cull < 0)
+        no_cull = getenv("RECOMP_NO_CULL") != NULL;
+    if (!s_gpu.cull_enable || no_cull)
+        return 0;
+    front = s_gpu.front_face == 0x901 ? !cw : cw;
+    switch (s_gpu.cull_face) {
+    case 0x404: if (!front) return 0; break;      /* FRONT */
+    case 0x408: break;                            /* FRONT_AND_BACK */
+    default:    if (front) return 0; break;       /* BACK */
+    }
+    s_gpu.tris_culled++;
+    return 1;
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2153,6 +2181,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         s_gpu.xf_degenerate++;
         return;
     }
+    if (cull_triangle(area))
+        return;
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
@@ -2399,8 +2429,13 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
+        /* Every other strip triangle is listed in the opposite order; swap
+         * it back so all of them share the strip's winding (culling). */
         for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            if (i & 1)
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3329,6 +3364,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
+    case 0x0308: s_gpu.cull_enable = param; break;/* CULL_FACE_ENABLE */
+    case 0x039C: s_gpu.cull_face = param; break;  /* CULL_FACE */
+    case 0x03A0: s_gpu.front_face = param; break; /* FRONT_FACE */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
@@ -3610,8 +3648,9 @@ void nv2a_pb_exec_report(void)
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
-                    " %u triangles dropped behind the eye\n",
-            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+                    " %u triangles dropped behind the eye, %u culled\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind,
+            s_gpu.tris_culled);
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
