@@ -21,12 +21,25 @@
 enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
        R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15 };
 
+/* x / 255.0f for every byte, built on first use. The executor unpacks every
+ * texel it samples, and four float divides per texel were ~14% of the NV2A
+ * worker thread in Blinx 2's hub. Same values as the division, bit for bit.
+ * Racing initialisers all write identical values, so no lock is needed. */
+static float s_unorm8[256];
+static volatile int s_unorm8_ready;
+
 void nv2a_rc_unpack(uint32_t c, float o[4])
 {
-    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
-    o[2] = (float)( c        & 0xFF) / 255.0f;
-    o[3] = (float)( c >> 24        ) / 255.0f;
+    if (!s_unorm8_ready) {
+        int i;
+        for (i = 0; i < 256; i++)
+            s_unorm8[i] = (float)i / 255.0f;
+        s_unorm8_ready = 1;
+    }
+    o[0] = s_unorm8[(c >> 16) & 0xFF];
+    o[1] = s_unorm8[(c >>  8) & 0xFF];
+    o[2] = s_unorm8[ c        & 0xFF];
+    o[3] = s_unorm8[ c >> 24        ];
 }
 
 /* D3DCOLOR to floats, memoised: a program's constants are the same for

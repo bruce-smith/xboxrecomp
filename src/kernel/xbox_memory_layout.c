@@ -170,6 +170,11 @@ static size_t xbox_TiledApertureSize(void)
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
+void *xbox_Nv2aWorkerThread(void)
+{
+    return g_nv2a_ack_thread;
+}
+
 /*
  * NV2A busy-bit acknowledgement.
  *

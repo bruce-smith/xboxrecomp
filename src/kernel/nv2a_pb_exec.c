@@ -1909,9 +1909,28 @@ static struct {
     int n;                                  /* threads incl. the caller */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
     volatile LONG pending;
-    const XfTri *tri;
+    const XfTri *tri;                       /* one big triangle, or ...    */
+    const XfTri *queue;                     /* ... a batch of them (qn)    */
+    int qn, qthreads;                       /* threads on this batch       */
     XfCount cnt[NV_RASTER_MAX_THREADS];
 } s_pool;
+
+/* First row >= y0 that thread k of n owns when rows are dealt out by
+ * absolute y. Absolute, not relative to each triangle's top: every triangle
+ * of a batch must give a pixel to the same thread, or two threads could
+ * write it out of submission order. */
+static int xf_row_start(int y0, int k, int n)
+{
+    int r = ((k - y0 % n) % n + n) % n;
+    return y0 + r;
+}
+
+static void xf_rows_queue(const XfTri *q, int qn, int k, int n, XfCount *cnt)
+{
+    int i;
+    for (i = 0; i < qn; i++)
+        xf_rows(&q[i], xf_row_start(q[i].miny, k, n), n, cnt);
+}
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -1919,7 +1938,11 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        if (s_pool.queue)
+            xf_rows_queue(s_pool.queue, s_pool.qn, k, s_pool.qthreads,
+                          &s_pool.cnt[k]);
+        else
+            xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -1984,6 +2007,112 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
     xf_rows(T, T->miny, 1, total);
 }
 #endif
+
+/* A draw call's triangles, rasterised together.
+ *
+ * The big-triangle split above helps full-screen passes and nothing else: a
+ * 3D level is thousands of triangles of a few hundred to a few thousand
+ * pixels, every one under NV_RASTER_MT_MIN_PIXELS, so all of them ran on the
+ * executor thread. In Blinx 2's hub that thread was the frame rate -- the
+ * title spent 87% of its time waiting for pushbuffer space.
+ *
+ * Within one draw call no GPU state changes, so the triangles can be set up
+ * as they come and rasterised afterwards. Each thread then takes the rows it
+ * owns (y mod n) through every queued triangle in submission order, which
+ * keeps depth testing and blending exactly as sequential: a pixel is only
+ * ever touched by one thread, in order. Vertices are copied because clipped
+ * polygons live on the clipper's stack.
+ * RECOMP_RASTER_BATCH=0 turns it off. */
+#define NV_XFQ_MAX 1024
+#define NV_XFQ_PX_PER_THREAD 1024
+static struct {
+    int on, n;
+    long px;
+    XfTri tri[NV_XFQ_MAX];
+    Nv2aVshOutput v[NV_XFQ_MAX][3];
+} s_xfq;
+
+static void xfq_flush(void)
+{
+    XfCount cnt = {0, 0, 0};
+    int i;
+
+    if (!s_xfq.n)
+        return;
+#if defined(_WIN32)
+    {
+        /* One thread per NV_XFQ_PX_PER_THREAD pixels, up to the pool: waking
+         * the whole pool for a few thousand pixels costs more than it saves,
+         * and most of a 3D frame's draw calls are that size. */
+        int n = raster_pool_size(), k;
+        long want = s_xfq.px / NV_XFQ_PX_PER_THREAD;
+        if (want < n) n = (int)want;
+        if (n >= 2) {
+            s_pool.queue = s_xfq.tri;
+            s_pool.qn = s_xfq.n;
+            s_pool.qthreads = n;
+            s_pool.pending = n - 1;
+            for (k = 0; k < n - 1; k++)
+                SetEvent(s_pool.start[k]);
+            xf_rows_queue(s_xfq.tri, s_xfq.n, n - 1, n, &cnt);
+            WaitForSingleObject(s_pool.done, INFINITE);
+            s_pool.queue = NULL;
+            for (k = 0; k < n - 1; k++) {
+                cnt.depth_fail += s_pool.cnt[k].depth_fail;
+                cnt.pixels += s_pool.cnt[k].pixels;
+                cnt.zpass += s_pool.cnt[k].zpass;
+            }
+            goto counted;
+        }
+    }
+#endif
+    for (i = 0; i < s_xfq.n; i++)
+        xf_rows(&s_xfq.tri[i], s_xfq.tri[i].miny, 1, &cnt);
+#if defined(_WIN32)
+counted:
+#endif
+    s_gpu.xf_depth_fail += cnt.depth_fail;
+    s_gpu.xf_pixels += cnt.pixels;
+    s_gpu.zpass_count += cnt.zpass;
+    s_xfq.n = 0;
+    s_xfq.px = 0;
+}
+
+/* Queue a set-up triangle, or 0 when batching is off. */
+static int xfq_push(XfTri *T)
+{
+    int i;
+    if (!s_xfq.on)
+        return 0;
+    if (s_xfq.n == NV_XFQ_MAX)
+        xfq_flush();
+    i = s_xfq.n++;
+    s_xfq.v[i][0] = *T->va;
+    s_xfq.v[i][1] = *T->vb;
+    s_xfq.v[i][2] = *T->vc;
+    T->va = &s_xfq.v[i][0]; T->a = s_xfq.v[i][0].pos;
+    T->vb = &s_xfq.v[i][1]; T->b = s_xfq.v[i][1].pos;
+    T->vc = &s_xfq.v[i][2]; T->c = s_xfq.v[i][2].pos;
+    s_xfq.tri[i] = *T;
+    s_xfq.px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+    return 1;
+}
+
+static void xfq_begin(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_RASTER_BATCH");
+        enabled = !(e && *e == '0');
+    }
+    s_xfq.on = enabled;
+}
+
+static void xfq_end(void)
+{
+    xfq_flush();
+    s_xfq.on = 0;
+}
 
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
@@ -2070,6 +2199,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
 
+    if (xfq_push(&T)) {
+        s_gpu.tris_drawn++;
+        note_drawn();
+        return;
+    }
     xf_rows_parallel(&T, &cnt);
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
@@ -2244,6 +2378,7 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    xfq_begin();
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -2273,6 +2408,7 @@ static void raster_batch_program(void)
     default:
         break;
     }
+    xfq_end();
 }
 
 static void raster_batch(void)

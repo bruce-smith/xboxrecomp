@@ -234,6 +234,10 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+/* The NV2A worker thread (busy-bit acks, fence mirrors, and the pushbuffer
+ * scan/executor), as a Win32 HANDLE in a void * so this header needs no
+ * windows.h. NULL before xbox_MemoryLayoutInit. For profilers. */
+void *xbox_Nv2aWorkerThread(void);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within
