@@ -11,13 +11,6 @@
 
 #include <string.h>
 
-/* The rasteriser evaluates pixels on several threads. */
-#if defined(_MSC_VER)
-#define NV_RC_TLS __declspec(thread)
-#else
-#define NV_RC_TLS __thread
-#endif
-
 enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
        R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15 };
 
@@ -42,63 +35,85 @@ void nv2a_rc_unpack(uint32_t c, float o[4])
     o[3] = s_unorm8[ c >> 24        ];
 }
 
-/* D3DCOLOR to floats, memoised: a program's constants are the same for
- * every pixel of a batch, and unpacking them per pixel was a measurable
- * share of the executor. */
-static const float *unpack_cached(uint32_t c)
-{
-    static NV_RC_TLS uint32_t key[16];
-    static NV_RC_TLS float val[16][4];
-    static NV_RC_TLS int valid[16];
-    unsigned slot = (c ^ (c >> 8) ^ (c >> 16) ^ (c >> 24)) & 15u;
-    if (!valid[slot] || key[slot] != c) {
-        nv2a_rc_unpack(c, val[slot]);
-        key[slot] = c;
-        valid[slot] = 1;
-    }
-    return val[slot];
-}
-
 static float clampf(float x, float lo, float hi)
 {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-/* PS_INPUTMAPPING, psh.c get_input_var. */
+/* PS_INPUTMAPPING (psh.c get_input_var) applied to three components with
+ * one decision, not one per component: this runs four times per stage per
+ * pixel and its switch was a fifth of the rasteriser. */
+static void map_in3(const float x[3], uint32_t byte, float v[3])
+{
+    int i;
+    switch ((byte >> 5) & 7) {
+    case 0:                                          /* unsigned identity */
+        for (i = 0; i < 3; i++) v[i] = x[i] < 0.0f ? 0.0f : x[i];
+        break;
+    case 1:                                          /* unsigned invert   */
+        for (i = 0; i < 3; i++) v[i] = 1.0f - clampf(x[i], 0.0f, 1.0f);
+        break;
+    case 2:                                          /* expand normal     */
+        for (i = 0; i < 3; i++) v[i] = 2.0f * (x[i] < 0.0f ? 0.0f : x[i]) - 1.0f;
+        break;
+    case 3:                                          /* expand negate     */
+        for (i = 0; i < 3; i++) v[i] = -2.0f * (x[i] < 0.0f ? 0.0f : x[i]) + 1.0f;
+        break;
+    case 4:                                          /* half-bias normal  */
+        for (i = 0; i < 3; i++) v[i] = (x[i] < 0.0f ? 0.0f : x[i]) - 0.5f;
+        break;
+    case 5:                                          /* half-bias negate  */
+        for (i = 0; i < 3; i++) v[i] = -(x[i] < 0.0f ? 0.0f : x[i]) + 0.5f;
+        break;
+    case 6:                                          /* signed identity   */
+        for (i = 0; i < 3; i++) v[i] = x[i];
+        break;
+    default:                                         /* signed negate     */
+        for (i = 0; i < 3; i++) v[i] = -x[i];
+        break;
+    }
+}
+
+/* The same for one value (alpha portion). */
 static float map_in(float x, uint32_t byte)
 {
     float p = x < 0.0f ? 0.0f : x;
     switch ((byte >> 5) & 7) {
-    case 0:  return p;                               /* unsigned identity */
-    case 1:  return 1.0f - clampf(x, 0.0f, 1.0f);    /* unsigned invert   */
-    case 2:  return 2.0f * p - 1.0f;                 /* expand normal     */
-    case 3:  return -2.0f * p + 1.0f;                /* expand negate     */
-    case 4:  return p - 0.5f;                        /* half-bias normal  */
-    case 5:  return -p + 0.5f;                       /* half-bias negate  */
-    case 6:  return x;                               /* signed identity   */
-    default: return -x;                              /* signed negate     */
+    case 0:  return p;
+    case 1:  return 1.0f - clampf(x, 0.0f, 1.0f);
+    case 2:  return 2.0f * p - 1.0f;
+    case 3:  return -2.0f * p + 1.0f;
+    case 4:  return p - 0.5f;
+    case 5:  return -p + 0.5f;
+    case 6:  return x;
+    default: return -x;
     }
 }
 
-/* PS_COMBINEROUTPUT scale/bias, psh.c get_output. */
-static float map_out(float x, uint32_t mapping)
+/* PS_COMBINEROUTPUT scale/bias (psh.c get_output) as (x + bias) * scale:
+ * 0x08 x-0.5, 0x10 2x, 0x18 2(x-0.5), 0x20 4x, 0x30 x/2. Exact for each. */
+static void out_map(uint32_t mapping, float *bias, float *scale)
 {
     switch (mapping) {
-    case 0x08: return x - 0.5f;
-    case 0x10: return x * 2.0f;
-    case 0x18: return (x - 0.5f) * 2.0f;
-    case 0x20: return x * 4.0f;
-    case 0x30: return x * 0.5f;
-    default:   return x;
+    case 0x08: *bias = -0.5f; *scale = 1.0f; break;
+    case 0x10: *bias =  0.0f; *scale = 2.0f; break;
+    case 0x18: *bias = -0.5f; *scale = 2.0f; break;
+    case 0x20: *bias =  0.0f; *scale = 4.0f; break;
+    case 0x30: *bias =  0.0f; *scale = 0.5f; break;
+    default:   *bias =  0.0f; *scale = 1.0f; break;
     }
 }
 
 static void read_rgb(float R[16][4], uint32_t byte, float v[3])
 {
     const float *r = R[byte & 0xF];
-    int i;
-    for (i = 0; i < 3; i++)
-        v[i] = map_in((byte & 0x10) ? r[3] : r[i], byte);
+    if (byte & 0x10) {
+        float a[3];
+        a[0] = a[1] = a[2] = r[3];
+        map_in3(a, byte, v);
+    } else {
+        map_in3(r, byte, v);
+    }
 }
 
 static float read_alpha(float R[16][4], uint32_t byte)
@@ -107,10 +122,35 @@ static float read_alpha(float R[16][4], uint32_t byte)
     return map_in((byte & 0x10) ? r[3] : r[2], byte);
 }
 
+void nv2a_rc_prepare(const Nv2aCombiner *rc, Nv2aCombinerPrep *p)
+{
+    uint32_t flags = rc->control >> 8, s;
+
+    memset(p, 0, sizeof *p);
+    p->rc = *rc;
+    /* One c0/c1 for every stage, or one per stage (COMBINERCOUNT). */
+    for (s = 0; s < 8; s++) {
+        nv2a_rc_unpack(rc->factor0[(flags & 0x010) ? s : 0], p->c0[s]);
+        nv2a_rc_unpack(rc->factor1[(flags & 0x100) ? s : 0], p->c1[s]);
+    }
+    nv2a_rc_unpack(rc->final_c0, p->fc0);
+    nv2a_rc_unpack(rc->final_c1, p->fc1);
+}
+
 void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                   const float v1[4], const float fog[4],
                   const float t[4][4], float out[4])
 {
+    Nv2aCombinerPrep p;
+    nv2a_rc_prepare(rc, &p);
+    nv2a_rc_eval_prep(&p, v0, v1, fog, t, out);
+}
+
+void nv2a_rc_eval_prep(const Nv2aCombinerPrep *p, const float v0[4],
+                       const float v1[4], const float fog[4],
+                       const float t[4][4], float out[4])
+{
+    const Nv2aCombiner *rc = &p->rc;
     float R[16][4];
     uint32_t n = rc->control & 0xFF, flags = rc->control >> 8, s;
     int i;
@@ -140,12 +180,11 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         uint32_t aicw = rc->alpha_icw[s], aocw = rc->alpha_ocw[s];
         uint32_t fl = ocw >> 12, afl = aocw >> 12;
         float A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
-        float aA, aB, aC, aD, aab, acd, ams;
+        float aA, aB, aC, aD, aab, acd, ams, bias, scale, dab, dcd;
         int mux_cd;
 
-        /* One c0/c1 for every stage, or one per stage (COMBINERCOUNT). */
-        memcpy(R[R_C0], unpack_cached(rc->factor0[(flags & 0x010) ? s : 0]), 16);
-        memcpy(R[R_C1], unpack_cached(rc->factor1[(flags & 0x100) ? s : 0]), 16);
+        memcpy(R[R_C0], p->c0[s], 16);
+        memcpy(R[R_C1], p->c1[s], 16);
         mux_cd = (flags & 1) ? R[R_R0][3] >= 0.5f
                              : ((int)(R[R_R0][3] * 255.0f) & 1);
 
@@ -156,22 +195,24 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
         aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
 
+        out_map(fl & 0x38, &bias, &scale);
+        dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+        dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
         for (i = 0; i < 3; i++) {
-            float dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
-            float dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
             float pab = (fl & 2) ? dab : A[i] * B[i];
             float pcd = (fl & 1) ? dcd : C[i] * D[i];
             float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            ab[i] = clampf(map_out(pab, fl & 0x38), -1.0f, 1.0f);
-            cd[i] = clampf(map_out(pcd, fl & 0x38), -1.0f, 1.0f);
-            ms[i] = clampf(map_out(sum, fl & 0x38), -1.0f, 1.0f);
+            ab[i] = clampf((pab + bias) * scale, -1.0f, 1.0f);
+            cd[i] = clampf((pcd + bias) * scale, -1.0f, 1.0f);
+            ms[i] = clampf((sum + bias) * scale, -1.0f, 1.0f);
         }
+        out_map(afl & 0x38, &bias, &scale);
         {
             float pab = aA * aB, pcd = aC * aD;
             float sum = (afl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            aab = clampf(map_out(pab, afl & 0x38), -1.0f, 1.0f);
-            acd = clampf(map_out(pcd, afl & 0x38), -1.0f, 1.0f);
-            ams = clampf(map_out(sum, afl & 0x38), -1.0f, 1.0f);
+            aab = clampf((pab + bias) * scale, -1.0f, 1.0f);
+            acd = clampf((pcd + bias) * scale, -1.0f, 1.0f);
+            ams = clampf((sum + bias) * scale, -1.0f, 1.0f);
         }
 
         /* RGB destinations; blue-to-alpha also writes the destination's .a. */
@@ -200,8 +241,8 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         uint32_t f0 = rc->final0, f1 = rc->final1, fflags = f1 & 0xFF;
         float A[3], B[3], C[3], D[3], E[3], F[3];
 
-        memcpy(R[R_C0], unpack_cached(rc->final_c0), 16);
-        memcpy(R[R_C1], unpack_cached(rc->final_c1), 16);
+        memcpy(R[R_C0], p->fc0, 16);
+        memcpy(R[R_C1], p->fc1, 16);
         /* V1R0 sum: optional complements (0x40 v1, 0x20 r0), clamp (0x80). */
         for (i = 0; i < 3; i++) {
             float a = (fflags & 0x40) ? 1.0f - R[R_V1][i] : R[R_V1][i];

@@ -245,6 +245,9 @@ typedef struct {
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
+    /* Swizzled, non-DXT: texel index of x at swz[x], of y at swz[width + y].
+     * Set on the copies a draw carries (pix_capture), not in s_gpu. */
+    const uint32_t *swz;
 } Texture;
 
 static struct {
@@ -734,6 +737,36 @@ static const SwzTable *surface_swizzled(void)
     return t;
 }
 
+/* Texel-index tables for swizzled textures, one per size, built on the
+ * executor and never freed (13 x 13 sizes at most). sample_tex used to
+ * recompute the masks and deposit every coordinate bit by bit per texel --
+ * four times per bilinear tap, a tenth of the pixel path in Blinx 2's hub. */
+static const uint32_t *tex_swizzle_table(const Texture *t)
+{
+    static uint32_t *tabs[13][13];
+    uint32_t lw, lh, mx, my, i, *tab;
+
+    if (!t->valid || !d3d8_format_is_swizzled(t->color)
+        || d3d8_format_dxt_block_bytes(t->color))
+        return NULL;
+    for (lw = 0; lw < 13 && (1u << lw) != t->width; lw++) ;
+    for (lh = 0; lh < 13 && (1u << lh) != t->height; lh++) ;
+    if (lw == 13 || lh == 13)
+        return NULL;
+    if (tabs[lw][lh])
+        return tabs[lw][lh];
+    tab = (uint32_t *)malloc(sizeof(uint32_t) * (t->width + t->height));
+    if (!tab)
+        return NULL;
+    xbox_swizzle_masks(t->width, t->height, &mx, &my);
+    for (i = 0; i < t->width; i++)
+        tab[i] = swizzle_deposit(i, mx);
+    for (i = 0; i < t->height; i++)
+        tab[t->width + i] = swizzle_deposit(i, my);
+    tabs[lw][lh] = tab;
+    return tab;
+}
+
 /* Everything a pixel needs from the GPU state, copied once per draw call.
  *
  * Rasterisation is deferred (see "Deferred rasterisation") and runs on worker
@@ -751,7 +784,7 @@ typedef struct {
     uint32_t blend_color;
     uint32_t depth_test, depth_func, depth_mask, zpass_enable;
     uint32_t clip_plane_mode;
-    Nv2aCombiner rc;
+    Nv2aCombinerPrep rcp;               /* constants unpacked per draw */
     Texture texs[4];
 } PixState;
 
@@ -780,8 +813,13 @@ static void pix_capture(PixState *ps)
     ps->depth_mask = s_gpu.depth_mask;
     ps->zpass_enable = s_gpu.zpass_enable;
     ps->clip_plane_mode = s_gpu.clip_plane_mode;
-    ps->rc = s_gpu.rc;
+    nv2a_rc_prepare(&s_gpu.rc, &ps->rcp);
     memcpy(ps->texs, s_gpu.texs, sizeof ps->texs);
+    {
+        int st;
+        for (st = 0; st < 4; st++)
+            ps->texs[st].swz = tex_swizzle_table(&ps->texs[st]);
+    }
 }
 
 /* Drawing straight from the executor thread (screen-space batches, texture
@@ -1093,7 +1131,8 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * index for every one of them. */
         fmt = linear_twin(fmt);
         p = mem + base;
-        u = swizzle_offset(u, v, t->width, t->height);
+        u = t->swz ? t->swz[u] + t->swz[t->width + v]
+                   : swizzle_offset(u, v, t->width, t->height);
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
@@ -1885,7 +1924,7 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
 static int rc_stage_fetch(int st, const float c[4], float out[4])
 {
     const Texture *t = &P->texs[st];
-    uint32_t mode = (P->rc.stage_program >> (st * 5)) & 0x1F, j;
+    uint32_t mode = (P->rcp.rc.stage_program >> (st * 5)) & 0x1F, j;
     float q = c[3] != 0.0f ? c[3] : 1.0f;
 
     switch (mode) {
@@ -2040,7 +2079,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
                         fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
                         for (st = 0; st < 4 && keep; st++) {
-                            if (!((P->rc.stage_program >> (st * 5)) & 0x1F)) {
+                            if (!((P->rcp.rc.stage_program >> (st * 5)) & 0x1F)) {
                                 t[st][0] = t[st][1] = t[st][2] = 0.0f;
                                 t[st][3] = 1.0f;
                                 continue;
@@ -2052,7 +2091,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                         }
                         if (!keep)
                             continue;
-                        nv2a_rc_eval(&P->rc, col, d1, fog,
+                        nv2a_rc_eval_prep(&P->rcp, col, d1, fog,
                                      (const float (*)[4])t, out);
                         if (P->alpha_test && !alpha_test_pass(out[3]))
                             continue;
