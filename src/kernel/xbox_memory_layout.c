@@ -1337,6 +1337,10 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+/* RECOMP_WATCHDOG_STALL=<n>: fire when no flip has happened for n seconds
+ * (once flips have started) rather than after a fixed time -- for a hang
+ * that comes once in several runs, at a different moment each time. */
+static unsigned  s_watchdog_stall;
 
 /* Can RECOMP_PEEK dereference this guest address?
  *
@@ -1645,7 +1649,17 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
     uint32_t esp, i;
 
     (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
+    if (s_watchdog_stall) {
+        for (;;) {
+            DWORD flip = g_frame_counter_flip_ms;
+            Sleep(1000);
+            if (flip && GetTickCount() - flip > s_watchdog_stall * 1000u)
+                break;
+        }
+        fprintf(stderr, "[WATCHDOG] no flip for %us\n", s_watchdog_stall);
+    } else {
+        Sleep(s_watchdog_secs * 1000u);
+    }
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
@@ -1721,12 +1735,14 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *stall = getenv("RECOMP_WATCHDOG_STALL");
     HANDLE h;
 
-    if (!secs || !*secs)
-        return;
-    s_watchdog_secs = (unsigned)atoi(secs);
-    if (!s_watchdog_secs)
+    if (stall && *stall)
+        s_watchdog_stall = (unsigned)atoi(stall);
+    if (secs && *secs)
+        s_watchdog_secs = (unsigned)atoi(secs);
+    if (!s_watchdog_secs && !s_watchdog_stall)
         return;
 
     /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
