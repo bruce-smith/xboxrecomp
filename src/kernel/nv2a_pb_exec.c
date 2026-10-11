@@ -339,8 +339,11 @@ static struct {
     uint32_t zeta_offset, zstencil_clear;
 } s_gpu;
 
-/* Deferred rasterisation (below): drain everything queued. */
-static void rq_sync(void);
+/* Deferred rasterisation (below): drain everything queued. Counted by call
+ * site, because a drain is where the executor and the raster workers stop
+ * overlapping, and which ones a frame pays for is the question. */
+static void rq_sync_at(int line);
+#define rq_sync() rq_sync_at(__LINE__)
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -2037,15 +2040,15 @@ typedef struct {
     uint32_t zpass, written_max;
 } XfCount;
 
-/* Rows y0, y0+step, ... < maxy of triangle T. */
-static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+/* Rows y0, y0+step, ... < y1 of triangle T. */
+static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
 {
     const float *a = T->a, *b = T->b, *c = T->c;
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
     int x, y, k;
 
     P = T->ps;
-    for (y = y0; y < T->maxy; y += step) {
+    for (y = y0; y < y1; y += step) {
         for (x = T->minx; x < T->maxx; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
             float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
@@ -2128,6 +2131,11 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     }
 }
 
+static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+{
+    xf_rows_span(T, y0, T->maxy, step, cnt);
+}
+
 /* Deferred rasterisation.
  *
  * Triangles used to be rasterised per draw call: set up, then the pool woken
@@ -2162,6 +2170,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 typedef struct {
     int n, nst, nsurf;                  /* nsurf < 0: too many to track */
     long px;                            /* bounding-box pixels queued */
+    int ymin, ymax;                     /* rows the batch touches */
     XfTri tri[NV_RQ_TRIS];
     Nv2aVshOutput v[NV_RQ_TRIS][3];
     PixState st[NV_RQ_STATES];
@@ -2174,21 +2183,39 @@ static int s_rq_busy = -1;              /* the batch the workers have */
 static const PixState *s_rq_ps;         /* this draw's state, in s_rq[fill] */
 static int s_rq_each = -1;              /* RECOMP_RASTER_BATCH=0 */
 
-/* First row >= y0 that thread k of n owns when rows are dealt out by
- * absolute y. Absolute, not relative to each triangle's top: every triangle
- * of a batch must give a pixel to the same thread, or two threads could
- * write it out of submission order. */
-static int xf_row_start(int y0, int k, int n)
-{
-    int r = ((k - y0 % n) % n + n) % n;
-    return y0 + r;
-}
+/* Work is dealt out in bands of NV_BAND rows by absolute y, and each band
+ * goes through every triangle of the batch in submission order on one
+ * thread, so no pixel is ever written out of order.
+ *
+ * Bands are claimed, not assigned. With rows dealt statically (y mod n) the
+ * slowest worker set the pace -- sixteen workers next to the title's threads
+ * on sixteen cores means some share a core -- and in Blinx 2's hub worker 0
+ * sat 60% idle while the executor waited on the batch. A claimed band also
+ * lets the executor work instead of waiting (rq_wait).
+ * Four rows, not one: a 32-bit swizzled surface keeps a 4x4 block in each
+ * 64-byte line, and rows dealt one by one put four threads on every line of
+ * the reflection targets. */
+#define NV_BAND 4
 
-static void xf_rows_queue(const XfTri *q, int qn, int k, int n, XfCount *cnt)
+/* A batch in order on the calling thread: no pool. */
+static void xf_rows_queue(const XfTri *q, int qn, XfCount *cnt)
 {
     int i;
     for (i = 0; i < qn; i++)
-        xf_rows(&q[i], xf_row_start(q[i].miny, k, n), n, cnt);
+        xf_rows(&q[i], q[i].miny, 1, cnt);
+}
+
+/* One band through every triangle of a batch. */
+static void xf_band(const XfTri *q, int qn, int band, XfCount *cnt)
+{
+    int y0 = band * NV_BAND, y1 = y0 + NV_BAND, i;
+    for (i = 0; i < qn; i++) {
+        const XfTri *T = &q[i];
+        int lo = y0 > T->miny ? y0 : T->miny;
+        int hi = y1 < T->maxy ? y1 : T->maxy;
+        if (lo < hi)
+            xf_rows_span(T, lo, hi, 1, cnt);
+    }
 }
 
 static void rq_count(const XfCount *c)
@@ -2206,6 +2233,8 @@ static struct {
     HANDLE thread[NV_RASTER_MAX_THREADS];
     volatile LONG pending;
     const RasterBatch *batch;
+    volatile LONG next_band;                /* next band to claim */
+    LONG band_end;
     XfCount cnt[NV_RASTER_MAX_THREADS];
 } s_pool;
 
@@ -2214,8 +2243,11 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     int k = (int)(intptr_t)arg;
     for (;;) {
         XfCount c = {0, 0, 0, 0, 0};
+        LONG band;
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        xf_rows_queue(s_pool.batch->tri, s_pool.batch->n, k, s_pool.n, &c);
+        while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
+               < s_pool.band_end)
+            xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
         stats_take(&c.written, &c.written_max);
         s_pool.cnt[k] = c;
         if (InterlockedDecrement(&s_pool.pending) == 0)
@@ -2264,6 +2296,15 @@ static void rq_wait(void)
     int k;
     if (s_rq_busy < 0)
         return;
+    {
+        /* Claim bands alongside the workers rather than sleep. */
+        XfCount c = {0, 0, 0, 0, 0};
+        LONG band;
+        while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
+               < s_pool.band_end)
+            xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
+        rq_count(&c);
+    }
     WaitForSingleObject(s_pool.done, INFINITE);
     for (k = 0; k < s_pool.n; k++)
         rq_count(&s_pool.cnt[k]);
@@ -2291,6 +2332,8 @@ static void rq_kick(void)
         if (raster_pool_size() > 1) {
             int k;
             s_pool.batch = b;
+            s_pool.next_band = b->ymin / NV_BAND;
+            s_pool.band_end = (b->ymax + NV_BAND - 1) / NV_BAND;
             s_pool.pending = s_pool.n;
             s_rq_busy = s_rq_fill;
             for (k = 0; k < s_pool.n; k++)
@@ -2301,7 +2344,7 @@ static void rq_kick(void)
 #endif
         {
             XfCount c = {0, 0, 0, 0, 0};
-            xf_rows_queue(b->tri, b->n, 0, 1, &c);
+            xf_rows_queue(b->tri, b->n, &c);
             rq_count(&c);
             s_gpu.rq_inline++;
         }
@@ -2309,13 +2352,26 @@ static void rq_kick(void)
     b = s_rq[s_rq_fill];
     b->n = b->nst = b->nsurf = 0;
     b->px = 0;
+    b->ymin = 1 << 30;
+    b->ymax = 0;
     s_rq_ps = NULL;
 }
 
-static void rq_sync(void)
+static struct { int line; uint32_t n; } s_sync_sites[24];
+
+static void rq_sync_at(int line)
 {
     uint64_t n;
     uint32_t mx;
+    if (s_rq_busy >= 0 || (s_rq[s_rq_fill] && s_rq[s_rq_fill]->n)) {
+        int i;
+        for (i = 0; i < 24 && s_sync_sites[i].line && s_sync_sites[i].line != line; i++)
+            ;
+        if (i < 24) {
+            s_sync_sites[i].line = line;
+            s_sync_sites[i].n++;
+        }
+    }
     rq_kick();
     rq_wait();
     stats_take(&n, &mx);              /* the executor's own direct drawing */
@@ -2388,6 +2444,7 @@ static int rq_ready(void)
                         " drawing on the executor\n");
         return 0;
     }
+    s_rq[0]->ymin = s_rq[1]->ymin = 1 << 30;
     return 1;
 }
 
@@ -2437,6 +2494,8 @@ static void xfq_push(XfTri *T)
     T->ps = s_rq_ps;
     b->tri[i] = *T;
     b->px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+    if (T->miny < b->ymin) b->ymin = T->miny;
+    if (T->maxy > b->ymax) b->ymax = T->maxy;
 }
 
 /* A draw call starts: its state is captured afresh by its first triangle. */
@@ -4030,6 +4089,13 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex-program batches: %u with a texture on some"
                     " stage, %u with none\n",
             s_gpu.program_textured, s_gpu.program_no_tex);
+    {
+        int i;
+        fprintf(stderr, "[GPU] raster drains with work pending, by line:");
+        for (i = 0; i < 24 && s_sync_sites[i].line; i++)
+            fprintf(stderr, " %d:%u", s_sync_sites[i].line, s_sync_sites[i].n);
+        fputc(10, stderr);
+    }
     fprintf(stderr, "[GPU] raster batches: %u to the pool, %u inline;"
                     " %llu triangles, %llu bbox pixels\n",
             s_gpu.rq_pooled, s_gpu.rq_inline,
