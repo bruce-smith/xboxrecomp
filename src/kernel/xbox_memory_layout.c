@@ -1071,7 +1071,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
                 }
-                fflush(stderr);
+                /* No fflush(stderr) here. This runs on every pushbuffer kick,
+                 * many per frame, and with a title's stderr fully buffered
+                 * it wrote out every thread's pending log on the NV2A
+                 * thread: 7% of the executor in Blinx 2's hub. The title's
+                 * own stderr policy decides when output appears. */
             }
         }
         if (s_nv2a_trace) {
