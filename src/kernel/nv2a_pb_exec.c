@@ -669,6 +669,76 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+static uint8_t *s_surface;          /* host address of surface row 0 */
+
+/* Swizzled colour surfaces. SURFACE_FORMAT's type field (bits 8-11) is 1 for
+ * a pitch surface and 2 for a swizzled one, whose size is log2 in bits 16-23
+ * (width) and 24-31 (height). A title renders into a swizzled surface when it
+ * means to sample the result as an ordinary swizzled texture -- Blinx 2's hub
+ * floor reflection is two 512x512 A8R8G8B8 render targets. Written row by row
+ * with the pitch they came out as a linear image, and sampling that as
+ * swizzled drew the floor as stair-stepped bands.
+ * The tables hold each coordinate's byte offset, rebuilt when the format
+ * changes, so a pixel costs two loads and an OR. */
+#define NV_SWZ_MAX 4096
+static struct {
+    uint32_t format;                    /* SURFACE_FORMAT the tables are for */
+    int on;
+    uint32_t w, h;
+    uint32_t x[NV_SWZ_MAX], y[NV_SWZ_MAX];
+} s_swz;
+
+static int surface_swizzled(void)
+{
+    uint32_t f = s_gpu.format, lw, lh, mx, my, i, bpp;
+
+    if (f == s_swz.format)
+        return s_swz.on;
+    s_swz.format = f;
+    s_swz.on = 0;
+    lw = (f >> 16) & 0xFF;
+    lh = (f >> 24) & 0xFF;
+    if (((f >> 8) & 0xF) != 2 || lw > 12 || lh > 12)
+        return 0;
+    switch (f & 0xF) {                            /* as surface_bpp() */
+    case 0x1: case 0x2: case 0x3: case 0xA: bpp = 2; break;
+    case 0x9: bpp = 1; break;
+    default: bpp = 4; break;
+    }
+    s_swz.w = 1u << lw;
+    s_swz.h = 1u << lh;
+    xbox_swizzle_masks(s_swz.w, s_swz.h, &mx, &my);
+    for (i = 0; i < s_swz.w; i++)
+        s_swz.x[i] = swizzle_deposit(i, mx) * bpp;
+    for (i = 0; i < s_swz.h; i++)
+        s_swz.y[i] = swizzle_deposit(i, my) * bpp;
+    s_swz.on = 1;
+    return 1;
+}
+
+/* Host address of surface pixel (x, y), swizzled or pitch. NULL when a
+ * swizzled surface's clip reaches past its own size. */
+static uint8_t *surface_pixel(uint8_t *base, int x, int y, uint32_t bpp)
+{
+    if (s_swz.on && s_swz.format == s_gpu.format) {
+        if ((uint32_t)x >= s_swz.w || (uint32_t)y >= s_swz.h)
+            return NULL;
+        return base + s_swz.x[x] + s_swz.y[y];
+    }
+    return base + (size_t)y * s_gpu.pitch + (size_t)x * bpp;
+}
+
+static int surface_begin_batch(const uint8_t *mem)
+{
+    uint32_t base = dma_resolve(s_gpu.color_offset);
+
+    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+        return 0;
+    s_surface = (uint8_t *)mem + base;
+    surface_swizzled();
+    return 1;
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -688,7 +758,24 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
+    if (surface_swizzled()) {
+        /* Pixel by pixel through the swizzle tables. A clip covering the whole
+         * surface could be one fill, but clears are not where the time goes. */
+        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                                | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                | ((s_gpu.clear_color >> 3) & 0x001F));
+        for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h && y < s_swz.h; y++)
+            for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w && x < s_swz.w; x++) {
+                uint8_t *p = mem + s_gpu.color_base + s_swz.x[x] + s_swz.y[y];
+                if (bpp == 4)
+                    *(uint32_t *)p = s_gpu.clear_color;
+                else if (bpp == 2)
+                    *(uint16_t *)p = v16;
+            }
+        y = s_gpu.clip_h;                         /* skip the pitch loop */
+    } else
+        y = 0;
+    for (; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
@@ -1134,17 +1221,6 @@ static void dump_texture_bmp(uint32_t seq)
  * This is not a micro-optimisation for its own sake: the loader's video
  * paces on frames actually presented, so the rasteriser's throughput is the
  * playback rate. */
-static uint8_t *s_surface;          /* host address of surface row 0 */
-
-static int surface_begin_batch(const uint8_t *mem)
-{
-    uint32_t base = dma_resolve(s_gpu.color_offset);
-
-    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
-        return 0;
-    s_surface = (uint8_t *)mem + base;
-    return 1;
-}
 
 static uint32_t pack_color(const float c[4]);
 
@@ -1179,7 +1255,7 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
 
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
-    uint8_t *row;
+    uint8_t *px;
 
     (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
@@ -1189,7 +1265,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
+    px = surface_pixel(s_surface, x, y, bpp);
+    if (!px)
+        return;
 
     /* Blending, with the GL factor set and equations the NV2A takes.
      *
@@ -1203,9 +1281,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         float sc[4], dc[4], sf[4], df[4], out[4];
         int k;
         if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
+            dst = *(const uint32_t *)px;
         } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = *(const uint16_t *)px;
             dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
                 | ((t & 0x001Fu) << 3);
         }
@@ -1238,17 +1316,17 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         if (keep == 0xFFFFFFFFu)
             return;
         if (bpp == 4) {
-            old = ((const uint32_t *)row)[x];
+            old = *(const uint32_t *)px;
         } else {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = *(const uint16_t *)px;
             old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
         }
         argb = (argb & ~keep) | (old & keep);
     }
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        *(uint32_t *)px = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
+        *(uint16_t *)px = (uint16_t)(((argb >> 8) & 0xF800)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
     }
