@@ -292,6 +292,11 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    /* The same split for vertex-program batches, which are nearly all of a 3D
+     * scene's. A program always outputs texcoords, so the only question is
+     * whether any stage had a texture bound. These were never counted, which
+     * is why the report said "0 textured" over frames full of textures. */
+    uint32_t program_textured, program_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t blend_equation, blend_color;
     uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
@@ -2375,6 +2380,15 @@ static void raster_batch_program(void)
         if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
             s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
     }
+    {
+        int st, any = 0;
+        for (st = 0; st < 4; st++)
+            any |= s_gpu.texs[st].valid;
+        if (any)
+            s_gpu.program_textured++;
+        else
+            s_gpu.program_no_tex++;
+    }
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
@@ -3623,9 +3637,12 @@ void nv2a_pb_exec_report(void)
      * that draws its background from one texture and its text from another
      * shows both as flat colour if either half is missing, so the split is
      * what says which half. */
-    fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
-                    " %u with texcoords but no usable stage\n",
+    fprintf(stderr, "[GPU] screen-space batches: %u textured, %u with no"
+                    " texcoords, %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    fprintf(stderr, "[GPU] vertex-program batches: %u with a texture on some"
+                    " stage, %u with none\n",
+            s_gpu.program_textured, s_gpu.program_no_tex);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
