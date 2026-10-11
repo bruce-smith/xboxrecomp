@@ -3991,11 +3991,29 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
-/* Finish every queued triangle. The NV2A thread calls this before it moves
- * GET up to PUT. */
+/* Called by the NV2A thread before it moves GET up to PUT: hand the queued
+ * triangles to the workers, without waiting for them.
+ *
+ * Waiting here (rq_sync) kept "GET passed" meaning "pixels done", but it is
+ * also where the NV2A thread blocks before it gets back round to acking
+ * D3D's next kick (the 0x100410 flush bit, which only that loop may clear),
+ * and the title spends most of its frame spinning on that bit. Not waiting
+ * was ~12.8 -> ~14.7 fps in Blinx 2's hub (alternating within one run). What GET releases is safe to
+ * reuse: vertices are transformed and copied at set-up, render targets are
+ * only written by the queue, and flips, clears and render-to-texture still
+ * drain. The one gap is a texture the CPU rewrites right after GET passes
+ * a draw still queued, which then samples the newer texels -- and the
+ * GPU-idle shim already lets the title assume every fence has passed.
+ * RECOMP_RASTER_GET_WAIT=1 restores the wait. */
 void nv2a_pb_exec_drain(void)
 {
-    rq_sync();
+    static int wait = -1;
+    if (wait < 0)
+        wait = getenv("RECOMP_RASTER_GET_WAIT") != NULL;
+    if (wait)
+        rq_sync();
+    else
+        rq_kick();
 }
 
 void nv2a_pb_exec_report(void)
