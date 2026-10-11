@@ -4060,7 +4060,48 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
+    (void)obj_type;
     if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+
+#ifdef _WIN32
+    /* Thread handles get a minimal KTHREAD the title can read.
+     *
+     * XAPI GetExitCodeThread (Blinx 2: sub_00298004) references the handle,
+     * reads Header.SignalState (byte at +4) and, once it is set, ExitStatus
+     * (+0x120); otherwise it reports STILL_ACTIVE. Handing back NULL made
+     * those reads land on guest page zero -- always 0 -- so a title polling
+     * for a loader thread to finish waited forever after the thread had
+     * exited. (Blinx 2 stalled on the stage load that way.)
+     *
+     * One small guest block per handle token, refreshed on every reference:
+     * SignalState is 1 once the host thread has ended, ExitStatus is its exit
+     * code (PsTerminateSystemThread exits with the guest's status). Other
+     * object types keep the old behaviour. */
+    {
+        HANDLE h = bridge_resolve_handle(handle);
+        if (h && GetThreadId(h) != 0) {
+            enum { SLOTS = 64 };
+            static uint32_t tokens[SLOTS], blocks[SLOTS];
+            uint32_t blk = 0;
+            int i;
+            for (i = 0; i < SLOTS && tokens[i]; i++)
+                if (tokens[i] == handle) { blk = blocks[i]; break; }
+            if (!blk && i < SLOTS) {
+                blk = xbox_HeapAlloc(0x200, 16);   /* zeroed */
+                if (blk) { tokens[i] = handle; blocks[i] = blk; }
+            }
+            if (blk) {
+                DWORD code = 0;
+                int done = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+                if (done)
+                    GetExitCodeThread(h, &code);
+                BRIDGE_MEM8(blk + 4)       = done ? 1 : 0;   /* SignalState */
+                BRIDGE_MEM32(blk + 0x120)  = code;           /* ExitStatus  */
+                if (object_ptr) BRIDGE_MEM32(object_ptr) = blk;
+            }
+        }
+    }
+#endif
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
