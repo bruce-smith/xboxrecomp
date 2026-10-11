@@ -3445,6 +3445,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0308: s_gpu.cull_enable = param; break;/* CULL_FACE_ENABLE */
     case 0x039C: s_gpu.cull_face = param; break;  /* CULL_FACE */
     case 0x03A0: s_gpu.front_face = param; break; /* FRONT_FACE */
+
+    /* Nothing to do in an executor that runs every method in order, to
+     * completion: NO_OPERATION, WAIT_FOR_IDLE, BREAK_VERTEX_BUFFER_CACHE.
+     * Ranked as unhandled they were three of the top four entries in Blinx
+     * 2's hub and pushed the methods that matter down the list. */
+    case 0x0100: case 0x0110: case 0x1710:
+        break;
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
