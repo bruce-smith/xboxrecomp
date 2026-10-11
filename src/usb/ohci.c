@@ -1007,6 +1007,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * what killed the process here, two interrupts in, with no fault report
      * because the fault was in the runtime rather than in the title. */
     unsigned waited = 0;
+    DWORD    started = GetTickCount();     /* for the "operational after" line */
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
@@ -1039,8 +1040,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            /* Wait as long as it takes. This used to give up after 1500
+             * ticks, but when a title starts its USB stack is its business:
+             * Blinx 2 brings XPP up 10-25 s into boot. At the default 15.6 ms
+             * timer resolution 1500 ticks lasted ~23 s and usually sufficed;
+             * once the process ran at 1 ms resolution they lasted 6 s, and
+             * the pad silently never arrived. An idle controller costs one
+             * wake per tick. */
+            ++waited;
             continue;
         }
         if (!(enable & INTR_MIE))
@@ -1065,7 +1072,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port 1\n",
+                    (unsigned)(GetTickCount() - started));
             fflush(stderr);
         }
 
