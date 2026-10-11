@@ -9668,7 +9668,10 @@ static void kernel_thunk_dispatch_body(void)
                             (unsigned long long)g_ordinal_calls[best]);
                 }
             }
-            fflush(stderr);
+            /* No fflush: this runs on whichever guest thread made the call --
+             * usually the title's main loop -- and writing out a buffered
+             * stderr there was 15% of Blinx 2's main thread under PB_EXEC.
+             * The title's stderr policy decides when output appears. */
             last_summary_tick = now;
         }
     }
