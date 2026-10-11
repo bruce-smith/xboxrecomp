@@ -813,6 +813,20 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
 
+    /* The arena ignores low/high. Say so when that breaks a caller's limit:
+     * with a 128 MB window above the image (xbox_SetContigLayout) a block can
+     * land past 64 MB, and a title that asked for "below 64 MB" -- because
+     * it masks physical addresses with 0x03FFFFFF, say -- would then point
+     * the GPU at the wrong bytes with nothing else naming the cause. */
+    if (xbox_va && high
+            && (uint64_t)(xbox_va - XBOX_PHYSICAL_MIRROR_BASE) + size - 1 > high) {
+        static LONG warned;
+        if (InterlockedIncrement(&warned) <= 8)
+            fprintf(stderr, "  [CONTIG] Ex alloc size=%u at physical 0x%08X is "
+                    "above the caller's highest 0x%08X\n",
+                    size, xbox_va - XBOX_PHYSICAL_MIRROR_BASE, high);
+    }
+
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
                 size, align, xbox_va);

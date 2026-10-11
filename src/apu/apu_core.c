@@ -71,14 +71,14 @@ void mcpx_debug_end_frame(void) {}
  * buffer never reported that it had stopped, and Burnout 3's frontend waits
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
-extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern int xbox_ContiguousOwnsPhys(uint32_t phys);
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
-    if (a < xbox_ContiguousAllocatedBytes())
+    if (xbox_ContiguousOwnsPhys(a))
         return g_apu_ram_ptr + 0x80000000u + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }

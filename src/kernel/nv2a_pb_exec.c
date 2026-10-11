@@ -96,7 +96,7 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  */
 static uint32_t dma_resolve(uint32_t offset)
 {
-    extern uint32_t xbox_ContiguousAllocatedBytes(void);
+    extern int xbox_ContiguousOwnsPhys(uint32_t phys);
 
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window, and that is not a guess: the arena is a bump
@@ -112,7 +112,7 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < xbox_ContiguousAllocatedBytes())
+    if (xbox_ContiguousOwnsPhys(offset))
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
         return offset;

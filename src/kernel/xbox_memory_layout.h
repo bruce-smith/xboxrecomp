@@ -77,6 +77,25 @@ extern size_t g_xbox_total_ram;
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
+/* Contiguous-window layout. On hardware MmAllocateContiguousMemory never
+ * hands out physical pages that hold the loaded XBE, so a physical address
+ * names one thing. Here the window is separate storage and the arena starts
+ * at physical 0x1000, so for a title whose image is large every arena address
+ * below the image top also names image bytes -- and device models (OHCI, APU)
+ * that follow a physical pointer cannot tell which the title meant. Blinx 2
+ * (image top 0x0303AC20) builds its USB descriptors at physical 0x0085C670.
+ *
+ * above_image starts the arena above the image top, as on hardware; bytes
+ * sets the window size (64 MB or XBOX_CONTIG_SIZE_MAX). With a 48 MB image a
+ * 64 MB window leaves no room above it, so the two go together. Defaults
+ * (64 MB, arena from 0x1000) are the old behaviour. Set before
+ * xbox_MemoryLayoutInit(). */
+void xbox_SetContigLayout(uint32_t bytes, int above_image);
+
+/* Whether a physical address lies in the range the contiguous arena has
+ * handed out: [arena start, high-water). Device models resolving a bus
+ * address use this to decide it lives in the contiguous window. */
+int xbox_ContiguousOwnsPhys(uint32_t phys);
 
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.

@@ -448,7 +448,7 @@ static int ohci_pad_for(uint32_t ed0)
 /* The contiguous (physical-mirror) window. Mapped separately from main RAM
  * and far above it, so a size check against the mapped RAM size rejects it. */
 #define OHCI_CONTIG_BASE 0x80000000u
-#define OHCI_CONTIG_SIZE (64u * 1024u * 1024u)
+#define OHCI_CONTIG_SIZE XBOX_CONTIG_SIZE   /* 64 or 128 MB, see kernel.h */
 
 static int guest_ok(uint32_t va, uint32_t bytes)
 {
@@ -500,7 +500,7 @@ static uint32_t bus_resolve(uint32_t addr)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
+    if (xbox_ContiguousOwnsPhys(addr))
         return OHCI_CONTIG_BASE + addr;
     return addr;
 }

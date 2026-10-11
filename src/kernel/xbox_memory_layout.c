@@ -59,6 +59,21 @@ void xbox_SetMapSize(size_t bytes)
     g_xbox_map_size = bytes;
 }
 
+/* Contiguous-window layout; see xbox_SetContigLayout in the header. The
+ * arena's first physical address is kept so xbox_ContiguousOwnsPhys can tell
+ * arena memory from the image below it. */
+uint32_t g_xbox_contig_size = 64u * 1024u * 1024u;
+static int g_contig_above_image;
+static uint32_t g_contig_next;          /* defined with the allocator below */
+static uint32_t g_contig_lo = 0x1000u;  /* physical start of the arena */
+
+void xbox_SetContigLayout(uint32_t bytes, int above_image)
+{
+    if (bytes >= 64u * 1024u * 1024u && bytes <= XBOX_CONTIG_SIZE_MAX)
+        g_xbox_contig_size = bytes;
+    g_contig_above_image = above_image;
+}
+
 /* File mapping handle for the Xbox memory region.
  * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
  * the same physical pages as the base region, so writes to mirror addresses
@@ -2319,9 +2334,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE
             );
+        /* Arena above the image (xbox_SetContigLayout). The image is loaded
+         * by now, so its top is known. */
+        if (g_contig_above_image && g_xbox_image_hi) {
+            uint32_t lo = (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu;
+            if ((uint64_t)lo + 16u * 1024u * 1024u <= XBOX_CONTIG_SIZE) {
+                g_contig_lo = lo;
+                g_contig_next = XBOX_CONTIG_BASE + lo;
+            } else {
+                fprintf(stderr, "  WARNING: image top 0x%08X leaves under 16 MB "
+                        "of the %u MB contiguous window; arena stays at 0x1000\n",
+                        g_xbox_image_hi, XBOX_CONTIG_SIZE / (1024 * 1024));
+            }
+        }
         if (g_contig_memory) {
-            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
-                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
+            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X, "
+                    "arena from physical 0x%08X\n",
+                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE,
+                    g_contig_lo);
         } else {
             fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %lu); pinned physical allocations will fault\n",
@@ -3166,8 +3196,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
                 (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
                     - XBOX_GPU_INSTANCE_DEFAULT) {
             fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                    size, g_contig_next - XBOX_CONTIG_BASE,
-                    (unsigned)XBOX_CONTIG_SIZE);
+                    size, g_contig_next - XBOX_CONTIG_BASE - g_contig_lo,
+                    (unsigned)(XBOX_CONTIG_SIZE - g_contig_lo));
             fflush(stderr);
             if (reclaim)
                 ReleaseSRWLockExclusive(&g_contig_lock);
@@ -3248,6 +3278,11 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+int xbox_ContiguousOwnsPhys(uint32_t phys)
+{
+    return phys >= g_contig_lo && phys < g_contig_next - XBOX_CONTIG_BASE;
 }
 
 

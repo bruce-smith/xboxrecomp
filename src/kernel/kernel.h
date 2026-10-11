@@ -396,7 +396,12 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
  * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
  * the layout and the bridges cannot disagree about where it is. */
 #define XBOX_CONTIG_BASE 0x80000000u
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+/* 64 MB as on a retail console, unless a title asked for the devkit-sized
+ * 128 MB window through xbox_SetContigLayout (xbox_memory_layout.h). A
+ * variable, so read it at run time: no static initialisers. */
+extern uint32_t g_xbox_contig_size;
+#define XBOX_CONTIG_SIZE g_xbox_contig_size
+#define XBOX_CONTIG_SIZE_MAX (128u * 1024u * 1024u)
 
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
