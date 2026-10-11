@@ -3550,6 +3550,91 @@ static void bridge_NtQueryInformationFile(void)
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
+#ifdef _WIN32
+/* FileRenameInformation (class 10).
+ *
+ * Xbox layout (32-bit): BOOLEAN ReplaceIfExists; HANDLE RootDirectory;
+ * OBJECT_STRING FileName { USHORT Length, MaximumLength; PCHAR Buffer }.
+ * The name is an Xbox path -- absolute (\Device\...) or relative to
+ * RootDirectory -- in guest memory, so this lives in the bridge, which can
+ * read it and run the path translation.
+ *
+ * Unimplemented, it returned STATUS_NOT_IMPLEMENTED. Blinx 2 copies each
+ * archive into the Partition5 cache as <name>.tmp and renames it to
+ * <name>.ipk when the copy completes. The rename failed, the .ipk never
+ * appeared, and stage loading stalled after stg0101_tex_us.tmp. */
+static NTSTATUS bridge_rename_file(HANDLE handle, uint32_t info_va)
+{
+    uint8_t  replace = BRIDGE_MEM8(info_va);
+    uint32_t root    = BRIDGE_MEM32(info_va + 4);
+    uint16_t len     = BRIDGE_MEM16(info_va + 8);
+    uint32_t buf     = BRIDGE_MEM32(info_va + 12);
+    char     name[MAX_PATH];
+    WCHAR    dst[MAX_PATH], src[MAX_PATH];
+    static unsigned shown;
+
+    if (!len || len >= sizeof(name) || !buf || !bridge_buf_ok(buf, len, "rename")) {
+        fprintf(stderr, "  [FILE] rename: bad name (replace=%u root=0x%08X len=%u buf=0x%08X)\n",
+                replace, root, len, buf);
+        fflush(stderr);
+        return (NTSTATUS)0xC0000033;                /* OBJECT_NAME_INVALID */
+    }
+    memcpy(name, XBOX_TO_NATIVE(buf), len);
+    name[len] = 0;
+
+    /* RootDirectory 0xFFFFFFFD is ObDosDevicesDirectory: the name is then a
+     * drive-letter path (XAPI MoveFile passes "z:\lng_us\x.ipk"), which the
+     * path rules translate like any absolute path. */
+    if (name[0] == '\\' || !root || root == 0xFFFFFFFDu
+            || (name[0] && name[1] == ':')) {
+        if (!xbox_translate_path(name, dst, MAX_PATH)) {
+            fprintf(stderr, "  [FILE] rename: cannot translate %s\n", name);
+            fflush(stderr);
+            return (NTSTATUS)0xC000003A;            /* OBJECT_PATH_NOT_FOUND */
+        }
+    } else {
+        HANDLE dir = bridge_resolve_handle(root);
+        WCHAR  base[MAX_PATH];
+        DWORD  n = GetFinalPathNameByHandleW(dir, base, MAX_PATH, 0);
+        if (!n || n >= MAX_PATH) {
+            fprintf(stderr, "  [FILE] rename: no path for root 0x%08X (%s)\n", root, name);
+            fflush(stderr);
+            return (NTSTATUS)0xC000003A;
+        }
+        swprintf_s(dst, MAX_PATH, L"%s\\%S", base, name);
+    }
+
+    {
+        size_t bytes = wcslen(dst) * sizeof(WCHAR);
+        size_t total = sizeof(FILE_RENAME_INFO) + bytes;
+        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, total);
+        BOOL ok;
+        if (!fri)
+            return (NTSTATUS)0xC0000017;            /* NO_MEMORY */
+        fri->ReplaceIfExists = replace ? TRUE : FALSE;
+        fri->RootDirectory = NULL;
+        fri->FileNameLength = (DWORD)bytes;
+        memcpy(fri->FileName, dst, bytes);
+        ok = SetFileInformationByHandle(handle, FileRenameInfo, fri, (DWORD)total);
+        free(fri);
+        /* A handle opened without DELETE access cannot rename itself; fall
+         * back to renaming the path it refers to. */
+        if (!ok && GetFinalPathNameByHandleW(handle, src, MAX_PATH, 0))
+            ok = MoveFileExW(src, dst, replace ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (shown++ < 16) {
+            fprintf(stderr, "  [FILE] rename -> %s %s (err=%lu)\n", name,
+                    ok ? "ok" : "FAILED", ok ? 0ul : (unsigned long)GetLastError());
+            fflush(stderr);
+        }
+        if (ok)
+            return 0;
+        return GetLastError() == ERROR_ALREADY_EXISTS
+            ? (NTSTATUS)0xC0000035                  /* OBJECT_NAME_COLLISION */
+            : (NTSTATUS)0xC0000022;                 /* ACCESS_DENIED */
+    }
+}
+#endif
+
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
 static void bridge_NtSetInformationFile(void)
 {
@@ -3566,6 +3651,14 @@ static void bridge_NtSetInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
+#ifdef _WIN32
+    if (infoclass == 10 && length >= 16) {   /* FileRenameInformation */
+        NTSTATUS st = bridge_rename_file(handle, info_va);
+        bridge_write_iostatus(ios_va, st, 0);
+        g_eax = (uint32_t)st;
+        return;
+    }
+#endif
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
