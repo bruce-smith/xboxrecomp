@@ -379,6 +379,10 @@ def load_coalescences(path):
     with open(path, encoding="utf-8") as stream:
         entries = json.load(stream)
     fields = {"start", "end", "coalesce_starts"}
+    # Optional: interior starts the title's evidence shows are reached only
+    # from inside the owner (a loop back-edge into a false split). See
+    # coalesce_function for how they are still checked.
+    optional = {"internal_alias_starts"}
 
     def address(value):
         if not isinstance(value, str) or not value.startswith("0x"):
@@ -392,13 +396,17 @@ def load_coalescences(path):
         raise ValueError(f"{path}: expected an array of coalescence entries")
     parsed = []
     for entry in entries:
-        if (not isinstance(entry, dict) or set(entry) != fields
-                or not isinstance(entry["coalesce_starts"], list)):
+        if (not isinstance(entry, dict) or not fields <= set(entry)
+                or not set(entry) <= fields | optional
+                or not isinstance(entry["coalesce_starts"], list)
+                or not isinstance(entry.get("internal_alias_starts", []), list)):
             raise ValueError(f"{path}: expected start, end and coalesce_starts")
         parsed.append({
             "start": address(entry["start"]),
             "end": address(entry["end"]),
             "coalesce_starts": [address(item) for item in entry["coalesce_starts"]],
+            "internal_alias_starts": [
+                address(item) for item in entry.get("internal_alias_starts", [])],
         })
     return parsed
 
@@ -567,7 +575,8 @@ class FunctionTranslator:
 
         return self.recovered_function_starts
 
-    def coalesce_function(self, target, end, expected_starts):
+    def coalesce_function(self, target, end, expected_starts,
+                          internal_alias_starts=()):
         """Merge an explicitly named set of false interior function starts.
 
         A false split can lose flags or turn a back-edge into host recursion.
@@ -614,14 +623,45 @@ class FunctionTranslator:
         if protected:
             reject(
                 f"interior start 0x{protected[0]:08X} is protected by manual code")
+        # A tail_jump_alias is normally evidence of an outside entry. The
+        # caller may name aliases its own evidence shows are reached only from
+        # inside [target, end) -- the back-edge of a loop that a false split
+        # turned into host recursion (Blinx 2's sub_00044900 overflowed the
+        # host stack that way). Only a bare alias qualifies: one with a
+        # prologue, callers or any other strong method still rejects.
+        internal = set(internal_alias_starts)
+        if any(start not in actual for start in internal):
+            reject("internal_alias_starts must be listed interior starts")
+
+        def waived(start):
+            info = self.func_db[start]
+            return (start in internal
+                    and info.get("detection_method") == "tail_jump_alias"
+                    and not info.get("has_prologue")
+                    and not info.get("called_by")
+                    and not info.get("external_entry")
+                    and start not in self.coalesced_function_starts)
+
         strong = [start for start in actual
-                  if self._is_strong_entry(self.func_db[start], start)]
+                  if not waived(start)
+                  and self._is_strong_entry(self.func_db[start], start)]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
+        # An interior's detected end may run past ``end`` into the gap before
+        # the next detected function -- a jump table placed after the code,
+        # which the detector counted as body (Blinx 2's sub_00044900 ends its
+        # code at 0x00044FD8 and its table runs to 0x00045000). That gap is
+        # not code; the exact tiling checks below still fail closed if decoded
+        # instructions reach past ``end``. Anything beyond the next function
+        # start is a real crossing.
+        next_start = min((start for start in self.func_db if start >= end),
+                         default=None)
         overruns = [
             start for start in actual
             if self.func_db[start].get("end", start) > end
+            and (next_start is None
+                 or self.func_db[start].get("end", start) > next_start)
         ]
         if overruns:
             reject(f"interior function 0x{overruns[0]:08X} crosses end")
@@ -2736,7 +2776,8 @@ class BatchTranslator:
             for path in coalesce_json_paths:
                 for entry in load_coalescences(path):
                     self.translator.coalesce_function(
-                        entry["start"], entry["end"], entry["coalesce_starts"])
+                        entry["start"], entry["end"], entry["coalesce_starts"],
+                        entry.get("internal_alias_starts", ()))
                     self.translator.discover_static_indirect_targets(
                         coalescing=True)
 

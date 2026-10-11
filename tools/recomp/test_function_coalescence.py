@@ -1252,3 +1252,81 @@ def test_batch_preserves_callbacks_exposed_between_repairs(
         bounds.write_text(json.dumps(repairs), encoding="utf-8")
     with pytest.raises(ValueError, match="independent evidence|callback"):
         BatchTranslator(image, functions, coalesce_json_paths=paths)
+
+
+def test_named_internal_alias_is_coalesced():
+    # A bare tail_jump_alias the caller vouches for as internal (a loop
+    # back-edge into a false split) may be merged into its owner.
+    subject = translator()
+    subject.func_db[SPLITS[0]]["detection_method"] = "tail_jump_alias"
+    subject.coalesce_function(BASE, END, SPLITS, [SPLITS[0]])
+    assert list(subject.func_db) == [BASE]
+
+
+def test_unnamed_alias_still_counts_as_evidence():
+    subject = translator()
+    subject.func_db[SPLITS[0]]["detection_method"] = "tail_jump_alias"
+    before = copy.deepcopy(subject.func_db)
+    with pytest.raises(ValueError, match="independent evidence"):
+        subject.coalesce_function(BASE, END, SPLITS)
+    assert subject.func_db == before
+
+
+@pytest.mark.parametrize("extra", [
+    {"has_prologue": True}, {"called_by": [hex(BASE + 0x100)]},
+    {"external_entry": True},
+])
+def test_internal_alias_waiver_never_hides_other_evidence(extra):
+    subject = translator()
+    subject.func_db[SPLITS[0]].update({"detection_method": "tail_jump_alias", **extra})
+    with pytest.raises(ValueError, match="independent evidence"):
+        subject.coalesce_function(BASE, END, SPLITS, [SPLITS[0]])
+
+
+def test_internal_alias_waiver_only_applies_to_aliases():
+    subject = translator()
+    subject.func_db[SPLITS[0]]["detection_method"] = "call_target"
+    with pytest.raises(ValueError, match="independent evidence"):
+        subject.coalesce_function(BASE, END, SPLITS, [SPLITS[0]])
+
+
+def test_internal_alias_starts_must_be_interior_starts():
+    subject = translator()
+    with pytest.raises(ValueError, match="internal_alias_starts"):
+        subject.coalesce_function(BASE, END, SPLITS, [BASE + 1])
+
+
+def test_loader_accepts_optional_internal_alias_starts(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps([{
+        "start": "0x00010000", "end": "0x0001001B",
+        "coalesce_starts": ["0x0001000D"],
+        "internal_alias_starts": ["0x0001000D"]}]))
+    (entry,) = load_coalescences(str(path))
+    assert entry["internal_alias_starts"] == [0x1000D]
+    path.write_text(json.dumps([{
+        "start": "0x00010000", "end": "0x0001001B",
+        "coalesce_starts": ["0x0001000D"], "note": "x"}]))
+    with pytest.raises(ValueError):
+        load_coalescences(str(path))
+
+
+def test_interior_end_may_reach_the_next_function_through_a_gap():
+    # A jump table after the code can make an interior's detected end run
+    # past the owner's code end up to the next function. That is not a
+    # crossing.
+    subject = translator()
+    nxt = END + 8
+    subject.func_db[nxt] = function(nxt, nxt + 4)
+    subject.func_db[SPLITS[-1]]["end"] = nxt
+    subject.coalesce_function(BASE, END, SPLITS)
+    assert BASE in subject.func_db and SPLITS[-1] not in subject.func_db
+
+
+def test_interior_end_past_the_next_function_still_crosses():
+    subject = translator()
+    nxt = END + 8
+    subject.func_db[nxt] = function(nxt, nxt + 4)
+    subject.func_db[SPLITS[-1]]["end"] = nxt + 1
+    with pytest.raises(ValueError, match="crosses end"):
+        subject.coalesce_function(BASE, END, SPLITS)
