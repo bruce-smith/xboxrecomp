@@ -891,12 +891,36 @@ static void framebuffer_probe_tick(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* Under RECOMP_VBLANK the runtime does raise one GPU interrupt, so its
+     * pending bits (PCRTC_INTR_0 bit 0, and PMC_INTR_0 bit 24 that mirrors
+     * it) must stay set until the title acknowledges -- zeroing them on sight
+     * lost most vblanks before D3D's DPC read PMC_INTR_0, and Blinx 2's frame
+     * callback ran at 2-3 Hz. The acknowledgement is write-1-to-clear, which
+     * plain RAM cannot see, so the vblank tick sets PCRTC_INTR_0 to
+     * 1 | XBOX_NV2A_VBLANK_MARK: D3D acks with a plain "= 1", the marker
+     * disappears, and that is the ack. Then both bits drop, which is also
+     * what ends D3D's "ack, then spin while PMC_INTR_0 says PCRTC" loop. */
+    int vblank = getenv("RECOMP_VBLANK") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (vblank) {
+            volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
+            volatile uint32_t *pmc   = (volatile uint32_t *)((char *)regs + 0x000100);
+            uint32_t p = *pcrtc;
+            if ((p & 1u) && !(p & XBOX_NV2A_VBLANK_MARK))
+                *pcrtc = p = 0;                     /* acknowledged */
+            if (!(p & 1u) && (*pmc & (1u << 24)))
+                *pmc &= ~(1u << 24);
+        }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+            uint32_t mask = NV2A_ACK[i].busy_mask;
+            if (vblank && NV2A_ACK[i].offset == 0x000100)
+                mask &= ~(1u << 24);
+            if (vblank && NV2A_ACK[i].offset == 0x600100)
+                mask &= ~(1u | XBOX_NV2A_VBLANK_MARK);
+            if (*r & mask) {
+                *r &= ~mask;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {

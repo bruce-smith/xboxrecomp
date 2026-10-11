@@ -403,6 +403,12 @@ extern uint32_t g_xbox_contig_size;
 #define XBOX_CONTIG_SIZE g_xbox_contig_size
 #define XBOX_CONTIG_SIZE_MAX (128u * 1024u * 1024u)
 
+/* Set alongside the vblank bit in PCRTC_INTR_0 by the runtime's vblank tick.
+ * The title acknowledges with a plain write of 1, which erases it -- the only
+ * way plain RAM can show a write-1-to-clear acknowledgement. See the NV2A ack
+ * thread in xbox_memory_layout.c. */
+#define XBOX_NV2A_VBLANK_MARK 0x80000000u
+
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
 

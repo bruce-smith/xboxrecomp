@@ -2289,6 +2289,13 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* The pending bits stay set until the title acknowledges them: D3D's ISR only
+ * queues a DPC, and the DPC is what reads PMC_INTR_0, sees the PCRTC bit and
+ * runs the vblank work -- including the title's vertical-blank callback. The
+ * NV2A ack thread (xbox_memory_layout.c) used to zero both registers
+ * continuously, so the bit was usually gone by the time the DPC looked, and
+ * Blinx 2's callback ran at 2-3 Hz instead of 60. It now clears them only
+ * once the title's write-1-to-clear ack has erased XBOX_NV2A_VBLANK_MARK. */
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2322,7 +2329,8 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
+        NV2A_PCRTC_INTR_VBLANK | XBOX_NV2A_VBLANK_MARK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     {
