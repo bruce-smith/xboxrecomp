@@ -144,6 +144,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* The window is the game: closing it ends the process. It used to
+         * close only the window and leave the title running invisibly, so
+         * a double-clicked exe had to be killed from Task Manager.
+         * TerminateProcess rather than exit(): guest threads are mid-flight,
+         * and CRT teardown under them can hang. */
+        InterlockedExchange(&s_fb_running, 0);
+        fprintf(stderr, "  [FBWIN] window closed; exiting\n");
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 0);
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
@@ -285,6 +295,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    /* In front, titled from the start: it opens a few seconds after launch,
+     * when something else may have the focus, and the keyboard pad
+     * stand-in only sees keys sent to this window. */
+    SetWindowTextW(hwnd, s_title);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    SetForegroundWindow(hwnd);
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
