@@ -300,6 +300,9 @@ static struct {
      * whether any stage had a texture bound. These were never counted, which
      * is why the report said "0 textured" over frames full of textures. */
     uint32_t program_textured, program_no_tex;
+    /* Raster batches (rq_kick) and their sizes: ~6 a frame in the hub. */
+    uint32_t rq_pooled, rq_inline;     /* inline: no pool (RASTER_THREADS=1) */
+    uint64_t rq_tris, rq_px;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t blend_equation, blend_color;
     uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
@@ -2158,6 +2161,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 
 typedef struct {
     int n, nst, nsurf;                  /* nsurf < 0: too many to track */
+    long px;                            /* bounding-box pixels queued */
     XfTri tri[NV_RQ_TRIS];
     Nv2aVshOutput v[NV_RQ_TRIS][3];
     PixState st[NV_RQ_STATES];
@@ -2199,6 +2203,7 @@ static void rq_count(const XfCount *c)
 static struct {
     int n;                                  /* worker threads */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
+    HANDLE thread[NV_RASTER_MAX_THREADS];
     volatile LONG pending;
     const RasterBatch *batch;
     XfCount cnt[NV_RASTER_MAX_THREADS];
@@ -2238,12 +2243,20 @@ static int raster_pool_size(void)
             s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
             for (k = 0; k < n; k++) {
                 s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
-                CloseHandle(CreateThread(NULL, 0, raster_worker,
-                                         (LPVOID)(intptr_t)k, 0, NULL));
+                s_pool.thread[k] = CreateThread(NULL, 0, raster_worker,
+                                                (LPVOID)(intptr_t)k, 0, NULL);
             }
         }
     }
     return s_pool.n;
+}
+
+/* Raster worker k's thread handle, or NULL before the pool starts (on the
+ * first draw) or without one. For a sampling profiler: with the executor
+ * waiting on the workers, theirs is the time worth timing. */
+void *nv2a_pb_exec_raster_thread(int k)
+{
+    return k >= 0 && k < s_pool.n ? s_pool.thread[k] : NULL;
 }
 
 static void rq_wait(void)
@@ -2257,6 +2270,7 @@ static void rq_wait(void)
     s_rq_busy = -1;
 }
 #else
+void *nv2a_pb_exec_raster_thread(int k) { (void)k; return NULL; }
 static int raster_pool_size(void) { return 1; }
 static void rq_wait(void) { }
 #endif
@@ -2271,6 +2285,8 @@ static void rq_kick(void)
         return;
     if (b->n) {
         rq_wait();
+        s_gpu.rq_tris += (uint64_t)b->n;
+        s_gpu.rq_px += (uint64_t)b->px;
 #if defined(_WIN32)
         if (raster_pool_size() > 1) {
             int k;
@@ -2280,16 +2296,19 @@ static void rq_kick(void)
             for (k = 0; k < s_pool.n; k++)
                 SetEvent(s_pool.start[k]);
             s_rq_fill ^= 1;
+            s_gpu.rq_pooled++;
         } else
 #endif
         {
             XfCount c = {0, 0, 0, 0, 0};
             xf_rows_queue(b->tri, b->n, 0, 1, &c);
             rq_count(&c);
+            s_gpu.rq_inline++;
         }
     }
     b = s_rq[s_rq_fill];
     b->n = b->nst = b->nsurf = 0;
+    b->px = 0;
     s_rq_ps = NULL;
 }
 
@@ -2417,6 +2436,7 @@ static void xfq_push(XfTri *T)
     T->vc = &b->v[i][2]; T->c = b->v[i][2].pos;
     T->ps = s_rq_ps;
     b->tri[i] = *T;
+    b->px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
 }
 
 /* A draw call starts: its state is captured afresh by its first triangle. */
@@ -2979,7 +2999,10 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    static int verbose = -1;                /* getenv per draw was 3% */
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4007,6 +4030,10 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex-program batches: %u with a texture on some"
                     " stage, %u with none\n",
             s_gpu.program_textured, s_gpu.program_no_tex);
+    fprintf(stderr, "[GPU] raster batches: %u to the pool, %u inline;"
+                    " %llu triangles, %llu bbox pixels\n",
+            s_gpu.rq_pooled, s_gpu.rq_inline,
+            (unsigned long long)s_gpu.rq_tris, (unsigned long long)s_gpu.rq_px);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
