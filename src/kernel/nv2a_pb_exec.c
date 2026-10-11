@@ -333,6 +333,9 @@ static struct {
     uint32_t zeta_offset, zstencil_clear;
 } s_gpu;
 
+/* Deferred rasterisation (below): drain everything queued. */
+static void rq_sync(void);
+
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
@@ -594,6 +597,7 @@ static int s_flip_dumping;
 
 static void dump_surface_bmp(void)
 {
+    rq_sync();
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     int drawn = s_gpu.drawn_offset != 0;
@@ -681,51 +685,125 @@ static uint8_t *s_surface;          /* host address of surface row 0 */
  * The tables hold each coordinate's byte offset, rebuilt when the format
  * changes, so a pixel costs two loads and an OR. */
 #define NV_SWZ_MAX 4096
-static struct {
+#define NV_SWZ_TABLES 4
+typedef struct {
     uint32_t format;                    /* SURFACE_FORMAT the tables are for */
-    int on;
     uint32_t w, h;
     uint32_t x[NV_SWZ_MAX], y[NV_SWZ_MAX];
-} s_swz;
+} SwzTable;
+/* A few, by format: with rasterisation deferred, queued triangles may still
+ * be writing through one table when the title moves on to a surface of
+ * another size. */
+static SwzTable s_swz_tab[NV_SWZ_TABLES];
+static int s_swz_used, s_swz_next;
 
-static int surface_swizzled(void)
+/* The current colour surface's swizzle tables, or NULL for a pitch surface. */
+static const SwzTable *surface_swizzled(void)
 {
     uint32_t f = s_gpu.format, lw, lh, mx, my, i, bpp;
+    SwzTable *t;
+    int k;
 
-    if (f == s_swz.format)
-        return s_swz.on;
-    s_swz.format = f;
-    s_swz.on = 0;
     lw = (f >> 16) & 0xFF;
     lh = (f >> 24) & 0xFF;
     if (((f >> 8) & 0xF) != 2 || lw > 12 || lh > 12)
-        return 0;
+        return NULL;
+    for (k = 0; k < s_swz_used; k++)
+        if (s_swz_tab[k].format == f)
+            return &s_swz_tab[k];
+    if (s_swz_used < NV_SWZ_TABLES) {
+        k = s_swz_used++;
+    } else {
+        rq_sync();                    /* queued triangles may use the evictee */
+        k = s_swz_next++ % NV_SWZ_TABLES;
+    }
+    t = &s_swz_tab[k];
     switch (f & 0xF) {                            /* as surface_bpp() */
     case 0x1: case 0x2: case 0x3: case 0xA: bpp = 2; break;
     case 0x9: bpp = 1; break;
     default: bpp = 4; break;
     }
-    s_swz.w = 1u << lw;
-    s_swz.h = 1u << lh;
-    xbox_swizzle_masks(s_swz.w, s_swz.h, &mx, &my);
-    for (i = 0; i < s_swz.w; i++)
-        s_swz.x[i] = swizzle_deposit(i, mx) * bpp;
-    for (i = 0; i < s_swz.h; i++)
-        s_swz.y[i] = swizzle_deposit(i, my) * bpp;
-    s_swz.on = 1;
-    return 1;
+    t->format = f;
+    t->w = 1u << lw;
+    t->h = 1u << lh;
+    xbox_swizzle_masks(t->w, t->h, &mx, &my);
+    for (i = 0; i < t->w; i++)
+        t->x[i] = swizzle_deposit(i, mx) * bpp;
+    for (i = 0; i < t->h; i++)
+        t->y[i] = swizzle_deposit(i, my) * bpp;
+    return t;
+}
+
+/* Everything a pixel needs from the GPU state, copied once per draw call.
+ *
+ * Rasterisation is deferred (see "Deferred rasterisation") and runs on worker
+ * threads while the executor walks on and changes the live state, so the
+ * pixel path must not read s_gpu. It reads P, the state of the triangle the
+ * calling thread is drawing: xf_rows sets it per triangle, and drawing done
+ * directly on the executor sets it to s_live. */
+typedef struct {
+    uint8_t *surface;                   /* host address of the colour surface */
+    const SwzTable *swz;                /* NULL: a pitch surface */
+    uint32_t pitch;
+    uint32_t clip_x, clip_y, clip_w, clip_h;
+    uint32_t color_mask, alpha_test, alpha_func, alpha_ref;
+    uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
+    uint32_t blend_color;
+    uint32_t depth_test, depth_func, depth_mask, zpass_enable;
+    uint32_t clip_plane_mode;
+    Nv2aCombiner rc;
+    Texture texs[4];
+} PixState;
+
+static NV_TLS const PixState *P;
+static PixState s_live;
+
+static void pix_capture(PixState *ps)
+{
+    memset(ps, 0, sizeof *ps);            /* padding too: states are memcmp'd */
+    ps->surface = s_surface;
+    ps->swz = surface_swizzled();
+    ps->pitch = s_gpu.pitch;
+    ps->clip_x = s_gpu.clip_x; ps->clip_y = s_gpu.clip_y;
+    ps->clip_w = s_gpu.clip_w; ps->clip_h = s_gpu.clip_h;
+    ps->color_mask = s_gpu.color_mask;
+    ps->alpha_test = s_gpu.alpha_test;
+    ps->alpha_func = s_gpu.alpha_func;
+    ps->alpha_ref = s_gpu.alpha_ref;
+    ps->blend_enable = s_gpu.blend_enable;
+    ps->blend_sfactor = s_gpu.blend_sfactor;
+    ps->blend_dfactor = s_gpu.blend_dfactor;
+    ps->blend_equation = s_gpu.blend_equation;
+    ps->blend_color = s_gpu.blend_color;
+    ps->depth_test = s_gpu.depth_test;
+    ps->depth_func = s_gpu.depth_func;
+    ps->depth_mask = s_gpu.depth_mask;
+    ps->zpass_enable = s_gpu.zpass_enable;
+    ps->clip_plane_mode = s_gpu.clip_plane_mode;
+    ps->rc = s_gpu.rc;
+    memcpy(ps->texs, s_gpu.texs, sizeof ps->texs);
+}
+
+/* Drawing straight from the executor thread (screen-space batches, texture
+ * dumps): whatever is queued goes first, then the live state applies. */
+static void pix_direct(void)
+{
+    rq_sync();
+    pix_capture(&s_live);
+    P = &s_live;
 }
 
 /* Host address of surface pixel (x, y), swizzled or pitch. NULL when a
  * swizzled surface's clip reaches past its own size. */
-static uint8_t *surface_pixel(uint8_t *base, int x, int y, uint32_t bpp)
+static uint8_t *surface_pixel(int x, int y, uint32_t bpp)
 {
-    if (s_swz.on && s_swz.format == s_gpu.format) {
-        if ((uint32_t)x >= s_swz.w || (uint32_t)y >= s_swz.h)
+    const SwzTable *t = P->swz;
+    if (t) {
+        if ((uint32_t)x >= t->w || (uint32_t)y >= t->h)
             return NULL;
-        return base + s_swz.x[x] + s_swz.y[y];
+        return P->surface + t->x[x] + t->y[y];
     }
-    return base + (size_t)y * s_gpu.pitch + (size_t)x * bpp;
+    return P->surface + (size_t)y * P->pitch + (size_t)x * bpp;
 }
 
 static int surface_begin_batch(const uint8_t *mem)
@@ -735,7 +813,6 @@ static int surface_begin_batch(const uint8_t *mem)
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
     s_surface = (uint8_t *)mem + base;
-    surface_swizzled();
     return 1;
 }
 
@@ -744,7 +821,9 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+    const SwzTable *swz;
 
+    rq_sync();                            /* queued pixels land first */
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
@@ -758,15 +837,15 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
-    if (surface_swizzled()) {
+    if ((swz = surface_swizzled()) != NULL) {
         /* Pixel by pixel through the swizzle tables. A clip covering the whole
          * surface could be one fill, but clears are not where the time goes. */
         uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                 | ((s_gpu.clear_color >> 5) & 0x07E0)
                                 | ((s_gpu.clear_color >> 3) & 0x001F));
-        for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h && y < s_swz.h; y++)
-            for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w && x < s_swz.w; x++) {
-                uint8_t *p = mem + s_gpu.color_base + s_swz.x[x] + s_swz.y[y];
+        for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h && y < swz->h; y++)
+            for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w && x < swz->w; x++) {
+                uint8_t *p = mem + s_gpu.color_base + swz->x[x] + swz->y[y];
                 if (bpp == 4)
                     *(uint32_t *)p = s_gpu.clear_color;
                 else if (bpp == 2)
@@ -1141,7 +1220,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 {
-    return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+    return sample_tex(&P->texs[0], 0, u, v, argb);
 }
 
 /* Write a bound texture out as a BMP, through the sampler rather than around it.
@@ -1159,6 +1238,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
  */
 static void dump_texture_bmp(uint32_t seq)
 {
+    pix_direct();
     const char *prefix = getenv("RECOMP_TEX_DUMP");
     uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
     uint32_t row_bytes, pad, filesz;
@@ -1230,7 +1310,7 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
 {
     int k;
     for (k = 0; k < 4; k++) {
-        float c = (float)((s_gpu.blend_color >> (k == 3 ? 24 : 16 - 8 * k))
+        float c = (float)((P->blend_color >> (k == 3 ? 24 : 16 - 8 * k))
                           & 0xFF) / 255.0f;
         switch (f) {
         case 0x0000: out[k] = 0.0f;            break;   /* ZERO                */
@@ -1246,11 +1326,33 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
         case 0x0308: out[k] = k == 3 ? 1.0f : fminf(s[3], 1.0f - d[3]); break;
         case 0x8001: out[k] = c;               break;   /* CONSTANT_COLOR      */
         case 0x8002: out[k] = 1.0f - c;        break;
-        case 0x8003: out[k] = (float)(s_gpu.blend_color >> 24) / 255.0f; break;
-        case 0x8004: out[k] = 1.0f - (float)(s_gpu.blend_color >> 24) / 255.0f; break;
+        case 0x8003: out[k] = (float)(P->blend_color >> 24) / 255.0f; break;
+        case 0x8004: out[k] = 1.0f - (float)(P->blend_color >> 24) / 255.0f; break;
         default:     out[k] = f ? 1.0f : 0.0f; break;
         }
     }
+}
+
+/* Pixels written and the brightest, per thread. They were s_gpu fields that
+ * every raster worker bumped for every pixel, and that one contended cache
+ * line held 16 workers to the throughput of about eight. Folded into s_gpu
+ * by stats_fold() on the executor. */
+static NV_TLS uint64_t t_pixels;
+static NV_TLS uint32_t t_pixel_max;
+
+static void stats_take(uint64_t *n, uint32_t *mx)
+{
+    *n = t_pixels;
+    *mx = t_pixel_max;
+    t_pixels = 0;
+    t_pixel_max = 0;
+}
+
+static void stats_fold(uint64_t n, uint32_t mx)
+{
+    s_gpu.pixels += n;
+    if ((mx & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+        s_gpu.pixel_max = mx;
 }
 
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
@@ -1258,14 +1360,14 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     uint8_t *px;
 
     (void)mem;
-    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
+    if (x < (int)P->clip_x || x >= (int)(P->clip_x + P->clip_w))
         return;
-    if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+    if (y < (int)P->clip_y || y >= (int)(P->clip_y + P->clip_h))
         return;
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
-    px = surface_pixel(s_surface, x, y, bpp);
+    t_pixels++;
+    if ((argb & 0x00FFFFFFu) > (t_pixel_max & 0x00FFFFFFu))
+        t_pixel_max = argb;
+    px = surface_pixel(x, y, bpp);
     if (!px)
         return;
 
@@ -1275,8 +1377,8 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      * pair was written opaque. Menus never noticed; a race does: Burnout 3
      * finishes its 3D frame with screen-space passes that modulate or add
      * over the scene, and written opaque they paint the whole view over. */
-    if (s_gpu.blend_enable
-        && !(s_gpu.blend_sfactor == 1 && s_gpu.blend_dfactor == 0)) {
+    if (P->blend_enable
+        && !(P->blend_sfactor == 1 && P->blend_dfactor == 0)) {
         uint32_t dst = 0xFF000000u;
         float sc[4], dc[4], sf[4], df[4], out[4];
         int k;
@@ -1292,11 +1394,11 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
             sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
             dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
         }
-        blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
-        blend_factor(s_gpu.blend_dfactor, sc, dc, df);
+        blend_factor(P->blend_sfactor, sc, dc, sf);
+        blend_factor(P->blend_dfactor, sc, dc, df);
         for (k = 0; k < 4; k++) {
             float a = sc[k] * sf[k], b = dc[k] * df[k];
-            switch (s_gpu.blend_equation) {
+            switch (P->blend_equation) {
             case 0x800A: out[k] = a - b; break;               /* SUBTRACT     */
             case 0x800B: out[k] = b - a; break;               /* REV_SUBTRACT */
             case 0x8007: out[k] = fminf(sc[k], dc[k]); break; /* MIN          */
@@ -1307,12 +1409,12 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         argb = pack_color(out);
     }
 
-    if (s_gpu.color_mask != 0x01010101u) {
+    if (P->color_mask != 0x01010101u) {
         uint32_t keep = 0, old;
-        if (!(s_gpu.color_mask & 0x01000000u)) keep |= 0xFF000000u;
-        if (!(s_gpu.color_mask & 0x00010000u)) keep |= 0x00FF0000u;
-        if (!(s_gpu.color_mask & 0x00000100u)) keep |= 0x0000FF00u;
-        if (!(s_gpu.color_mask & 0x00000001u)) keep |= 0x000000FFu;
+        if (!(P->color_mask & 0x01000000u)) keep |= 0xFF000000u;
+        if (!(P->color_mask & 0x00010000u)) keep |= 0x00FF0000u;
+        if (!(P->color_mask & 0x00000100u)) keep |= 0x0000FF00u;
+        if (!(P->color_mask & 0x00000001u)) keep |= 0x000000FFu;
         if (keep == 0xFFFFFFFFu)
             return;
         if (bpp == 4) {
@@ -1357,6 +1459,7 @@ static void raster_triangle(const float a[2], const float b[2],
      * one pixel at a time than 4.9 MB at once. */
     if (!surface_begin_batch(mem))
         return;
+    pix_direct();
 
     minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
     maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
@@ -1647,6 +1750,7 @@ static float *zbuf_current(int create)
             return s_zbufs[i].z;
     if (!create)
         return NULL;
+    rq_sync();                     /* the slot reused may still be in use */
     i = s_zbuf_next++ & 3;
     if (!s_zbufs[i].z)
         s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
@@ -1660,6 +1764,7 @@ static float *zbuf_current(int create)
 
 static void zbuf_clear(void)
 {
+    rq_sync();
     float *z = zbuf_current(1), v = zclear_value();
     size_t k;
     if (z)
@@ -1669,7 +1774,7 @@ static void zbuf_clear(void)
 
 static int depth_pass(float z, float stored)
 {
-    switch (s_gpu.depth_func) {                   /* GL enums, as the NV2A */
+    switch (P->depth_func) {                   /* GL enums, as the NV2A */
     case 0x200: return 0;
     case 0x201: return z <  stored;
     case 0x202: return z == stored;
@@ -1779,8 +1884,8 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
 static int rc_stage_fetch(int st, const float c[4], float out[4])
 {
-    const Texture *t = &s_gpu.texs[st];
-    uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
+    const Texture *t = &P->texs[st];
+    uint32_t mode = (P->rc.stage_program >> (st * 5)) & 0x1F, j;
     float q = c[3] != 0.0f ? c[3] : 1.0f;
 
     switch (mode) {
@@ -1818,7 +1923,7 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
     case 5:                                       /* CLIPPLANE */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         for (j = 0; j < 4; j++) {
-            int ge = (s_gpu.clip_plane_mode >> (st * 4 + j)) & 1;
+            int ge = (P->clip_plane_mode >> (st * 4 + j)) & 1;
             if (ge ? c[j] >= 0.0f : c[j] < 0.0f)
                 return 0;
         }
@@ -1859,8 +1964,8 @@ static float fog_factor(float d)
 
 static int alpha_test_pass(float a)
 {
-    int v = (int)(a * 255.0f + 0.5f), r = (int)(s_gpu.alpha_ref & 0xFF);
-    switch (s_gpu.alpha_func) {
+    int v = (int)(a * 255.0f + 0.5f), r = (int)(P->alpha_ref & 0xFF);
+    switch (P->alpha_func) {
     case 0x200: return 0;                         /* NEVER    */
     case 0x201: return v <  r;                    /* LESS     */
     case 0x202: return v == r;                    /* EQUAL    */
@@ -1882,9 +1987,13 @@ typedef struct {
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
+    const PixState *ps;                 /* the draw's state, for P */
 } XfTri;
 
-typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
+typedef struct {
+    uint64_t depth_fail, pixels, written;
+    uint32_t zpass, written_max;
+} XfCount;
 
 /* Rows y0, y0+step, ... < maxy of triangle T. */
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
@@ -1893,6 +2002,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
     int x, y, k;
 
+    P = T->ps;
     for (y = y0; y < T->maxy; y += step) {
         for (x = T->minx; x < T->maxx; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
@@ -1909,11 +2019,11 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
-                int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
+                int shade = (P->color_mask & 0x01010101u) || P->alpha_test;
                 /* Depth test, then shade, then alpha test, and only then the
                  * depth write: an alpha-tested texel that is cut away must
                  * not leave its depth behind (foliage, fences). */
-                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                if (zp && P->depth_test && !depth_pass(z, *zp)) {
                     cnt->depth_fail++;
                     continue;
                 }
@@ -1930,7 +2040,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
                         fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
                         for (st = 0; st < 4 && keep; st++) {
-                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
+                            if (!((P->rc.stage_program >> (st * 5)) & 0x1F)) {
                                 t[st][0] = t[st][1] = t[st][2] = 0.0f;
                                 t[st][3] = 1.0f;
                                 continue;
@@ -1942,9 +2052,9 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                         }
                         if (!keep)
                             continue;
-                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
+                        nv2a_rc_eval(&P->rc, col, d1, fog,
                                      (const float (*)[4])t, out);
-                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                        if (P->alpha_test && !alpha_test_pass(out[3]))
                             continue;
                         argb = pack_color(out);
                     } else {
@@ -1958,16 +2068,16 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                                                (uint32_t)(int32_t)floorf(tv), &texel))
                                 argb = modulate(texel, col);
                         }
-                        if (s_gpu.alpha_test
+                        if (P->alpha_test
                             && !alpha_test_pass((float)(argb >> 24) / 255.0f))
                             continue;
                     }
                 }
-                if (zp && s_gpu.depth_mask)
+                if (zp && P->depth_mask)
                     *zp = z;
-                if (s_gpu.zpass_enable)
+                if (P->zpass_enable)
                     cnt->zpass++;
-                if (!(s_gpu.color_mask & 0x01010101u))
+                if (!(P->color_mask & 0x01010101u))
                     continue;              /* colour writes off: depth only */
                 cnt->pixels++;
             }
@@ -1976,31 +2086,50 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     }
 }
 
-/* Worker threads for big triangles.
+/* Deferred rasterisation.
  *
- * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
- * handful of full-screen passes -- composites, blurs, the menu backdrops --
- * each two triangles of 300,000 pixels through the register combiners. Those
- * split cleanly by row: every pixel reads only its own depth and colour, so
- * interleaved rows on N threads need no locking. Small triangles stay on the
- * executor thread, where waking workers would cost more than it saves.
- * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
- * few cores for the title and the host.
- * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
- * may undercount; nothing depends on them. */
+ * Triangles used to be rasterised per draw call: set up, then the pool woken
+ * for the call's rows, then waited for. A Blinx 2 hub frame is ~400 draw
+ * calls, most a few hundred to a few thousand pixels, so the pool sat idle
+ * while the executor shaded them itself -- it was ~70% inside its own xf_rows
+ * and the title spent 85-92% of its time waiting for pushbuffer space.
+ *
+ * Now set-up triangles go into a batch together with a snapshot of the state
+ * they need (PixState, one per draw call, shared while it does not change).
+ * A full batch is handed to the workers and the executor goes on filling the
+ * other one, so the vertex programs and the pushbuffer walk overlap the
+ * shading. Each worker owns the rows y mod n through every triangle of a
+ * batch in submission order, and a batch starts only when the one before it
+ * is done, so depth testing and blending stay exactly sequential.
+ *
+ * Anything that touches the results from the executor thread drains the
+ * queue first (rq_sync): clears, depth-buffer reuse, visibility reports,
+ * flips, dumps, direct screen-space drawing -- and a draw that samples a
+ * surface the queue is still writing (render to texture: Blinx's floor
+ * reflection, its bloom downsample).
+ * RECOMP_RASTER_THREADS=<n> sets the workers (1: everything on the executor),
+ * RECOMP_RASTER_BATCH=0 drains after every draw call.
+ * Every count a worker keeps is its own until the batch ends (XfCount on
+ * its stack, put_pixel's in TLS): shared counters bumped per pixel made the
+ * workers fight over cache lines. */
 #define NV_RASTER_MAX_THREADS 16
-#define NV_RASTER_MT_MIN_PIXELS 8192
+#define NV_RQ_TRIS   4096
+#define NV_RQ_STATES 256
+#define NV_RQ_SURFS  8
 
-#if defined(_WIN32)
-static struct {
-    int n;                                  /* threads incl. the caller */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
-    volatile LONG pending;
-    const XfTri *tri;                       /* one big triangle, or ...    */
-    const XfTri *queue;                     /* ... a batch of them (qn)    */
-    int qn, qthreads;                       /* threads on this batch       */
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-} s_pool;
+typedef struct {
+    int n, nst, nsurf;                  /* nsurf < 0: too many to track */
+    XfTri tri[NV_RQ_TRIS];
+    Nv2aVshOutput v[NV_RQ_TRIS][3];
+    PixState st[NV_RQ_STATES];
+    uint32_t surf_lo[NV_RQ_SURFS], surf_hi[NV_RQ_SURFS];
+} RasterBatch;
+
+static RasterBatch *s_rq[2];
+static int s_rq_fill;                   /* the batch being filled */
+static int s_rq_busy = -1;              /* the batch the workers have */
+static const PixState *s_rq_ps;         /* this draw's state, in s_rq[fill] */
+static int s_rq_each = -1;              /* RECOMP_RASTER_BATCH=0 */
 
 /* First row >= y0 that thread k of n owns when rows are dealt out by
  * absolute y. Absolute, not relative to each triangle's top: every triangle
@@ -2019,23 +2148,40 @@ static void xf_rows_queue(const XfTri *q, int qn, int k, int n, XfCount *cnt)
         xf_rows(&q[i], xf_row_start(q[i].miny, k, n), n, cnt);
 }
 
+static void rq_count(const XfCount *c)
+{
+    s_gpu.xf_depth_fail += c->depth_fail;
+    s_gpu.xf_pixels += c->pixels;
+    s_gpu.zpass_count += c->zpass;
+    stats_fold(c->written, c->written_max);
+}
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* worker threads */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const RasterBatch *batch;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
+
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
     int k = (int)(intptr_t)arg;
     for (;;) {
+        XfCount c = {0, 0, 0, 0, 0};
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        if (s_pool.queue)
-            xf_rows_queue(s_pool.queue, s_pool.qn, k, s_pool.qthreads,
-                          &s_pool.cnt[k]);
-        else
-            xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        xf_rows_queue(s_pool.batch->tri, s_pool.batch->n, k, s_pool.n, &c);
+        stats_take(&c.written, &c.written_max);
+        s_pool.cnt[k] = c;
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
     return 0;
 }
 
+/* Worker threads; 1 means none, everything on the executor. The default
+ * leaves a few cores for the title and the host. */
 static int raster_pool_size(void)
 {
     static int init;
@@ -2051,7 +2197,7 @@ static int raster_pool_size(void)
         s_pool.n = n;
         if (n > 1) {
             s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
-            for (k = 0; k < n - 1; k++) {
+            for (k = 0; k < n; k++) {
                 s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
                 CloseHandle(CreateThread(NULL, 0, raster_worker,
                                          (LPVOID)(intptr_t)k, 0, NULL));
@@ -2061,144 +2207,195 @@ static int raster_pool_size(void)
     return s_pool.n;
 }
 
-static void xf_rows_parallel(const XfTri *T, XfCount *total)
+static void rq_wait(void)
 {
-    int n = raster_pool_size(), k;
-    long px = (long)(T->maxx - T->minx) * (T->maxy - T->miny);
-
-    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS || T->maxy - T->miny < n) {
-        xf_rows(T, T->miny, 1, total);
+    int k;
+    if (s_rq_busy < 0)
         return;
-    }
-    s_pool.tri = T;
-    s_pool.pending = n - 1;
-    for (k = 0; k < n - 1; k++)
-        SetEvent(s_pool.start[k]);
-    {
-        XfCount mine = {0, 0, 0};
-        xf_rows(T, T->miny + (n - 1), n, &mine);
-        WaitForSingleObject(s_pool.done, INFINITE);
-        total->depth_fail += mine.depth_fail;
-        total->pixels += mine.pixels;
-        total->zpass += mine.zpass;
-    }
-    for (k = 0; k < n - 1; k++) {
-        total->depth_fail += s_pool.cnt[k].depth_fail;
-        total->pixels += s_pool.cnt[k].pixels;
-        total->zpass += s_pool.cnt[k].zpass;
-    }
+    WaitForSingleObject(s_pool.done, INFINITE);
+    for (k = 0; k < s_pool.n; k++)
+        rq_count(&s_pool.cnt[k]);
+    s_rq_busy = -1;
 }
 #else
-static void xf_rows_parallel(const XfTri *T, XfCount *total)
-{
-    xf_rows(T, T->miny, 1, total);
-}
+static int raster_pool_size(void) { return 1; }
+static void rq_wait(void) { }
 #endif
 
-/* A draw call's triangles, rasterised together.
- *
- * The big-triangle split above helps full-screen passes and nothing else: a
- * 3D level is thousands of triangles of a few hundred to a few thousand
- * pixels, every one under NV_RASTER_MT_MIN_PIXELS, so all of them ran on the
- * executor thread. In Blinx 2's hub that thread was the frame rate -- the
- * title spent 87% of its time waiting for pushbuffer space.
- *
- * Within one draw call no GPU state changes, so the triangles can be set up
- * as they come and rasterised afterwards. Each thread then takes the rows it
- * owns (y mod n) through every queued triangle in submission order, which
- * keeps depth testing and blending exactly as sequential: a pixel is only
- * ever touched by one thread, in order. Vertices are copied because clipped
- * polygons live on the clipper's stack.
- * RECOMP_RASTER_BATCH=0 turns it off. */
-#define NV_XFQ_MAX 1024
-#define NV_XFQ_PX_PER_THREAD 1024
-static struct {
-    int on, n;
-    long px;
-    XfTri tri[NV_XFQ_MAX];
-    Nv2aVshOutput v[NV_XFQ_MAX][3];
-} s_xfq;
-
-static void xfq_flush(void)
+/* Hand the batch being filled to the workers (or draw it here, with no
+ * pool) and start filling the other one. */
+static void rq_kick(void)
 {
-    XfCount cnt = {0, 0, 0};
-    int i;
+    RasterBatch *b = s_rq[s_rq_fill];
 
-    if (!s_xfq.n)
+    if (!b)
         return;
+    if (b->n) {
+        rq_wait();
 #if defined(_WIN32)
-    {
-        /* One thread per NV_XFQ_PX_PER_THREAD pixels, up to the pool: waking
-         * the whole pool for a few thousand pixels costs more than it saves,
-         * and most of a 3D frame's draw calls are that size. */
-        int n = raster_pool_size(), k;
-        long want = s_xfq.px / NV_XFQ_PX_PER_THREAD;
-        if (want < n) n = (int)want;
-        if (n >= 2) {
-            s_pool.queue = s_xfq.tri;
-            s_pool.qn = s_xfq.n;
-            s_pool.qthreads = n;
-            s_pool.pending = n - 1;
-            for (k = 0; k < n - 1; k++)
+        if (raster_pool_size() > 1) {
+            int k;
+            s_pool.batch = b;
+            s_pool.pending = s_pool.n;
+            s_rq_busy = s_rq_fill;
+            for (k = 0; k < s_pool.n; k++)
                 SetEvent(s_pool.start[k]);
-            xf_rows_queue(s_xfq.tri, s_xfq.n, n - 1, n, &cnt);
-            WaitForSingleObject(s_pool.done, INFINITE);
-            s_pool.queue = NULL;
-            for (k = 0; k < n - 1; k++) {
-                cnt.depth_fail += s_pool.cnt[k].depth_fail;
-                cnt.pixels += s_pool.cnt[k].pixels;
-                cnt.zpass += s_pool.cnt[k].zpass;
-            }
-            goto counted;
+            s_rq_fill ^= 1;
+        } else
+#endif
+        {
+            XfCount c = {0, 0, 0, 0, 0};
+            xf_rows_queue(b->tri, b->n, 0, 1, &c);
+            rq_count(&c);
         }
     }
-#endif
-    for (i = 0; i < s_xfq.n; i++)
-        xf_rows(&s_xfq.tri[i], s_xfq.tri[i].miny, 1, &cnt);
-#if defined(_WIN32)
-counted:
-#endif
-    s_gpu.xf_depth_fail += cnt.depth_fail;
-    s_gpu.xf_pixels += cnt.pixels;
-    s_gpu.zpass_count += cnt.zpass;
-    s_xfq.n = 0;
-    s_xfq.px = 0;
+    b = s_rq[s_rq_fill];
+    b->n = b->nst = b->nsurf = 0;
+    s_rq_ps = NULL;
 }
 
-/* Queue a set-up triangle, or 0 when batching is off. */
-static int xfq_push(XfTri *T)
+static void rq_sync(void)
+{
+    uint64_t n;
+    uint32_t mx;
+    rq_kick();
+    rq_wait();
+    stats_take(&n, &mx);              /* the executor's own direct drawing */
+    stats_fold(n, mx);
+}
+
+static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 {
     int i;
-    if (!s_xfq.on)
+    if (b->nsurf < 0)
+        return 1;
+    for (i = 0; i < b->nsurf; i++)
+        if (lo < b->surf_hi[i] && b->surf_lo[i] < hi)
+            return 1;
+    return 0;
+}
+
+static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
+{
+    int i;
+    if (b->nsurf < 0)
+        return;
+    for (i = 0; i < b->nsurf; i++)
+        if (b->surf_lo[i] == lo && b->surf_hi[i] == hi)
+            return;
+    if (b->nsurf == NV_RQ_SURFS) {
+        b->nsurf = -1;                    /* every textured draw syncs */
+        return;
+    }
+    b->surf_lo[b->nsurf] = lo;
+    b->surf_hi[b->nsurf] = hi;
+    b->nsurf++;
+}
+
+/* Render to texture: a draw that samples memory the queue is still writing
+ * has to wait for it. Every stage with a texture counts, used or not --
+ * a stale binding costs a sync, not a wrong picture. */
+static void rq_check_textures(void)
+{
+    int st;
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &s_gpu.texs[st];
+        uint32_t lo, hi;
+        if (!t->valid)
+            continue;
+        lo = t->offset;
+        hi = lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
+        if ((s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
+            || (s_rq_busy >= 0 && rq_surf_overlaps(s_rq[s_rq_busy], lo, hi))) {
+            rq_sync();
+            return;
+        }
+    }
+}
+
+static int rq_ready(void)
+{
+    static int failed;
+    if (s_rq[0] && s_rq[1])
+        return 1;
+    if (failed)
         return 0;
-    if (s_xfq.n == NV_XFQ_MAX)
-        xfq_flush();
-    i = s_xfq.n++;
-    s_xfq.v[i][0] = *T->va;
-    s_xfq.v[i][1] = *T->vb;
-    s_xfq.v[i][2] = *T->vc;
-    T->va = &s_xfq.v[i][0]; T->a = s_xfq.v[i][0].pos;
-    T->vb = &s_xfq.v[i][1]; T->b = s_xfq.v[i][1].pos;
-    T->vc = &s_xfq.v[i][2]; T->c = s_xfq.v[i][2].pos;
-    s_xfq.tri[i] = *T;
-    s_xfq.px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+    s_rq[0] = (RasterBatch *)calloc(1, sizeof(RasterBatch));
+    s_rq[1] = (RasterBatch *)calloc(1, sizeof(RasterBatch));
+    if (!s_rq[0] || !s_rq[1]) {
+        free(s_rq[0]); free(s_rq[1]);
+        s_rq[0] = s_rq[1] = NULL;
+        failed = 1;
+        fprintf(stderr, "  [GPU] no memory for the raster queue;"
+                        " drawing on the executor\n");
+        return 0;
+    }
     return 1;
 }
 
-static void xfq_begin(void)
+/* Queue a set-up triangle with this draw call's state. */
+static void xfq_push(XfTri *T)
 {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("RECOMP_RASTER_BATCH");
-        enabled = !(e && *e == '0');
+    RasterBatch *b;
+    int i;
+
+    if (!rq_ready()) {
+        XfCount c = {0, 0, 0, 0, 0};
+        pix_capture(&s_live);
+        T->ps = &s_live;
+        xf_rows(T, T->miny, 1, &c);
+        rq_count(&c);
+        return;
     }
-    s_xfq.on = enabled;
+    /* Before taking pointers into the batch: a swizzle-table eviction syncs,
+     * and a sync swaps the batches. */
+    if (!s_rq_ps)
+        (void)surface_swizzled();
+    b = s_rq[s_rq_fill];
+    if (b->n == NV_RQ_TRIS || (!s_rq_ps && b->nst == NV_RQ_STATES)) {
+        rq_kick();
+        b = s_rq[s_rq_fill];
+    }
+    if (!s_rq_ps) {
+        PixState *ps = &b->st[b->nst];
+        uint32_t lo = dma_resolve(s_gpu.color_offset), bytes;
+        pix_capture(ps);
+        if (b->nst && memcmp(ps, &b->st[b->nst - 1], sizeof *ps) == 0)
+            ps = &b->st[b->nst - 1];
+        else
+            b->nst++;
+        s_rq_ps = ps;
+        bytes = ps->swz ? ps->swz->w * ps->swz->h * T->bpp
+                        : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
+        rq_note_surface(b, lo, lo + bytes);
+    }
+    i = b->n++;
+    b->v[i][0] = *T->va;
+    b->v[i][1] = *T->vb;
+    b->v[i][2] = *T->vc;
+    T->va = &b->v[i][0]; T->a = b->v[i][0].pos;
+    T->vb = &b->v[i][1]; T->b = b->v[i][1].pos;
+    T->vc = &b->v[i][2]; T->c = b->v[i][2].pos;
+    T->ps = s_rq_ps;
+    b->tri[i] = *T;
 }
 
+/* A draw call starts: its state is captured afresh by its first triangle. */
+static void xfq_begin(void)
+{
+    if (s_rq_each < 0) {
+        const char *e = getenv("RECOMP_RASTER_BATCH");
+        s_rq_each = e && *e == '0';
+    }
+    rq_check_textures();
+    s_rq_ps = NULL;
+}
+
+/* A frame trace counts each draw's pixels, so it drains per draw. */
 static void xfq_end(void)
 {
-    xfq_flush();
-    s_xfq.on = 0;
+    if (s_rq_each || s_ftrace == 2)
+        rq_sync();
 }
 
 /* Back-face culling, on the screen-space signed area (y down, so a
@@ -2229,7 +2426,6 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
     XfTri T;
-    XfCount cnt = {0, 0, 0};
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
@@ -2312,15 +2508,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
 
-    if (xfq_push(&T)) {
-        s_gpu.tris_drawn++;
-        note_drawn();
-        return;
-    }
-    xf_rows_parallel(&T, &cnt);
-    s_gpu.xf_depth_fail += cnt.depth_fail;
-    s_gpu.xf_pixels += cnt.pixels;
-    s_gpu.zpass_count += cnt.zpass;
+    xfq_push(&T);
     s_gpu.tris_drawn++;
     note_drawn();
 }
@@ -3231,6 +3419,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        rq_sync();
         s_gpu.zpass_count = 0;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
@@ -3246,7 +3435,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * The report DMA object starts at physical 0 here, as D3D sets it. */
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
-        uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        uint64_t stamp;
+        rq_sync();                         /* every queued pixel counted */
+        stamp = (uint64_t)s_gpu.reports++ * 1000u;
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
         memset(mem + at + 12, 0, 4);
@@ -3345,6 +3536,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_INCREMENT_WRITE:
+        rq_sync();                       /* the frame is finished */
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
@@ -3353,6 +3545,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
+        rq_sync();
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
@@ -3677,8 +3870,16 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* Finish every queued triangle. The NV2A thread calls this before it moves
+ * GET up to PUT. */
+void nv2a_pb_exec_drain(void)
+{
+    rq_sync();
+}
+
 void nv2a_pb_exec_report(void)
 {
+    rq_sync();
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {

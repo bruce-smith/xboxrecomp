@@ -1047,9 +1047,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
+                /* Consumed, now that it has actually been executed --
+                 * including the triangles the executor queued for its
+                 * raster workers. GET at PUT tells D3D it may reuse what the
+                 * commands pointed at (vertex data, textures it rewrites), so
+                 * no queued pixel may still be reading it. */
                 {
-                    volatile uint32_t *get =
+                    extern void nv2a_pb_exec_drain(void);
+                    volatile uint32_t *get;
+                    nv2a_pb_exec_drain();
+                    get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
                     *get = put;
