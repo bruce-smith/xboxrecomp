@@ -2153,10 +2153,10 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  * Now set-up triangles go into a batch together with a snapshot of the state
  * they need (PixState, one per draw call, shared while it does not change).
  * A full batch is handed to the workers and the executor goes on filling the
- * other one, so the vertex programs and the pushbuffer walk overlap the
- * shading. Each worker owns the rows y mod n through every triangle of a
- * batch in submission order, and a batch starts only when the one before it
- * is done, so depth testing and blending stay exactly sequential.
+ * next one, so the vertex programs and the pushbuffer walk overlap the
+ * shading. Every band of rows goes through the batches, and through each
+ * batch's triangles, in submission order, so depth testing and blending stay
+ * exactly sequential (see the pool below).
  *
  * Anything that touches the results from the executor thread drains the
  * queue first (rq_sync): clears, depth-buffer reuse, visibility reports,
@@ -2168,7 +2168,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  * Every count a worker keeps is its own until the batch ends (XfCount on
  * its stack, put_pixel's in TLS): shared counters bumped per pixel made the
  * workers fight over cache lines. */
-#define NV_RASTER_MAX_THREADS 16
+#define NV_RASTER_MAX_THREADS 32      /* default: cores - 4 */
 #define NV_RQ_TRIS   4096
 #define NV_RQ_STATES 256
 #define NV_RQ_SURFS  8
@@ -2183,9 +2183,10 @@ typedef struct {
     uint32_t surf_lo[NV_RQ_SURFS], surf_hi[NV_RQ_SURFS];
 } RasterBatch;
 
-static RasterBatch *s_rq[2];
+#define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
+
+static RasterBatch *s_rq[NV_RQ_DEPTH];
 static int s_rq_fill;                   /* the batch being filled */
-static int s_rq_busy = -1;              /* the batch the workers have */
 static const PixState *s_rq_ps;         /* this draw's state, in s_rq[fill] */
 static int s_rq_each = -1;              /* RECOMP_RASTER_BATCH=0 */
 
@@ -2233,49 +2234,114 @@ static void rq_count(const XfCount *c)
 }
 
 #if defined(_WIN32)
+/* The pool works on a pipeline of batches rather than one at a time.
+ *
+ * Each band of NV_BAND rows takes the submitted batches strictly in order --
+ * band_next[b] is the next batch it owes -- so depth testing and blending
+ * stay exactly sequential for every pixel, but different bands may be on
+ * different batches. A worker claims a free band and runs it through every
+ * batch submitted so far, then looks for another. One batch at a time (all
+ * workers start it, all finish it, then the next) left a worker idle 44% of
+ * the time in Blinx 2's hub: a batch touching a few rows has only a few
+ * bands, and every batch ended in a tail the whole pool waited out, with the
+ * executor waiting behind it -- and the title waiting on the executor.
+ *
+ * The executor fills one batch while up to NV_RQ_DEPTH - 1 are in flight;
+ * it waits only when the ring is full or something drains (rq_wait). */
+#define NV_MAX_BANDS 1024                   /* 4096 rows */
+
 static struct {
     int n;                                  /* worker threads */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
     HANDLE thread[NV_RASTER_MAX_THREADS];
-    volatile LONG pending;
-    const RasterBatch *batch;
-    volatile LONG next_band;                /* next band to claim */
-    LONG band_end;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-    /* A fence waiting on this batch (see rq_fence): whoever finishes the
-     * batch's last band -- a worker, or the executor helping in rq_wait --
-     * releases it, so the title sees it as soon as the pixels are written
-     * and the executor never stops for it. rel_armed is taken with an
-     * exchange, so exactly one thread releases. */
-    volatile LONG bands_done;
-    LONG band_total;
-    volatile LONG rel_armed;
-    uint32_t rel_off, rel_val;
+    SRWLOCK lock;
+    CONDITION_VARIABLE work_cv, done_cv;
+    volatile LONG head;                     /* batches submitted */
+    LONG tail;                              /* batches retired (executor) */
+    volatile LONG band_next[NV_MAX_BANDS];  /* next batch each band owes */
+    volatile LONG band_busy[NV_MAX_BANDS];
+    int band0[NV_RQ_DEPTH], band1[NV_RQ_DEPTH]; /* bands a batch touches */
+    volatile LONG left[NV_RQ_DEPTH];        /* its bands not yet drawn */
+    volatile LONG done[NV_RQ_DEPTH];
+    volatile LONG slot_seq[NV_RQ_DEPTH];    /* which batch a slot holds */
+    int nbands;                             /* bands any batch has used */
+    XfCount cnt[NV_RASTER_MAX_THREADS + 1]; /* + 1: the executor helping */
 } s_pool;
 
-static void rq_band_done(void)
+static int band_has_work(int b)
 {
-    if (InterlockedIncrement(&s_pool.bands_done) == s_pool.band_total
-            && InterlockedExchange(&s_pool.rel_armed, 0))
-        xbox_Nv2aSemaphoreRelease(s_pool.rel_off, s_pool.rel_val);
+    return s_pool.band_next[b] < s_pool.head && !s_pool.band_busy[b];
+}
+
+/* Claim one band that owes a batch and draw it through every batch
+ * submitted so far. Returns 0 if there was nothing to claim. */
+static int rq_work_one(int k, int *start)
+{
+    int nb = s_pool.nbands, i;
+
+    for (i = 0; i < nb; i++) {
+        int b = (*start + i) % nb;
+        LONG seq;
+        XfCount *c = &s_pool.cnt[k];
+
+        if (!band_has_work(b)
+            || InterlockedCompareExchange(&s_pool.band_busy[b], 1, 0))
+            continue;
+        while ((seq = s_pool.band_next[b]) < s_pool.head) {
+            int slot = seq % NV_RQ_DEPTH, in;
+            /* A band the batch does not touch can fall behind until the
+             * slot holds a newer batch. Read the range between two looks
+             * at slot_seq: if the slot moved on, batch seq was retired --
+             * which needs every band it touches -- so this one it does not. */
+            in = s_pool.slot_seq[slot] == seq
+                 && b >= s_pool.band0[slot] && b < s_pool.band1[slot];
+            MemoryBarrier();
+            if (in && s_pool.slot_seq[slot] == seq) {
+                const RasterBatch *rb = s_rq[slot];
+                uint64_t wn;
+                uint32_t wmx;
+                xf_band(rb->tri, rb->n, b, c);
+                stats_take(&wn, &wmx);          /* resets: accumulate */
+                c->written += wn;
+                if ((wmx & 0x00FFFFFFu) > (c->written_max & 0x00FFFFFFu))
+                    c->written_max = wmx;
+                InterlockedExchange(&s_pool.band_next[b], seq + 1);
+                if (InterlockedDecrement(&s_pool.left[slot]) == 0) {
+                    AcquireSRWLockExclusive(&s_pool.lock);
+                    s_pool.done[slot] = 1;
+                    WakeAllConditionVariable(&s_pool.done_cv);
+                    ReleaseSRWLockExclusive(&s_pool.lock);
+                }
+            } else {
+                InterlockedExchange(&s_pool.band_next[b], seq + 1);
+            }
+        }
+        InterlockedExchange(&s_pool.band_busy[b], 0);
+        *start = b + 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int rq_any_work(void)
+{
+    int b;
+    for (b = 0; b < s_pool.nbands; b++)
+        if (band_has_work(b))
+            return 1;
+    return 0;
 }
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
-    int k = (int)(intptr_t)arg;
+    int k = (int)(intptr_t)arg, start = k * 7;
     for (;;) {
-        XfCount c = {0, 0, 0, 0, 0};
-        LONG band;
-        WaitForSingleObject(s_pool.start[k], INFINITE);
-        while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
-               < s_pool.band_end) {
-            xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
-            rq_band_done();
-        }
-        stats_take(&c.written, &c.written_max);
-        s_pool.cnt[k] = c;
-        if (InterlockedDecrement(&s_pool.pending) == 0)
-            SetEvent(s_pool.done);
+        if (rq_work_one(k, &start))
+            continue;
+        AcquireSRWLockExclusive(&s_pool.lock);
+        while (!rq_any_work())
+            SleepConditionVariableSRW(&s_pool.work_cv, &s_pool.lock,
+                                      INFINITE, 0);
+        ReleaseSRWLockExclusive(&s_pool.lock);
     }
     return 0;
 }
@@ -2295,14 +2361,13 @@ static int raster_pool_size(void)
         if (n < 1) n = 1;
         if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
         s_pool.n = n;
-        if (n > 1) {
-            s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
-            for (k = 0; k < n; k++) {
-                s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+        InitializeSRWLock(&s_pool.lock);
+        InitializeConditionVariable(&s_pool.work_cv);
+        InitializeConditionVariable(&s_pool.done_cv);
+        if (n > 1)
+            for (k = 0; k < n; k++)
                 s_pool.thread[k] = CreateThread(NULL, 0, raster_worker,
                                                 (LPVOID)(intptr_t)k, 0, NULL);
-            }
-        }
     }
     return s_pool.n;
 }
@@ -2315,35 +2380,59 @@ void *nv2a_pb_exec_raster_thread(int k)
     return k >= 0 && k < s_pool.n ? s_pool.thread[k] : NULL;
 }
 
+/* Retire finished batches in order, so their slots can be refilled. */
+static void rq_reap(void)
+{
+    while (s_pool.tail < s_pool.head
+           && s_pool.done[s_pool.tail % NV_RQ_DEPTH])
+        s_pool.tail++;
+}
+
+/* Wait until at most `keep` batches are in flight, drawing bands alongside
+ * the workers rather than sleeping. */
+static void rq_wait_until(LONG keep)
+{
+    int start = 0;
+    for (;;) {
+        rq_reap();
+        if (s_pool.head - s_pool.tail <= keep)
+            return;
+        if (rq_work_one(s_pool.n, &start))
+            continue;
+        AcquireSRWLockExclusive(&s_pool.lock);
+        if (!s_pool.done[s_pool.tail % NV_RQ_DEPTH] && !rq_any_work())
+            SleepConditionVariableSRW(&s_pool.done_cv, &s_pool.lock, 1, 0);
+        ReleaseSRWLockExclusive(&s_pool.lock);
+    }
+}
+
+/* Everything queued drawn, and every count folded in. */
 static void rq_wait(void)
 {
     int k;
-    if (s_rq_busy < 0)
+    if (s_pool.head == s_pool.tail)
         return;
-    {
-        /* Claim bands alongside the workers rather than sleep. */
-        XfCount c = {0, 0, 0, 0, 0};
-        LONG band;
-        while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
-               < s_pool.band_end) {
-            xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
-            rq_band_done();
-        }
-        rq_count(&c);
-    }
-    WaitForSingleObject(s_pool.done, INFINITE);
-    for (k = 0; k < s_pool.n; k++)
+    rq_wait_until(0);
+    for (k = 0; k <= s_pool.n; k++) {
+        XfCount z = {0, 0, 0, 0, 0};
         rq_count(&s_pool.cnt[k]);
-    s_rq_busy = -1;
+        s_pool.cnt[k] = z;
+    }
+}
+
+static int rq_in_flight(void)
+{
+    return s_pool.head != s_pool.tail;
 }
 #else
 void *nv2a_pb_exec_raster_thread(int k) { (void)k; return NULL; }
 static int raster_pool_size(void) { return 1; }
 static void rq_wait(void) { }
+static int rq_in_flight(void) { return 0; }
 #endif
 
 /* Hand the batch being filled to the workers (or draw it here, with no
- * pool) and start filling the other one. */
+ * pool) and start filling the next one. */
 static void rq_kick(void)
 {
     RasterBatch *b = s_rq[s_rq_fill];
@@ -2351,23 +2440,35 @@ static void rq_kick(void)
     if (!b)
         return;
     if (b->n) {
-        rq_wait();
         s_gpu.rq_tris += (uint64_t)b->n;
         s_gpu.rq_px += (uint64_t)b->px;
 #if defined(_WIN32)
         if (raster_pool_size() > 1) {
-            int k;
-            s_pool.batch = b;
-            s_pool.next_band = b->ymin / NV_BAND;
-            s_pool.band_end = (b->ymax + NV_BAND - 1) / NV_BAND;
-            s_pool.band_total = s_pool.band_end - s_pool.next_band;
-            s_pool.bands_done = 0;
-            s_pool.pending = s_pool.n;
-            s_rq_busy = s_rq_fill;
-            for (k = 0; k < s_pool.n; k++)
-                SetEvent(s_pool.start[k]);
-            s_rq_fill ^= 1;
+            int slot = s_rq_fill;
+            int b0 = b->ymin / NV_BAND;
+            int b1 = (b->ymax + NV_BAND - 1) / NV_BAND;
+            if (b1 > NV_MAX_BANDS) b1 = NV_MAX_BANDS;
+            if (b0 > b1) b0 = b1;
+            s_pool.band0[slot] = b0;
+            s_pool.band1[slot] = b1;
+            s_pool.left[slot] = b1 - b0;
+            s_pool.done[slot] = b1 == b0;
+            s_pool.slot_seq[slot] = s_pool.head;
+            if (b1 > s_pool.nbands) {
+                /* New bands owe nothing from before this batch. */
+                int nb;
+                for (nb = s_pool.nbands; nb < b1; nb++)
+                    s_pool.band_next[nb] = s_pool.head;
+                s_pool.nbands = b1;
+            }
+            AcquireSRWLockExclusive(&s_pool.lock);
+            InterlockedIncrement(&s_pool.head);
+            WakeAllConditionVariable(&s_pool.work_cv);
+            ReleaseSRWLockExclusive(&s_pool.lock);
             s_gpu.rq_pooled++;
+            /* The next slot must be retired before it is refilled. */
+            rq_wait_until(NV_RQ_DEPTH - 1);
+            s_rq_fill = s_pool.head % NV_RQ_DEPTH;
         } else
 #endif
         {
@@ -2391,7 +2492,7 @@ static void rq_sync_at(int line)
 {
     uint64_t n;
     uint32_t mx;
-    if (s_rq_busy >= 0 || (s_rq[s_rq_fill] && s_rq[s_rq_fill]->n)) {
+    if (rq_in_flight() || (s_rq[s_rq_fill] && s_rq[s_rq_fill]->n)) {
         int i;
         for (i = 0; i < 24 && s_sync_sites[i].line && s_sync_sites[i].line != line; i++)
             ;
@@ -2415,11 +2516,9 @@ static void rq_sync_at(int line)
  * looks at what was drawn (flips, clears, visibility reports, render to
  * texture) drain the queue already.
  *
- * RECOMP_FENCE_STRICT=1 releases only once the pixels are written as well:
- * the queued work goes to the workers and the release rides on that batch,
- * so the executor does not stop for it. The title then waits on the
- * rasteriser at every fence: Blinx 2's hub ran at 12.4 fps that way against
- * 17.0, and at 11.6 when the executor drained the queue itself (rq_sync). */
+ * RECOMP_FENCE_STRICT=1 releases only once the pixels are written as well,
+ * by draining the queue first. The title then waits on the rasteriser at
+ * every fence: Blinx 2's hub ran at 11.6 fps that way against 17.0. */
 static void rq_fence(uint32_t off, uint32_t val)
 {
     static int strict = -1;
@@ -2427,27 +2526,8 @@ static void rq_fence(uint32_t off, uint32_t val)
         const char *e = getenv("RECOMP_FENCE_STRICT");
         strict = e && *e == '1';
     }
-    if (!strict) {
-        xbox_Nv2aSemaphoreRelease(off, val);
-        return;
-    }
-#if defined(_WIN32)
-    if (s_pool.rel_armed)
-        rq_wait();                    /* one fence in flight at a time */
-    rq_kick();
-    if (s_rq_busy >= 0) {
-        s_pool.rel_off = off;
-        s_pool.rel_val = val;
-        InterlockedExchange(&s_pool.rel_armed, 1);
-        /* The batch may have finished before the arm: then release here. */
-        if (s_pool.bands_done >= s_pool.band_total
-                && InterlockedExchange(&s_pool.rel_armed, 0))
-            xbox_Nv2aSemaphoreRelease(off, val);
-        return;
-    }
-#else
-    rq_kick();
-#endif
+    if (strict)
+        rq_sync();
     xbox_Nv2aSemaphoreRelease(off, val);
 }
 
@@ -2479,6 +2559,24 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
     b->nsurf++;
 }
 
+/* Does anything queued -- filling or still being drawn -- write [lo, hi)? */
+static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
+{
+    if (s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
+        return 1;
+#if defined(_WIN32)
+    {
+        LONG seq;
+        rq_reap();
+        for (seq = s_pool.tail; seq < s_pool.head; seq++)
+            if (!s_pool.done[seq % NV_RQ_DEPTH]
+                && rq_surf_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
+                return 1;
+    }
+#endif
+    return 0;
+}
+
 /* Render to texture: a draw that samples memory the queue is still writing
  * has to wait for it. Only stages the draw can sample count: those the
  * shader stage program enables, or stage 0 before the combiners are
@@ -2498,8 +2596,7 @@ static void rq_check_textures(void)
             continue;
         lo = t->offset;
         hi = lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
-        if ((s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
-            || (s_rq_busy >= 0 && rq_surf_overlaps(s_rq[s_rq_busy], lo, hi))) {
+        if (rq_queue_overlaps(lo, hi)) {
             rq_sync();
             return;
         }
@@ -2509,21 +2606,25 @@ static void rq_check_textures(void)
 static int rq_ready(void)
 {
     static int failed;
-    if (s_rq[0] && s_rq[1])
+    int i;
+    if (s_rq[0])
         return 1;
     if (failed)
         return 0;
-    s_rq[0] = (RasterBatch *)calloc(1, sizeof(RasterBatch));
-    s_rq[1] = (RasterBatch *)calloc(1, sizeof(RasterBatch));
-    if (!s_rq[0] || !s_rq[1]) {
-        free(s_rq[0]); free(s_rq[1]);
-        s_rq[0] = s_rq[1] = NULL;
-        failed = 1;
-        fprintf(stderr, "  [GPU] no memory for the raster queue;"
-                        " drawing on the executor\n");
-        return 0;
+    for (i = 0; i < NV_RQ_DEPTH; i++) {
+        s_rq[i] = (RasterBatch *)calloc(1, sizeof(RasterBatch));
+        if (!s_rq[i]) {
+            while (i--) {
+                free(s_rq[i]);
+                s_rq[i] = NULL;
+            }
+            failed = 1;
+            fprintf(stderr, "  [GPU] no memory for the raster queue;"
+                            " drawing on the executor\n");
+            return 0;
+        }
+        s_rq[i]->ymin = 1 << 30;
     }
-    s_rq[0]->ymin = s_rq[1]->ymin = 1 << 30;
     return 1;
 }
 
