@@ -308,6 +308,7 @@ static struct {
     /* Raster batches (rq_kick) and their sizes: ~6 a frame in the hub. */
     uint32_t rq_pooled, rq_inline;     /* inline: no pool (RASTER_THREADS=1) */
     uint64_t rq_tris, rq_px;
+    uint64_t xf_parallel_verts;          /* set up on the pool */
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t blend_equation, blend_color;
     uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
@@ -2219,6 +2220,28 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RQ_SURFS  8
 #define NV_RQ_TEXS   16
 
+/* One draw's geometry, deferred to the raster pool: its vertex inputs and
+ * constants are copied into the batch, and a worker transforms, assembles,
+ * clips and sets it up into the `cap` triangle slots reserved for it at
+ * tri0 -- in order, so the batch draws exactly what the executor would have
+ * queued. Slots it does not fill are left empty (no rows). */
+static void geo_fold(const GeoStats *st);
+static void geo_capture(GeoCtx *g);
+static uint32_t geo_count(uint32_t prim, uint32_t n);
+typedef void (*GeoSink)(void *sink, XfTri *T);
+static void geo_assemble(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
+                         uint32_t prim, const Nv2aVshOutput *x, uint32_t n);
+#define NV_RQ_GEO    1024               /* draws per batch */
+#define NV_RQ_GVERTS 32768              /* their vertices */
+typedef struct {
+    const Nv2aVshProg *prog;
+    uint32_t in0, n, prim, tri0, cap, cst;
+    GeoCtx g;
+    const PixState *ps;
+    int ymin, ymax;                     /* rows drawn, once done */
+    long px;
+} GeoJob;
+
 typedef struct {
     int n, nst, nsurf;                  /* nsurf < 0: too many to track */
     long px;                            /* bounding-box pixels queued */
@@ -2231,6 +2254,12 @@ typedef struct {
      * them starts a new batch (see rq_tex_overlaps). ntex < 0: too many. */
     int ntex;
     uint32_t tex_lo[NV_RQ_TEXS], tex_hi[NV_RQ_TEXS];
+    GeoJob *geo;                        /* NV_RQ_GEO */
+    int ngeo;
+    uint32_t nin;
+    float (*in)[NV2A_VSH_INPUTS][4];    /* NV_RQ_GVERTS */
+    float (*cst)[NV2A_VSH_CONSTANTS][4];/* NV_RQ_GEO */
+    volatile LONG geo_next, geo_left;
 } RasterBatch;
 
 #define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
@@ -2314,6 +2343,9 @@ static struct {
     volatile LONG left[NV_RQ_DEPTH];        /* its bands not yet drawn */
     volatile LONG done[NV_RQ_DEPTH];
     volatile LONG slot_seq[NV_RQ_DEPTH];    /* which batch a slot holds */
+    volatile LONG geo_ready[NV_RQ_DEPTH];   /* its geometry is all set up */
+    Nv2aVshOutput *xf_scratch[NV_RASTER_MAX_THREADS + 1];
+    GeoStats gst[NV_RASTER_MAX_THREADS + 1];
     int nbands;                             /* bands any batch has used */
     XfCount cnt[NV_RASTER_MAX_THREADS + 1]; /* + 1: the executor helping */
 } s_pool;
@@ -2343,6 +2375,13 @@ static int rq_work_one(int k, int *start)
              * slot holds a newer batch. Read the range between two looks
              * at slot_seq: if the slot moved on, batch seq was retired --
              * which needs every band it touches -- so this one it does not. */
+            if (s_pool.slot_seq[slot] == seq && !s_pool.geo_ready[slot]) {
+                /* Its triangles are still being set up, so which bands it
+                 * touches is not known yet. */
+                InterlockedExchange(&s_pool.band_busy[b], 0);
+                *start = b + 1;
+                return 2;
+            }
             in = s_pool.slot_seq[slot] == seq
                  && b >= s_pool.band0[slot] && b < s_pool.band1[slot];
             MemoryBarrier();
@@ -2373,9 +2412,94 @@ static int rq_work_one(int k, int *start)
     return 0;
 }
 
+static void geo_slot_sink(void *sink, XfTri *T);
+
+typedef struct {
+    RasterBatch *b;
+    uint32_t next, end;
+    const PixState *ps;
+    int ymin, ymax;
+    long px;
+} GeoSlots;
+
+/* A batch's last geometry job is done: its rows are known, so hand it to
+ * the bands, as rq_kick does for a batch with none. */
+static void rq_geo_finish(RasterBatch *b, int slot)
+{
+    int i, ymin = b->ymin, ymax = b->ymax, b0, b1;
+    for (i = 0; i < b->ngeo; i++) {
+        if (b->geo[i].ymin < ymin) ymin = b->geo[i].ymin;
+        if (b->geo[i].ymax > ymax) ymax = b->geo[i].ymax;
+    }
+    b0 = ymin / NV_BAND;
+    b1 = (ymax + NV_BAND - 1) / NV_BAND;
+    if (b1 > s_pool.nbands) b1 = s_pool.nbands;
+    if (b0 > b1) b0 = b1;
+    AcquireSRWLockExclusive(&s_pool.lock);
+    s_pool.band0[slot] = b0;
+    s_pool.band1[slot] = b1;
+    s_pool.left[slot] = b1 - b0;
+    s_pool.done[slot] = b1 == b0;
+    MemoryBarrier();
+    s_pool.geo_ready[slot] = 1;
+    WakeAllConditionVariable(&s_pool.work_cv);
+    WakeAllConditionVariable(&s_pool.done_cv);
+    ReleaseSRWLockExclusive(&s_pool.lock);
+}
+
+/* Claim and run one geometry job of the oldest batch that has one left. */
+static int rq_geo_work(int k)
+{
+    LONG seq;
+    for (seq = s_pool.tail; seq < s_pool.head; seq++) {
+        int slot = seq % NV_RQ_DEPTH;
+        RasterBatch *rb = s_rq[slot];
+        LONG j;
+        GeoJob *J;
+        GeoSlots S;
+        Nv2aVshOutput *xf;
+        uint32_t i;
+
+        if (s_pool.slot_seq[slot] != seq || s_pool.geo_ready[slot]
+            || rb->geo_next >= rb->ngeo)
+            continue;
+        j = InterlockedIncrement(&rb->geo_next) - 1;
+        if (j >= rb->ngeo)
+            continue;
+        J = &rb->geo[j];
+        if (!s_pool.xf_scratch[k])
+            s_pool.xf_scratch[k] = (Nv2aVshOutput *)malloc(
+                sizeof(Nv2aVshOutput) * NV_MAX_INDICES);
+        xf = s_pool.xf_scratch[k];
+        S.b = rb; S.next = J->tri0; S.end = J->tri0 + J->cap; S.ps = J->ps;
+        S.ymin = 1 << 30; S.ymax = 0; S.px = 0;
+        if (xf && nv2a_vsh_transform(J->prog, (const float (*)[4])rb->cst[J->cst],
+                                     (const float (*)[NV2A_VSH_INPUTS][4])
+                                         (rb->in + J->in0), J->n, xf))
+            geo_assemble(&J->g, &s_pool.gst[k], geo_slot_sink, &S, J->prim,
+                         xf, J->n);
+        for (i = S.next; i < S.end; i++) {     /* unused: no rows */
+            rb->tri[i].miny = rb->tri[i].maxy = 0;
+            rb->tri[i].minx = rb->tri[i].maxx = 0;
+        }
+        J->ymin = S.ymin; J->ymax = S.ymax; J->px = S.px;
+        if (InterlockedDecrement(&rb->geo_left) == 0)
+            rq_geo_finish(rb, slot);
+        return 1;
+    }
+    return 0;
+}
+
 static int rq_any_work(void)
 {
     int b;
+    LONG seq;
+    for (seq = s_pool.tail; seq < s_pool.head; seq++) {
+        int slot = seq % NV_RQ_DEPTH;
+        if (s_pool.slot_seq[slot] == seq && !s_pool.geo_ready[slot]
+            && s_rq[slot]->geo_next < s_rq[slot]->ngeo)
+            return 1;
+    }
     for (b = 0; b < s_pool.nbands; b++)
         if (band_has_work(b))
             return 1;
@@ -2386,8 +2510,12 @@ static DWORD WINAPI raster_worker(LPVOID arg)
 {
     int k = (int)(intptr_t)arg, start = k * 7;
     for (;;) {
-        if (rq_work_one(k, &start))
+        if (rq_geo_work(k))                 /* geometry first: bands wait on it */
             continue;
+        switch (rq_work_one(k, &start)) {
+        case 1: continue;
+        case 2: SwitchToThread(); continue; /* a batch's geometry is not done */
+        }
         AcquireSRWLockExclusive(&s_pool.lock);
         while (!rq_any_work())
             SleepConditionVariableSRW(&s_pool.work_cv, &s_pool.lock,
@@ -2415,6 +2543,10 @@ static int raster_pool_size(void)
         InitializeSRWLock(&s_pool.lock);
         InitializeConditionVariable(&s_pool.work_cv);
         InitializeConditionVariable(&s_pool.done_cv);
+        /* Every band from the start: with geometry set up on the pool a
+         * batch's rows are known only when it is done, so bands cannot be
+         * added as batches are submitted. */
+        s_pool.nbands = NV_ZBUF_H / NV_BAND;
         if (n > 1)
             for (k = 0; k < n; k++)
                 s_pool.thread[k] = CreateThread(NULL, 0, raster_worker,
@@ -2448,7 +2580,7 @@ static void rq_wait_until(LONG keep)
         rq_reap();
         if (s_pool.head - s_pool.tail <= keep)
             return;
-        if (rq_work_one(s_pool.n, &start))
+        if (rq_geo_work(s_pool.n) || rq_work_one(s_pool.n, &start) == 1)
             continue;
         AcquireSRWLockExclusive(&s_pool.lock);
         if (!s_pool.done[s_pool.tail % NV_RQ_DEPTH] && !rq_any_work())
@@ -2468,6 +2600,8 @@ static void rq_wait(void)
         XfCount z = {0, 0, 0, 0, 0};
         rq_count(&s_pool.cnt[k]);
         s_pool.cnt[k] = z;
+        geo_fold(&s_pool.gst[k]);
+        memset(&s_pool.gst[k], 0, sizeof s_pool.gst[k]);
     }
 }
 
@@ -2496,21 +2630,24 @@ static void rq_kick(void)
 #if defined(_WIN32)
         if (raster_pool_size() > 1) {
             int slot = s_rq_fill;
-            int b0 = b->ymin / NV_BAND;
-            int b1 = (b->ymax + NV_BAND - 1) / NV_BAND;
-            if (b1 > NV_MAX_BANDS) b1 = NV_MAX_BANDS;
-            if (b0 > b1) b0 = b1;
-            s_pool.band0[slot] = b0;
-            s_pool.band1[slot] = b1;
-            s_pool.left[slot] = b1 - b0;
-            s_pool.done[slot] = b1 == b0;
             s_pool.slot_seq[slot] = s_pool.head;
-            if (b1 > s_pool.nbands) {
-                /* New bands owe nothing from before this batch. */
-                int nb;
-                for (nb = s_pool.nbands; nb < b1; nb++)
-                    s_pool.band_next[nb] = s_pool.head;
-                s_pool.nbands = b1;
+            if (b->ngeo) {
+                /* Rows unknown until its geometry is set up: rq_geo_finish
+                 * hands it to the bands. */
+                s_pool.done[slot] = 0;
+                s_pool.geo_ready[slot] = 0;
+                b->geo_next = 0;
+                b->geo_left = b->ngeo;
+            } else {
+                int b0 = b->ymin / NV_BAND;
+                int b1 = (b->ymax + NV_BAND - 1) / NV_BAND;
+                if (b1 > s_pool.nbands) b1 = s_pool.nbands;
+                if (b0 > b1) b0 = b1;
+                s_pool.band0[slot] = b0;
+                s_pool.band1[slot] = b1;
+                s_pool.left[slot] = b1 - b0;
+                s_pool.done[slot] = b1 == b0;
+                s_pool.geo_ready[slot] = 1;
             }
             AcquireSRWLockExclusive(&s_pool.lock);
             InterlockedIncrement(&s_pool.head);
@@ -2531,6 +2668,8 @@ static void rq_kick(void)
     }
     b = s_rq[s_rq_fill];
     b->n = b->nst = b->nsurf = b->ntex = 0;
+    b->ngeo = 0;
+    b->nin = 0;
     b->px = 0;
     b->ymin = 1 << 30;
     b->ymax = 0;
@@ -2771,8 +2910,60 @@ static int rq_ready(void)
             return 0;
         }
         s_rq[i]->ymin = 1 << 30;
+        /* Geometry job space; without it every draw is set up here. */
+        s_rq[i]->geo = (GeoJob *)malloc(sizeof(GeoJob) * NV_RQ_GEO);
+        s_rq[i]->in = (float (*)[NV2A_VSH_INPUTS][4])malloc(
+            sizeof(float) * NV2A_VSH_INPUTS * 4 * NV_RQ_GVERTS);
+        s_rq[i]->cst = (float (*)[NV2A_VSH_CONSTANTS][4])malloc(
+            sizeof(float) * NV2A_VSH_CONSTANTS * 4 * NV_RQ_GEO);
+        if (!s_rq[i]->geo || !s_rq[i]->in || !s_rq[i]->cst) {
+            free(s_rq[i]->geo); free(s_rq[i]->in); free(s_rq[i]->cst);
+            s_rq[i]->geo = NULL; s_rq[i]->in = NULL; s_rq[i]->cst = NULL;
+        }
     }
     return 1;
+}
+
+/* A draw's state into batch b, once, at its first triangle (or when its
+ * geometry is queued): the PixState snapshot, and the surface and texture
+ * ranges the render-to-texture checks look at. A draw that renders into
+ * something a queued draw samples drains first, so b may change. */
+static RasterBatch *rq_draw_state(RasterBatch *b, uint32_t bpp)
+{
+    const SwzTable *swz = surface_swizzled();
+    uint32_t lo = dma_resolve(s_gpu.color_offset), bytes;
+    PixState *ps;
+
+    bytes = swz ? swz->w * swz->h * bpp
+                : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
+    if (rq_queue_samples(lo, lo + bytes)) {
+        rq_sync();
+        b = s_rq[s_rq_fill];
+    }
+    rt_seen_note(lo, lo + bytes);
+    ps = &b->st[b->nst];
+    pix_capture(ps);
+    if (b->nst && memcmp(ps, &b->st[b->nst - 1], sizeof *ps) == 0)
+        ps = &b->st[b->nst - 1];
+    else
+        b->nst++;
+    s_rq_ps = ps;
+    rq_note_surface(b, lo, lo + bytes);
+    rq_note_textures(b);
+    return b;
+}
+
+/* Triangle T into slot i of batch b, with its vertices copied alongside. */
+static void rq_put_tri(RasterBatch *b, int i, XfTri *T, const PixState *ps)
+{
+    b->v[i][0] = *T->va;
+    b->v[i][1] = *T->vb;
+    b->v[i][2] = *T->vc;
+    T->va = &b->v[i][0]; T->a = b->v[i][0].pos;
+    T->vb = &b->v[i][1]; T->b = b->v[i][1].pos;
+    T->vc = &b->v[i][2]; T->c = b->v[i][2].pos;
+    T->ps = ps;
+    b->tri[i] = *T;
 }
 
 /* Queue a set-up triangle with this draw call's state. */
@@ -2798,39 +2989,74 @@ static void xfq_push(XfTri *T)
         rq_kick();
         b = s_rq[s_rq_fill];
     }
-    if (!s_rq_ps) {
-        const SwzTable *swz = surface_swizzled();
-        uint32_t lo = dma_resolve(s_gpu.color_offset), bytes;
-        PixState *ps;
-        bytes = swz ? swz->w * swz->h * T->bpp
-                    : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
-        if (rq_queue_samples(lo, lo + bytes)) {
-            rq_sync();
-            b = s_rq[s_rq_fill];
-        }
-        rt_seen_note(lo, lo + bytes);
-        ps = &b->st[b->nst];
-        pix_capture(ps);
-        if (b->nst && memcmp(ps, &b->st[b->nst - 1], sizeof *ps) == 0)
-            ps = &b->st[b->nst - 1];
-        else
-            b->nst++;
-        s_rq_ps = ps;
-        rq_note_surface(b, lo, lo + bytes);
-        rq_note_textures(b);
-    }
+    if (!s_rq_ps)
+        b = rq_draw_state(b, T->bpp);
     i = b->n++;
-    b->v[i][0] = *T->va;
-    b->v[i][1] = *T->vb;
-    b->v[i][2] = *T->vc;
-    T->va = &b->v[i][0]; T->a = b->v[i][0].pos;
-    T->vb = &b->v[i][1]; T->b = b->v[i][1].pos;
-    T->vc = &b->v[i][2]; T->c = b->v[i][2].pos;
-    T->ps = s_rq_ps;
-    b->tri[i] = *T;
+    rq_put_tri(b, i, T, s_rq_ps);
     b->px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
     if (T->miny < b->ymin) b->ymin = T->miny;
     if (T->maxy > b->ymax) b->ymax = T->maxy;
+}
+
+/* A geometry job's triangle into the next of its reserved slots. */
+static void geo_slot_sink(void *sink, XfTri *T)
+{
+    GeoSlots *S = (GeoSlots *)sink;
+    if (S->next >= S->end)
+        return;                       /* cannot happen: 2 slots a triangle */
+    rq_put_tri(S->b, (int)S->next++, T, S->ps);
+    S->px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+    if (T->miny < S->ymin) S->ymin = T->miny;
+    if (T->maxy > S->ymax) S->ymax = T->maxy;
+}
+
+/* Queue a draw's geometry for the pool (see GeoJob): fetch its inputs and
+ * snapshot its constants and set-up state now, reserve its triangle slots,
+ * and let a worker do the rest. Returns 0 if the draw has to be set up
+ * here instead. */
+static int geo_queue(const Nv2aVshProg *prog, uint32_t n)
+{
+    GeoCtx g;
+    RasterBatch *b;
+    GeoJob *J;
+    uint32_t tris = geo_count(s_gpu.prim, n), cap = 2 * tris, i, a;
+
+    if (cap > NV_RQ_TRIS || n > NV_RQ_GVERTS)
+        return 0;
+    geo_capture(&g);
+    if (!tris || !g.ok)
+        return 1;                     /* draws nothing either way */
+    (void)surface_swizzled();
+    b = s_rq[s_rq_fill];
+    if (b->n + cap > NV_RQ_TRIS || b->nst == NV_RQ_STATES
+        || b->ngeo == NV_RQ_GEO || b->nin + n > NV_RQ_GVERTS) {
+        rq_kick();
+        b = s_rq[s_rq_fill];
+    }
+    b = rq_draw_state(b, g.bpp);
+    for (i = 0; i < n; i++)
+        for (a = 0; a < NV2A_VSH_INPUTS; a++)
+            fetch_input(a, s_gpu.idx[i], b->in[b->nin + i][a]);
+    memcpy(b->cst[b->ngeo], nv2a_vsh_constants(), sizeof b->cst[0]);
+    J = &b->geo[b->ngeo];
+    J->prog = prog;
+    J->in0 = b->nin;
+    J->n = n;
+    J->prim = s_gpu.prim;
+    J->tri0 = (uint32_t)b->n;
+    J->cap = cap;
+    J->cst = (uint32_t)b->ngeo;
+    J->g = g;
+    J->ps = s_rq_ps;
+    J->ymin = 1 << 30;
+    J->ymax = 0;
+    J->px = 0;
+    b->ngeo++;
+    b->nin += n;
+    b->n += (int)cap;
+    note_drawn();
+    s_gpu.xf_parallel_verts += n;
+    return 1;
 }
 
 /* A draw call starts: its state is captured afresh by its first triangle. */
@@ -2882,9 +3108,8 @@ static int geo_cull(const GeoCtx *g, GeoStats *st, float area)
     return 1;
 }
 
-/* Where a set-up triangle goes: the raster queue on the executor
+/* Where a set-up triangle goes (GeoSink): the raster queue on the executor
  * (xfq_push), or a geometry job's slots in its batch on the pool. */
-typedef void (*GeoSink)(void *sink, XfTri *T);
 
 static void geo_triangle(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
                          const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
@@ -3188,6 +3413,22 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    /* Geometry on the raster pool (GeoJob) unless something needs it here:
+     * RECOMP_SERIAL_XF=1, a vertex trace or timing (they read this loop),
+     * CXT_WRITE
+     * (vertices then depend on each other), no pool, or a program that
+     * could not be kept. */
+    static int serial_xf = -1, vtrace = -1;
+    const Nv2aVshProg *prog = NULL;
+    int deferred;
+    if (serial_xf < 0) {
+        serial_xf = getenv("RECOMP_SERIAL_XF") != NULL;
+        vtrace = getenv("RECOMP_VSH_TRACE") != NULL
+                 || getenv("RECOMP_VSH_TIME") != NULL;    /* times this loop */
+    }
+    deferred = !serial_xf && !vtrace && raster_pool_size() > 1 && rq_ready()
+               && s_rq[0]->geo && !nv2a_vsh_cxt_write()
+               && (prog = nv2a_vsh_snapshot()) != NULL;
 
     /* RECOMP_VSH_TIME=1: fetch + vertex-program time per vertex, every 10 s,
      * for A/B runs of the interpreter. */
@@ -3202,7 +3443,7 @@ static void raster_batch_program(void)
     /* Four at a time (nv2a_vsh_run4, bit-identical to one at a time): the
      * vertex program was a third of the executor in Blinx 2's hub. A short
      * tail repeats its last vertex to fill the lanes. */
-    for (i = 0; i < n; i += 4) {
+    for (i = 0; !deferred && i < n; i += 4) {
         static float in[4][NV2A_VSH_INPUTS][4];
         static Nv2aVshOutput tail[4];
         const float (*ip[4])[4];
@@ -3307,9 +3548,27 @@ static void raster_batch_program(void)
         note_texture_use();
 
     xfq_begin();
-    {
+    if (!deferred || !geo_queue(prog, n)) {
         GeoCtx g;
         GeoStats st;
+        if (deferred) {                 /* too big for a batch: transform here */
+            for (i = 0; i < n; i += 4) {
+                static float in[4][NV2A_VSH_INPUTS][4];
+                static Nv2aVshOutput tail[4];
+                const float (*ip[4])[4];
+                Nv2aVshOutput *op[4];
+                uint32_t l, a;
+                for (l = 0; l < 4; l++) {
+                    uint32_t j = i + l < n ? i + l : n - 1;
+                    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                        fetch_input(a, s_gpu.idx[j], in[l][a]);
+                    ip[l] = (const float (*)[4])in[l];
+                    op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
+                }
+                if (!nv2a_vsh_run4(ip, op))
+                    return;
+            }
+        }
         memset(&st, 0, sizeof st);
         geo_capture(&g);
         geo_assemble(&g, &st, xfq_sink, NULL, s_gpu.prim, s_xf, n);
@@ -4835,6 +5094,8 @@ void nv2a_pb_exec_report(void)
                     " %llu triangles, %llu bbox pixels\n",
             s_gpu.rq_pooled, s_gpu.rq_inline,
             (unsigned long long)s_gpu.rq_tris, (unsigned long long)s_gpu.rq_px);
+    fprintf(stderr, "[GPU] vertices set up on the pool: %llu%c",
+            (unsigned long long)s_gpu.xf_parallel_verts, 10);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
