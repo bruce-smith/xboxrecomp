@@ -39,6 +39,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static int      s_dec_valid;            /* decoded program matches s_program */
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -57,13 +58,19 @@ void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
+    s_dec_valid = 0;
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot)
+{
+    if (slot != s_start_slot)
+        s_dec_valid = 0;
+    s_start_slot = slot;
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -92,6 +99,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_dec_valid = 0;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -174,43 +182,95 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 
 typedef struct { float v[4]; } vec4;
 
-static vec4 read_src(const uint32_t *ins, int which,
-                     const float in[NV2A_VSH_INPUTS][4],
+/* The program, decoded once rather than per vertex. Every field used to be
+ * extracted from the instruction words again for each vertex -- about twenty
+ * shifts and masks an instruction, and the interpreter was ~14% of the
+ * pushbuffer executor in Blinx 2's hub. Invalidated by any program word or
+ * start-slot write. */
+typedef struct {
+    uint8_t mux, reg, neg, rel;
+    uint8_t sw[4];
+    uint16_t idx;                           /* input or constant index */
+} VshSrc;
+
+typedef struct {
+    VshSrc src[3];
+    uint8_t mac, ilu, mac_mask, ilu_mask, tdst;
+    uint8_t omask, oaddr, out_ilu, out_o, final;
+} VshIns;
+
+static VshIns s_dec[NV2A_VSH_SLOTS];
+static uint32_t s_dec_n;
+
+static void decode_src(const uint32_t *ins, int which, VshSrc *d)
+{
+    uint32_t swz;
+    if (which == 0) {
+        d->neg = (uint8_t)field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+        d->mux = (uint8_t)field(ins, 2, 26, 2); d->reg = (uint8_t)field(ins, 2, 28, 4);
+    } else if (which == 1) {
+        d->neg = (uint8_t)field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+        d->mux = (uint8_t)field(ins, 2, 11, 2); d->reg = (uint8_t)field(ins, 2, 13, 4);
+    } else {
+        d->neg = (uint8_t)field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+        d->mux = (uint8_t)field(ins, 3, 28, 2);
+        d->reg = (uint8_t)((field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2));
+    }
+    d->sw[0] = (uint8_t)((swz >> 6) & 3); d->sw[1] = (uint8_t)((swz >> 4) & 3);
+    d->sw[2] = (uint8_t)((swz >> 2) & 3); d->sw[3] = (uint8_t)(swz & 3);
+    d->rel = (uint8_t)field(ins, 3, 1, 1);
+    d->idx = (uint16_t)(d->mux == 2 ? field(ins, 1, 9, 4) : field(ins, 1, 13, 8));
+}
+
+static void decode_program(void)
+{
+    uint32_t s;
+    s_dec_n = 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        VshIns *d = &s_dec[s_dec_n++];
+        int k;
+        for (k = 0; k < 3; k++)
+            decode_src(ins, k, &d->src[k]);
+        d->mac = (uint8_t)field(ins, 1, 21, 4);
+        d->ilu = (uint8_t)field(ins, 1, 25, 3);
+        d->mac_mask = (uint8_t)field(ins, 3, 24, 4);
+        d->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
+        d->tdst = (uint8_t)field(ins, 3, 20, 4);
+        d->omask = (uint8_t)field(ins, 3, 12, 4);
+        d->oaddr = (uint8_t)field(ins, 3, 3, 8);
+        d->out_ilu = (uint8_t)field(ins, 3, 2, 1);
+        d->out_o = (uint8_t)field(ins, 3, 11, 1);
+        d->final = (uint8_t)field(ins, 3, 0, 1);
+        if (d->final)
+            break;
+    }
+    s_dec_valid = 1;
+}
+
+static vec4 read_src(const VshSrc *d, const float in[NV2A_VSH_INPUTS][4],
                      const vec4 *temp, const vec4 *opos, int a0)
 {
-    uint32_t neg, swz, mux, reg;
     const float *s;
     vec4 r;
 
-    if (which == 0) {
-        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
-        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
-    } else if (which == 1) {
-        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
-        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
-    } else {
-        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
-        mux = field(ins, 3, 28, 2);
-        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
-    }
-
-    if (mux == 1)
-        s = (reg == 12) ? opos->v : (reg < 12 ? temp[reg].v : temp[0].v);
-    else if (mux == 2)
-        s = in[field(ins, 1, 9, 4)];
+    if (d->mux == 1)
+        s = (d->reg == 12) ? opos->v : (d->reg < 12 ? temp[d->reg].v : temp[0].v);
+    else if (d->mux == 2)
+        s = in[d->idx];
     else {
-        int ci = (int)field(ins, 1, 13, 8);
-        if (field(ins, 3, 1, 1))
+        int ci = d->idx;
+        if (d->rel)
             ci += a0;
         if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
             ci = 0;
         s = s_const[ci];
     }
-    r.v[0] = s[(swz >> 6) & 3];
-    r.v[1] = s[(swz >> 4) & 3];
-    r.v[2] = s[(swz >> 2) & 3];
-    r.v[3] = s[swz & 3];
-    if (neg) {
+    r.v[0] = s[d->sw[0]];
+    r.v[1] = s[d->sw[1]];
+    r.v[2] = s[d->sw[2]];
+    r.v[3] = s[d->sw[3]];
+    if (d->neg) {
         r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
         r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
     }
@@ -344,15 +404,17 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
      * unwritten stage at infinity. */
     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
-    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
-        const uint32_t *ins = s_program[s];
-        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
-        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
-        uint32_t tdst = field(ins, 3, 20, 4);
-        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
-        vec4 a = read_src(ins, 0, in, temp, &opos, a0);
-        vec4 b = read_src(ins, 1, in, temp, &opos, a0);
-        vec4 c = read_src(ins, 2, in, temp, &opos, a0);
+    if (!s_dec_valid)
+        decode_program();
+    for (s = 0; s < s_dec_n; s++) {
+        const VshIns *ins = &s_dec[s];
+        uint32_t mac = ins->mac, ilu = ins->ilu;
+        uint32_t mac_mask = ins->mac_mask, ilu_mask = ins->ilu_mask;
+        uint32_t tdst = ins->tdst;
+        uint32_t omask = ins->omask, oaddr = ins->oaddr;
+        vec4 a = read_src(&ins->src[0], in, temp, &opos, a0);
+        vec4 b = read_src(&ins->src[1], in, temp, &opos, a0);
+        vec4 c = read_src(&ins->src[2], in, temp, &opos, a0);
         vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
 
         if (mac)
@@ -375,8 +437,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             if (d) write_masked(d, &ires, ilu_mask);
         }
         if (omask) {
-            const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
-            if (!field(ins, 3, 11, 1)) {                  /* to c[] */
+            const vec4 *src = ins->out_ilu ? &ires : &mres;
+            if (!ins->out_o) {                  /* to c[] */
                 if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
                     write_masked(s_const[oaddr], src, omask);
             } else if (oaddr == 0) {
@@ -385,7 +447,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
                 write_masked(outregs[oaddr], src, omask);
             }
         }
-        if (field(ins, 3, 0, 1)) {
+        if (ins->final) {
             memcpy(out->pos, opos.v, sizeof out->pos);
             memcpy(out->d0, outregs[3], sizeof out->d0);
             memcpy(out->d1, outregs[4], sizeof out->d1);
