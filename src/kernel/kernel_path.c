@@ -176,6 +176,7 @@ const wchar_t *xbox_LastHostPath(void)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
+static BOOL  s_save_explicit;       /* the host named the save dir */
 static BOOL  s_initialized = FALSE;
 
 /*
@@ -287,6 +288,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     }
 
     if (save_dir) {
+        s_save_explicit = TRUE;
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
@@ -417,6 +419,29 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
         fflush(stderr);
         return TRUE;
+    }
+
+    /* XAPI keeps saves and title data on partition 1 (E:\UDATA, E:\TDATA),
+     * which maps to the game dir. That is shared by every copy of the game
+     * using the same game_files, so an explicit save dir (RECOMP_SAVE_DIR,
+     * for a test run beside someone playing) takes these too. Without one
+     * they stay where existing saves already are. */
+    if (s_save_explicit) {
+        static const char *const own[] = {
+            "\\Device\\Harddisk0\\Partition1\\UDATA",
+            "\\Device\\Harddisk0\\Partition1\\TDATA",
+        };
+        for (int i = 0; i < 2; i++) {
+            const char *p = own[i];
+            skip = match_prefix(xbox_path, p);
+            if (skip && (xbox_path[skip] == '\0' || xbox_path[skip] == '\\')) {
+                skip = match_prefix(xbox_path, "\\Device\\Harddisk0\\Partition1\\");
+                remainder = xbox_path + skip;
+                base_dir  = s_save_dir;
+                sub_dir   = NULL;
+                goto translate;
+            }
+        }
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
