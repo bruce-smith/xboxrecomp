@@ -630,6 +630,13 @@ int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
                                   + g_memory_offset);
     if (!fence_readable(base + offset, 4))
         return -1;
+    {
+        static uint32_t last_at;
+        if (base + offset != last_at) {
+            last_at = base + offset;
+            fprintf(stderr, "  NV2A semaphore: releasing at 0x%08X\n", last_at);
+        }
+    }
     if (g_nv2a_memory)
         *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10u)
             = (value << 2) & 0x7Cu;
