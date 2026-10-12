@@ -310,3 +310,202 @@ void nv2a_rc_eval_prep(const Nv2aCombinerPrep *p, const float v0[4],
     for (i = 0; i < 4; i++)
         out[i] = clampf(out[i], 0.0f, 1.0f);
 }
+
+
+/* ---- four pixels at once (see nv2a_rc_eval_prep4 in the header) ---------- */
+
+static __m128 sel4(__m128 m, __m128 a, __m128 b)
+{
+    return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
+}
+
+/* clampf: x < lo ? lo : (x > hi ? hi : x) */
+static __m128 clamp4(__m128 x, __m128 lo, __m128 hi)
+{
+    return sel4(_mm_cmplt_ps(x, lo), lo, sel4(_mm_cmpgt_ps(x, hi), hi, x));
+}
+
+static __m128 neg4(__m128 x)
+{
+    return _mm_xor_ps(x, _mm_set1_ps(-0.0f));
+}
+
+/* map_in / map_in3, one component. */
+static __m128 map4(__m128 x, uint32_t byte)
+{
+    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
+    __m128 p = sel4(_mm_cmplt_ps(x, zero), zero, x);       /* x < 0 ? 0 : x */
+    switch ((byte >> 5) & 7) {
+    case 0:  return p;
+    case 1:  return _mm_sub_ps(one, clamp4(x, zero, one));
+    case 2:  return _mm_sub_ps(_mm_mul_ps(_mm_set1_ps(2.0f), p), one);
+    case 3:  return _mm_add_ps(_mm_mul_ps(_mm_set1_ps(-2.0f), p), one);
+    case 4:  return _mm_sub_ps(p, _mm_set1_ps(0.5f));
+    case 5:  return _mm_add_ps(neg4(p), _mm_set1_ps(0.5f));
+    case 6:  return x;
+    default: return neg4(x);
+    }
+}
+
+static void read_rgb4(__m128 R[16][4], uint32_t byte, __m128 v[3])
+{
+    const __m128 *r = R[byte & 0xF];
+    int i;
+    for (i = 0; i < 3; i++)
+        v[i] = map4((byte & 0x10) ? r[3] : r[i], byte);
+}
+
+static __m128 read_alpha4(__m128 R[16][4], uint32_t byte)
+{
+    const __m128 *r = R[byte & 0xF];
+    return map4((byte & 0x10) ? r[3] : r[2], byte);
+}
+
+void nv2a_rc_eval_prep4(const Nv2aCombinerPrep *p, const __m128 v0[4],
+                        const __m128 v1[4], const __m128 fog[4],
+                        const __m128 t[4][4], __m128 out[4])
+{
+    const Nv2aCombiner *rc = &p->rc;
+    const __m128 zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
+    const __m128 mone = _mm_set1_ps(-1.0f);
+    __m128 R[16][4];
+    uint32_t n = rc->control & 0xFF, flags = rc->control >> 8, s;
+    int i;
+
+    if (n > 8)
+        n = 8;
+    for (i = 0; i < 4; i++) {
+        R[0][i] = R[6][i] = R[7][i] = zero;
+        R[12][i] = R[13][i] = R[14][i] = R[15][i] = zero;
+        R[R_FOG][i] = fog[i];
+        R[R_V0][i] = v0[i];
+        R[R_V1][i] = v1[i];
+        R[R_T0 + 0][i] = t[0][i];
+        R[R_T0 + 1][i] = t[1][i];
+        R[R_T0 + 2][i] = t[2][i];
+        R[R_T0 + 3][i] = t[3][i];
+    }
+    R[R_R0][3] = (rc->stage_program & 0x1F) ? t[0][3] : one;
+
+    for (s = 0; s < n; s++) {
+        uint32_t icw = rc->color_icw[s], ocw = rc->color_ocw[s];
+        uint32_t aicw = rc->alpha_icw[s], aocw = rc->alpha_ocw[s];
+        uint32_t fl = ocw >> 12, afl = aocw >> 12;
+        const Nv2aRcStage *S = &p->st[s];
+        __m128 A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
+        __m128 aab = zero, acd = zero, ams = zero, mux;
+        __m128 bias = _mm_set1_ps(S->bias), scale = _mm_set1_ps(S->scale);
+        __m128 abias = _mm_set1_ps(S->abias), ascale = _mm_set1_ps(S->ascale);
+
+        for (i = 0; i < 4; i++) {
+            R[R_C0][i] = _mm_set1_ps(p->c0[s][i]);
+            R[R_C1][i] = _mm_set1_ps(p->c1[s][i]);
+        }
+        if (flags & 1)
+            mux = _mm_cmpge_ps(R[R_R0][3], _mm_set1_ps(0.5f));
+        else {
+            __m128i bit = _mm_and_si128(
+                _mm_cvttps_epi32(_mm_mul_ps(R[R_R0][3], _mm_set1_ps(255.0f))),
+                _mm_set1_epi32(1));
+            mux = _mm_castsi128_ps(_mm_cmpeq_epi32(bit, _mm_set1_epi32(1)));
+        }
+
+        if (S->color) {
+            int want_ab = S->ab || S->ms, want_cd = S->cd || S->ms;
+            __m128 dab = zero, dcd = zero;
+            if (want_ab) {
+                read_rgb4(R, icw >> 24, A); read_rgb4(R, icw >> 16, B);
+                if (fl & 2)
+                    dab = _mm_add_ps(_mm_add_ps(_mm_mul_ps(A[0], B[0]),
+                                                _mm_mul_ps(A[1], B[1])),
+                                     _mm_mul_ps(A[2], B[2]));
+            }
+            if (want_cd) {
+                read_rgb4(R, icw >> 8, C); read_rgb4(R, icw, D);
+                if (fl & 1)
+                    dcd = _mm_add_ps(_mm_add_ps(_mm_mul_ps(C[0], D[0]),
+                                                _mm_mul_ps(C[1], D[1])),
+                                     _mm_mul_ps(C[2], D[2]));
+            }
+            for (i = 0; i < 3; i++) {
+                __m128 pab = want_ab ? ((fl & 2) ? dab : _mm_mul_ps(A[i], B[i])) : zero;
+                __m128 pcd = want_cd ? ((fl & 1) ? dcd : _mm_mul_ps(C[i], D[i])) : zero;
+                if (S->ab)
+                    ab[i] = clamp4(_mm_mul_ps(_mm_add_ps(pab, bias), scale), mone, one);
+                if (S->cd)
+                    cd[i] = clamp4(_mm_mul_ps(_mm_add_ps(pcd, bias), scale), mone, one);
+                if (S->ms) {
+                    __m128 sum = (fl & 4) ? sel4(mux, pcd, pab) : _mm_add_ps(pab, pcd);
+                    ms[i] = clamp4(_mm_mul_ps(_mm_add_ps(sum, bias), scale), mone, one);
+                }
+            }
+        }
+        if (S->alpha) {
+            __m128 pab = zero, pcd = zero;
+            if (S->aab || S->ams)
+                pab = _mm_mul_ps(read_alpha4(R, aicw >> 24), read_alpha4(R, aicw >> 16));
+            if (S->acd || S->ams)
+                pcd = _mm_mul_ps(read_alpha4(R, aicw >> 8), read_alpha4(R, aicw));
+            if (S->aab)
+                aab = clamp4(_mm_mul_ps(_mm_add_ps(pab, abias), ascale), mone, one);
+            if (S->acd)
+                acd = clamp4(_mm_mul_ps(_mm_add_ps(pcd, abias), ascale), mone, one);
+            if (S->ams) {
+                __m128 sum = (afl & 4) ? sel4(mux, pcd, pab) : _mm_add_ps(pab, pcd);
+                ams = clamp4(_mm_mul_ps(_mm_add_ps(sum, abias), ascale), mone, one);
+            }
+        }
+
+        if (S->ab) {
+            __m128 *d = R[(ocw >> 4) & 0xF];
+            d[0] = ab[0]; d[1] = ab[1]; d[2] = ab[2];
+            if (fl & 0x80) d[3] = ab[2];
+        }
+        if (S->cd) {
+            __m128 *d = R[ocw & 0xF];
+            d[0] = cd[0]; d[1] = cd[1]; d[2] = cd[2];
+            if (fl & 0x40) d[3] = cd[2];
+        }
+        if (S->ms) {
+            __m128 *d = R[(ocw >> 8) & 0xF];
+            d[0] = ms[0]; d[1] = ms[1]; d[2] = ms[2];
+        }
+        if (S->aab) R[(aocw >> 4) & 0xF][3] = aab;
+        if (S->acd) R[aocw & 0xF][3] = acd;
+        if (S->ams) R[(aocw >> 8) & 0xF][3] = ams;
+        R[R_ZERO][0] = R[R_ZERO][1] = R[R_ZERO][2] = R[R_ZERO][3] = zero;
+    }
+
+    if (rc->final0 || rc->final1) {
+        uint32_t f0 = rc->final0, f1 = rc->final1, fflags = f1 & 0xFF;
+        __m128 A[3], B[3], C[3], D[3], E[3], F[3];
+
+        for (i = 0; i < 4; i++) {
+            R[R_C0][i] = _mm_set1_ps(p->fc0[i]);
+            R[R_C1][i] = _mm_set1_ps(p->fc1[i]);
+        }
+        for (i = 0; i < 3; i++) {
+            __m128 a = (fflags & 0x40) ? _mm_sub_ps(one, R[R_V1][i]) : R[R_V1][i];
+            __m128 b = (fflags & 0x20) ? _mm_sub_ps(one, R[R_R0][i]) : R[R_R0][i];
+            __m128 sum = _mm_add_ps(a, b);
+            R[R_SUM][i] = (fflags & 0x80) ? clamp4(sum, zero, one) : sum;
+        }
+        R[R_SUM][3] = zero;
+        read_rgb4(R, f1 >> 24, E);
+        read_rgb4(R, f1 >> 16, F);
+        for (i = 0; i < 3; i++)
+            R[R_EF][i] = _mm_mul_ps(E[i], F[i]);
+        R[R_EF][3] = zero;
+        read_rgb4(R, f0 >> 24, A); read_rgb4(R, f0 >> 16, B);
+        read_rgb4(R, f0 >> 8, C);  read_rgb4(R, f0, D);
+        for (i = 0; i < 3; i++)
+            out[i] = _mm_add_ps(_mm_add_ps(D[i], _mm_mul_ps(C[i], _mm_sub_ps(one, A[i]))),
+                                _mm_mul_ps(B[i], A[i]));
+        out[3] = read_alpha4(R, f1 >> 8);
+    } else {
+        for (i = 0; i < 4; i++)
+            out[i] = R[R_R0][i];
+    }
+    for (i = 0; i < 4; i++)
+        out[i] = clamp4(out[i], zero, one);
+}

@@ -821,10 +821,13 @@ typedef struct {
     uint32_t clip_plane_mode;
     Nv2aCombinerPrep rcp;               /* constants unpacked per draw */
     Texture texs[4];
+    uint32_t self_sample;               /* a stage samples the colour surface */
 } PixState;
 
 static NV_TLS const PixState *P;
 static PixState s_live;
+
+static uint32_t tex_face_stride(const Texture *t);
 
 static void pix_capture(PixState *ps)
 {
@@ -854,6 +857,29 @@ static void pix_capture(PixState *ps)
         int st;
         for (st = 0; st < 4; st++)
             ps->texs[st].swz = tex_swizzle_table(&ps->texs[st]);
+    }
+    /* A draw that samples the surface it draws into reads its own fresh
+     * pixels, so its result depends on the order pixels are written in
+     * (undefined on the console too). The four-lane path writes in a
+     * different order than the scalar one, so such draws stay scalar. */
+    if (s_gpu.color_offset && s_gpu.pitch) {
+        uint32_t lo = dma_resolve(s_gpu.color_offset), hi;
+        int st;
+        hi = lo + (ps->swz ? ps->swz->w * ps->swz->h * surface_bpp()
+                           : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch);
+        for (st = 0; st < 4; st++) {
+            const Texture *t = &s_gpu.texs[st];
+            uint32_t tlo, thi;
+            if (!t->valid)
+                continue;
+            if (s_gpu.rc_seen ? !((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
+                              : st != 0)
+                continue;
+            tlo = t->offset;
+            thi = tlo + tex_face_stride(t) * (t->cube ? 6u : 1u);
+            if (tlo < hi && lo < thi)
+                ps->self_sample = 1;
+        }
     }
 }
 
@@ -2091,8 +2117,10 @@ typedef struct {
     uint64_t csum;                      /* r+g+b shaded, for the draw trace */
 } XfCount;
 
-/* Rows y0, y0+step, ... < y1 of triangle T. */
-static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
+/* Rows y0, y0+step, ... < y1 of triangle T, one pixel at a time: the
+ * reference for xf_rows_span4. */
+static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
+                                XfCount *cnt)
 {
     const float *a = T->a, *b = T->b, *c = T->c;
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
@@ -2181,6 +2209,309 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
             put_pixel(T->mem, T->bpp, x, y, argb);
         }
     }
+}
+
+/* Four pixels of a row at once, for draws that go through the register
+ * combiners (T->use_rc): barycentrics, depth, colours, texture coordinates
+ * and the combiners in SSE lanes, with the same operations in the same order
+ * as xf_rows_span, so every pixel comes out the same. Texture fetches, the
+ * alpha test, packing and the write (blending, colour mask) run per lane
+ * through the scalar code. Draws without combiners stay scalar.
+ * RECOMP_SCALAR_PIXELS=1 turns this off; RECOMP_PIXEL_CHECK=1 runs both on
+ * every span and reports the first differences. */
+static int depth4_mask(uint32_t func, __m128 z, __m128 st)
+{
+    __m128 m;
+    switch (func) {
+    case 0x200: m = _mm_setzero_ps(); break;
+    case 0x201: m = _mm_cmplt_ps(z, st); break;
+    case 0x202: m = _mm_cmpeq_ps(z, st); break;
+    case 0x203: m = _mm_cmple_ps(z, st); break;
+    case 0x204: m = _mm_cmpgt_ps(z, st); break;
+    case 0x205: m = _mm_cmpneq_ps(z, st); break;
+    case 0x206: m = _mm_cmpge_ps(z, st); break;
+    default:    return 0xF;
+    }
+    return _mm_movemask_ps(m);
+}
+
+static __m128 bary3(__m128 l0, __m128 l1, __m128 l2, float a, float b, float c)
+{
+    return _mm_add_ps(_mm_add_ps(_mm_mul_ps(l0, _mm_set1_ps(a)),
+                                 _mm_mul_ps(l1, _mm_set1_ps(b))),
+                      _mm_mul_ps(l2, _mm_set1_ps(c)));
+}
+
+static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
+{
+    const float *a = T->a, *b = T->b, *c = T->c;
+    const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
+    const __m128 zero = _mm_setzero_ps();
+    const __m128 inv = _mm_set1_ps(T->inv_area);
+    const float ba0 = b[0] - a[0], ba1 = b[1] - a[1];
+    const float cb0 = c[0] - b[0], cb1 = c[1] - b[1];
+    const float ac0 = a[0] - c[0], ac1 = a[1] - c[1];
+    int x, y, k, l;
+
+    P = T->ps;
+    for (y = y0; y < y1; y++) {
+        float py = (float)y + 0.5f;
+        __m128 e0 = _mm_set1_ps(ba0 * (py - a[1]));
+        __m128 e1 = _mm_set1_ps(cb0 * (py - b[1]));
+        __m128 e2 = _mm_set1_ps(ac0 * (py - c[1]));
+        for (x = T->minx; x < T->maxx; x += 4) {
+            __m128 px = _mm_add_ps(_mm_cvtepi32_ps(_mm_setr_epi32(x, x + 1, x + 2, x + 3)),
+                                   _mm_set1_ps(0.5f));
+            __m128 w0 = _mm_sub_ps(e0, _mm_mul_ps(_mm_set1_ps(ba1), _mm_sub_ps(px, _mm_set1_ps(a[0]))));
+            __m128 w1 = _mm_sub_ps(e1, _mm_mul_ps(_mm_set1_ps(cb1), _mm_sub_ps(px, _mm_set1_ps(b[0]))));
+            __m128 w2 = _mm_sub_ps(e2, _mm_mul_ps(_mm_set1_ps(ac1), _mm_sub_ps(px, _mm_set1_ps(c[0]))));
+            __m128 l0, l1, l2, z;
+            float zl[4], zs[4];
+            uint32_t argb[4] = {0, 0, 0, 0};
+            int mask, n = T->maxx - x < 4 ? T->maxx - x : 4;
+            int shade = (P->color_mask & 0x01010101u) || P->alpha_test;
+
+            mask = (_mm_movemask_ps(_mm_and_ps(_mm_and_ps(_mm_cmpge_ps(w0, zero),
+                                                          _mm_cmpge_ps(w1, zero)),
+                                               _mm_cmpge_ps(w2, zero)))
+                  | _mm_movemask_ps(_mm_and_ps(_mm_and_ps(_mm_cmple_ps(w0, zero),
+                                                          _mm_cmple_ps(w1, zero)),
+                                               _mm_cmple_ps(w2, zero))))
+                 & ((1 << n) - 1);
+            if (!mask)
+                continue;
+            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+            l0 = _mm_mul_ps(w1, inv); l1 = _mm_mul_ps(w2, inv); l2 = _mm_mul_ps(w0, inv);
+            z = bary3(l0, l1, l2, a[2], b[2], c[2]);
+            _mm_storeu_ps(zl, z);
+            if (T->zb && P->depth_test) {
+                int pass;
+                for (l = 0; l < 4; l++)
+                    zs[l] = (mask >> l & 1) ? T->zb[(size_t)y * NV_ZBUF_W + x + l] : 0.0f;
+                pass = depth4_mask(P->depth_func, z, _mm_loadu_ps(zs));
+                for (l = 0; l < 4; l++)
+                    if ((mask >> l & 1) && !(pass >> l & 1))
+                        cnt->depth_fail++;
+                mask &= pass;
+                if (!mask)
+                    continue;
+            }
+            if (shade) {
+                __m128 col[4], d1[4], fog[4], t[4][4], out[4], pw;
+                float ol[4][4];
+                int st;
+                for (k = 0; k < 4; k++) {
+                    col[k] = bary3(l0, l1, l2, va->d0[k], vb->d0[k], vc->d0[k]);
+                    d1[k] = bary3(l0, l1, l2, va->d1[k], vb->d1[k], vc->d1[k]);
+                }
+                pw = bary3(l0, l1, l2, T->iw[0], T->iw[1], T->iw[2]);
+                fog[0] = _mm_set1_ps(T->fogc[0]);
+                fog[1] = _mm_set1_ps(T->fogc[1]);
+                fog[2] = _mm_set1_ps(T->fogc[2]);
+                fog[3] = bary3(l0, l1, l2, T->vfog[0], T->vfog[1], T->vfog[2]);
+                for (st = 0; st < 4; st++) {
+                    __m128 tc[4];
+                    float tcl[4][4], tl[4][4];
+                    if (!((P->rcp.rc.stage_program >> (st * 5)) & 0x1F)) {
+                        t[st][0] = t[st][1] = t[st][2] = zero;
+                        t[st][3] = _mm_set1_ps(1.0f);
+                        continue;
+                    }
+                    for (k = 0; k < 4; k++) {
+                        tc[k] = _mm_div_ps(bary3(l0, l1, l2, T->stc[0][st][k],
+                                                 T->stc[1][st][k], T->stc[2][st][k]), pw);
+                        _mm_storeu_ps(tcl[k], tc[k]);
+                    }
+                    for (l = 0; l < 4; l++) {
+                        float cl[4], o[4] = {0, 0, 0, 0};
+                        if (mask >> l & 1) {
+                            for (k = 0; k < 4; k++)
+                                cl[k] = tcl[k][l];
+                            if (!rc_stage_fetch(st, cl, o))
+                                mask &= ~(1 << l);     /* clip plane */
+                        }
+                        for (k = 0; k < 4; k++)
+                            tl[k][l] = o[k];
+                    }
+                    for (k = 0; k < 4; k++)
+                        t[st][k] = _mm_loadu_ps(tl[k]);
+                }
+                if (!mask)
+                    continue;
+                nv2a_rc_eval_prep4(&P->rcp, col, d1, fog, (const __m128 (*)[4])t, out);
+                for (k = 0; k < 4; k++)
+                    _mm_storeu_ps(ol[k], out[k]);
+                for (l = 0; l < 4; l++) {
+                    float o[4];
+                    if (!(mask >> l & 1))
+                        continue;
+                    for (k = 0; k < 4; k++)
+                        o[k] = ol[k][l];
+                    if (P->alpha_test && !alpha_test_pass(o[3])) {
+                        mask &= ~(1 << l);
+                        continue;
+                    }
+                    argb[l] = pack_color(o);
+                }
+            }
+            for (l = 0; l < 4; l++) {
+                if (!(mask >> l & 1))
+                    continue;
+                if (T->zb && P->depth_mask)
+                    T->zb[(size_t)y * NV_ZBUF_W + x + l] = zl[l];
+                if (P->zpass_enable)
+                    cnt->zpass++;
+                if (!(P->color_mask & 0x01010101u))
+                    continue;
+                cnt->pixels++;
+                cnt->csum += ((argb[l] >> 16) & 0xFF) + ((argb[l] >> 8) & 0xFF) + (argb[l] & 0xFF);
+                put_pixel(T->mem, T->bpp, x + l, y, argb[l]);
+            }
+        }
+    }
+}
+
+static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step, XfCount *cnt);
+
+/* RECOMP_PIXEL_CHECK=1: the four-lane path against the scalar one on the
+ * same span. The rows' pixels and depths are saved; the span is drawn four at
+ * a time, captured, restored, drawn by the scalar code, captured, and the two
+ * compared. On a difference the scalar draw is repeated from the same start:
+ * if that differs from the first scalar draw too, the input changed
+ * underneath (a video frame decoded into the texture meanwhile) and the span
+ * counts as unstable, not as a mismatch. The scalar result stays. Slow -- a
+ * differential test, not a mode to play in. */
+static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
+{
+    static volatile LONG reported, spans, unstable;
+    int w = T->maxx - T->minx, rows = y1 - y0, y, x, i, bad = -1;
+    size_t npx = (size_t)(w > 0 ? w : 0) * (size_t)(rows > 0 ? rows : 0);
+    uint32_t *orig = NULL, *r4 = NULL, *r1 = NULL;
+    float *zorig = NULL, *z4 = NULL, *z1 = NULL;
+    XfCount c4 = {0, 0, 0, 0, 0, 0}, c1 = {0, 0, 0, 0, 0, 0};
+
+    if (!npx) {
+        xf_rows_span_scalar(T, y0, y1, 1, cnt);
+        return;
+    }
+    orig = (uint32_t *)malloc(npx * 4);
+    r4 = (uint32_t *)malloc(npx * 4);
+    r1 = (uint32_t *)malloc(npx * 4);
+    if (T->zb) {
+        zorig = (float *)malloc(npx * 4);
+        z4 = (float *)malloc(npx * 4);
+        z1 = (float *)malloc(npx * 4);
+    }
+    if (!orig || !r4 || !r1 || (T->zb && (!zorig || !z4 || !z1))) {
+        free(orig); free(r4); free(r1); free(zorig); free(z4); free(z1);
+        xf_rows_span_scalar(T, y0, y1, 1, cnt);
+        return;
+    }
+    P = T->ps;
+#define CK_GET(dst, zdst) do { \
+        for (y = y0, i = 0; y < y1; y++) \
+            for (x = T->minx; x < T->maxx; x++, i++) { \
+                uint8_t *q = surface_pixel(x, y, T->bpp); \
+                dst[i] = !q ? 0 : T->bpp == 4 ? *(uint32_t *)q : *(uint16_t *)q; \
+            } \
+        if (T->zb) \
+            for (y = y0, i = 0; y < y1; y++, i += w) \
+                memcpy((zdst) + i, T->zb + (size_t)y * NV_ZBUF_W + T->minx, (size_t)w * 4); \
+    } while (0)
+#define CK_PUT(src, zsrc) do { \
+        for (y = y0, i = 0; y < y1; y++) \
+            for (x = T->minx; x < T->maxx; x++, i++) { \
+                uint8_t *q = surface_pixel(x, y, T->bpp); \
+                if (!q) continue; \
+                if (T->bpp == 4) *(uint32_t *)q = src[i]; \
+                else *(uint16_t *)q = (uint16_t)src[i]; \
+            } \
+        if (T->zb) \
+            for (y = y0, i = 0; y < y1; y++, i += w) \
+                memcpy(T->zb + (size_t)y * NV_ZBUF_W + T->minx, (zsrc) + i, (size_t)w * 4); \
+    } while (0)
+#define CK_DIFF(a, za, b, zb_) \
+    (memcmp((a), (b), npx * 4) || (T->zb && memcmp((za), (zb_), npx * 4)))
+
+    CK_GET(orig, zorig);
+    xf_rows_span4(T, y0, y1, &c4);
+    CK_GET(r4, z4);
+    CK_PUT(orig, zorig);
+    P = T->ps;
+    xf_rows_span_scalar(T, y0, y1, 1, &c1);
+    CK_GET(r1, z1);
+    if (CK_DIFF(r1, z1, r4, z4) || c1.pixels != c4.pixels
+        || c1.depth_fail != c4.depth_fail || c1.zpass != c4.zpass
+        || c1.csum != c4.csum) {
+        /* Both again from the same start. A real difference repeats: each
+         * path agrees with itself and they still disagree. */
+        uint32_t *r4b = (uint32_t *)malloc(npx * 4), *r1b = (uint32_t *)malloc(npx * 4);
+        float *z4b = T->zb ? (float *)malloc(npx * 4) : NULL;
+        float *z1b = T->zb ? (float *)malloc(npx * 4) : NULL;
+        XfCount c4b = {0, 0, 0, 0, 0, 0}, c1b = {0, 0, 0, 0, 0, 0};
+        if (r4b && r1b && (!T->zb || (z4b && z1b))) {
+            CK_PUT(orig, zorig);
+            xf_rows_span4(T, y0, y1, &c4b);
+            CK_GET(r4b, z4b);
+            CK_PUT(orig, zorig);
+            P = T->ps;
+            xf_rows_span_scalar(T, y0, y1, 1, &c1b);
+            CK_GET(r1b, z1b);
+            if (CK_DIFF(r1, z1, r1b, z1b) || CK_DIFF(r4, z4, r4b, z4b)
+                || c1b.csum != c1.csum || c4b.csum != c4.csum) {
+                InterlockedIncrement(&unstable);
+            } else {
+                for (i = 0; i < (int)npx && bad < 0; i++)
+                    if (r1[i] != r4[i])
+                        bad = i;
+                if (InterlockedIncrement(&reported) <= 8)
+                    fprintf(stderr, "[PIXCHECK] MISMATCH span y %d..%d x %d..%d,"
+                            " first pixel %d (scalar %08X four-lane %08X);"
+                            " pixels %llu/%llu zfail %llu/%llu csum %llu/%llu%c",
+                            y0, y1, T->minx, T->maxx, bad,
+                            bad >= 0 ? r1[bad] : 0, bad >= 0 ? r4[bad] : 0,
+                            (unsigned long long)c1.pixels, (unsigned long long)c4.pixels,
+                            (unsigned long long)c1.depth_fail,
+                            (unsigned long long)c4.depth_fail,
+                            (unsigned long long)c1.csum, (unsigned long long)c4.csum, 10);
+            }
+            c1 = c1b;
+        }
+        free(r4b); free(r1b); free(z4b); free(z1b);
+    }
+    if (!(InterlockedIncrement(&spans) & 0xFFFFF))
+        fprintf(stderr, "[PIXCHECK] %ld spans compared, %ld mismatched, %ld"
+                " unstable (input changed)%c", (long)spans, (long)reported,
+                (long)unstable, 10);
+#undef CK_GET
+#undef CK_PUT
+#undef CK_DIFF
+    cnt->depth_fail += c1.depth_fail;
+    cnt->pixels += c1.pixels;
+    cnt->zpass += c1.zpass;
+    cnt->csum += c1.csum;
+    free(orig); free(r4); free(r1); free(zorig); free(z4); free(z1);
+}
+
+/* Rows y0, y0+step, ... < y1 of triangle T. */
+static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
+{
+    static volatile LONG mode = -1;     /* 0 scalar, 1 four-lane, 2 check */
+    if (mode < 0) {
+        LONG m = getenv("RECOMP_SCALAR_PIXELS") ? 0
+               : getenv("RECOMP_PIXEL_CHECK") ? 2 : 1;
+        if (InterlockedCompareExchange(&mode, m, -1) == -1)
+            fprintf(stderr, "[GPU] pixel shading: %s%c", m == 0 ? "scalar"
+                    : m == 2 ? "four-lane, checked against scalar" : "four-lane", 10);
+    }
+    if (mode && step == 1 && T->use_rc && !T->ps->self_sample) {
+        if (mode == 2)
+            xf_rows_check(T, y0, y1, cnt);
+        else
+            xf_rows_span4(T, y0, y1, cnt);
+        return;
+    }
+    xf_rows_span_scalar(T, y0, y1, step, cnt);
 }
 
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)

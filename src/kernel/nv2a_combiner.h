@@ -55,6 +55,16 @@ void nv2a_rc_eval_prep(const Nv2aCombinerPrep *p, const float v0[4],
                        const float v1[4], const float fog[4],
                        const float t[4][4], float out[4]);
 
+/* Four pixels at once, each value one SSE register of four lanes (pixel i in
+ * lane i): v0/v1/fog[component], t[stage][component]. Bit-identical, lane by
+ * lane, to nv2a_rc_eval_prep -- the same operations in the same order, and
+ * clamps written as compare-and-select so NaNs pass through as they do
+ * there. */
+#include <emmintrin.h>
+void nv2a_rc_eval_prep4(const Nv2aCombinerPrep *p, const __m128 v0[4],
+                        const __m128 v1[4], const __m128 fog[4],
+                        const __m128 t[4][4], __m128 out[4]);
+
 /* D3DCOLOR (0xAARRGGBB) to r,g,b,a floats. */
 void nv2a_rc_unpack(uint32_t argb, float out[4]);
 
