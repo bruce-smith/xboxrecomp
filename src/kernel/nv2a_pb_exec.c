@@ -2974,7 +2974,13 @@ static void rq_kick(void)
 #if defined(_WIN32)
         if (raster_pool_size() > 1) {
             int slot = s_rq_fill;
+            /* The slot's new number before its new range: a band that fell
+             * behind on the slot's previous batch rereads slot_seq after the
+             * range (rq_work_one), so it must never see the new range with
+             * the old number. The fence keeps the compiler from sinking this
+             * store below the plain ones that follow. */
             s_pool.slot_seq[slot] = s_pool.head;
+            MemoryBarrier();
             if (b->ngeo) {
                 /* Rows unknown until its geometry is set up: rq_geo_finish
                  * hands it to the bands. */
