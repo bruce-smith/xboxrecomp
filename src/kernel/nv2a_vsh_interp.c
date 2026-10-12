@@ -242,16 +242,20 @@ static void decode_src(const uint32_t *ins, int which, VshSrc *d)
     d->ident = d->sw[0] == 0 && d->sw[1] == 1 && d->sw[2] == 2 && d->sw[3] == 3;
 }
 
+/* The current program's hash, kept under RECOMP_VSH_DUMP only: frame
+ * traces print it, to tell which dumped program a draw ran. */
+uint32_t nv2a_vsh_cur_hash;
+
 /* RECOMP_VSH_DUMP: disassemble each distinct program once, when decoded. */
 static void maybe_dump(void)
 {
     static int dump = -1;
-    static uint32_t dumped[16];
+    static uint32_t dumped[64];
     static int ndumped;
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
-    if (dump && ndumped < 16) {
+    if (dump && ndumped < 64) {
         /* By content: titles reload different programs into the same slot. */
         uint32_t h = 2166136261u, t;
         int i, seen = 0;
@@ -261,10 +265,12 @@ static void maybe_dump(void)
             if (field(s_program[t], 3, 0, 1))
                 break;
         }
+        nv2a_vsh_cur_hash = h;
         for (i = 0; i < ndumped; i++)
             if (dumped[i] == h) seen = 1;
         if (!seen) {
             dumped[ndumped++] = h;
+            fprintf(stderr, "  [VSH] hash %08X%c", h, 10);
             dump_program(s_start_slot);
         }
     }

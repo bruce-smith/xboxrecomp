@@ -1507,9 +1507,38 @@ static void stats_fold(uint64_t n, uint32_t mx)
         s_gpu.pixel_max = mx;
 }
 
+/* RECOMP_PIXEL_WATCH=x,y[;x,y...] (diagnostic, up to 8): log every write to
+ * those pixels of a 640-wide surface -- incoming colour, result, blend, stage
+ * program and the stage textures -- to find which draw paints a
+ * wrong-looking spot. */
+static int s_pw_n, s_pw_xs[8], s_pw_ys[8];
+/* RECOMP_TEX_WATCH=<hex address>: the same combiner-input line ([PXW-RC])
+ * for every 997th pixel of draws whose stage 0 samples that texture, and a
+ * [PXW-Z] line (depth and stored depth) for every 997th that fails the depth
+ * test (scalar path, RECOMP_SCALAR_PIXELS=1), whatever the camera does. */
+static uint32_t s_tw_addr;
+static volatile LONG s_tw_count;
+
+static void pixel_watch(int x, int y, uint32_t src, uint32_t out)
+{
+    int st;
+    fprintf(stderr, "[PXW] flip %u (%d,%d) surf %p src %08X -> %08X | blend %u %X/%X eq %X"
+            " | prog %05X fin %08X %08X | alpha %u %X %X |", s_gpu.flips, x, y,
+            (void *)P->surface, src, out, P->blend_enable, P->blend_sfactor,
+            P->blend_dfactor, P->blend_equation, P->rcp.rc.stage_program,
+            P->rcp.rc.final0, P->rcp.rc.final1, P->alpha_test, P->alpha_func,
+            P->alpha_ref);
+    for (st = 0; st < 4; st++)
+        if (P->texs[st].valid)
+            fprintf(stderr, " t%d %08X %ux%u f%02X", st, P->texs[st].offset,
+                    P->texs[st].width, P->texs[st].height, P->texs[st].color);
+    fputc(10, stderr);
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *px;
+    uint32_t src = argb;
 
     (void)mem;
     if (x < (int)P->clip_x || x >= (int)(P->clip_x + P->clip_w))
@@ -1583,6 +1612,12 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         *(uint16_t *)px = (uint16_t)(((argb >> 8) & 0xF800)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
+    }
+    if (s_pw_n && P->clip_w == 640) {
+        int i;
+        for (i = 0; i < s_pw_n; i++)
+            if (x == s_pw_xs[i] && y == s_pw_ys[i])
+                pixel_watch(x, y, src, argb);
     }
 }
 
@@ -2345,6 +2380,10 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
                         if (sp)
                             stencil_op(sp, P->st_zfail);
                         cnt->depth_fail++;
+                        if (s_tw_addr && P->texs[0].offset == s_tw_addr
+                            && InterlockedIncrement(&s_tw_count) % 997 == 0)
+                            fprintf(stderr, "[PXW-Z] (%d,%d) z %.1f stored %.1f%c",
+                                    x, y, z, *zp, 10);
                         continue;
                     }
                 }
@@ -2375,6 +2414,24 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
                             continue;
                         nv2a_rc_eval_prep(&P->rcp, col, d1, fog,
                                      (const float (*)[4])t, out);
+                        if ((s_pw_n || s_tw_addr) && P->clip_w == 640) {
+                            int i, hit = s_tw_addr && P->texs[0].offset == s_tw_addr
+                                         && InterlockedIncrement(&s_tw_count) % 997 == 0;
+                            for (i = 0; i < (hit ? 1 : s_pw_n); i++)
+                                if (hit || (x == s_pw_xs[i] && y == s_pw_ys[i]))
+                                    fprintf(stderr, "[PXW-RC] (%d,%d) v0 %.3f %.3f %.3f %.3f"
+                                            " v1 %.3f %.3f %.3f | fog %.3f %.3f %.3f f %.3f"
+                                            " | t0 %.3f %.3f %.3f %.3f t1 %.3f %.3f %.3f"
+                                            " t2 %.3f %.3f %.3f t3 %.3f %.3f %.3f %.3f"
+                                            " | out %.3f %.3f %.3f %.3f | filt %08X %08X%c", x, y,
+                                            col[0], col[1], col[2], col[3], d1[0], d1[1],
+                                            d1[2], fog[0], fog[1], fog[2], fog[3],
+                                            t[0][0], t[0][1], t[0][2], t[0][3],
+                                            t[1][0], t[1][1], t[1][2], t[2][0], t[2][1],
+                                            t[2][2], t[3][0], t[3][1], t[3][2], t[3][3],
+                                            out[0], out[1], out[2], out[3],
+                                            P->texs[0].filter, P->texs[3].filter, 10);
+                        }
                         if (P->alpha_test && !alpha_test_pass(out[3]))
                             continue;
                         argb = pack_color(out);
@@ -4903,6 +4960,10 @@ static void draw_primitive(void)
                     s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face,
                     s_gpu.tris_culled - c0, s_gpu.xf_degenerate - g0,
                     s_gpu.xf_offscreen - o0, s_gpu.tris_behind - b0);
+            if ((s_gpu.xf_mode & 3) == 2) {
+                extern uint32_t nv2a_vsh_cur_hash;
+                fprintf(stderr, "[FTRACE]     vsh %08X%c", nv2a_vsh_cur_hash, 10);
+            }
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
@@ -5327,6 +5388,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        {
+            const char *w = getenv("RECOMP_TEX_WATCH");
+            if (w)
+                s_tw_addr = (uint32_t)strtoul(w, NULL, 16);
+            w = getenv("RECOMP_PIXEL_WATCH");
+            while (w && s_pw_n < 8
+                   && sscanf(w, "%d,%d", &s_pw_xs[s_pw_n], &s_pw_ys[s_pw_n]) == 2) {
+                s_pw_n++;
+                w = strchr(w, ';');
+                if (w)
+                    w++;
+            }
+        }
         s_gpu.st_func = 0x207;                    /* stencil: ALWAYS, */
         s_gpu.st_fmask = s_gpu.st_wmask = 0xFF;   /* all bits, */
         s_gpu.st_fail = s_gpu.st_zfail = s_gpu.st_zpass = 0x1E00; /* KEEP */
