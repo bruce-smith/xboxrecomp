@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -62,6 +63,11 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
     }
+    /* RECOMP_AUDIO_MUTE=1: run the APU and XAudio2 exactly as usual, timing
+     * included, but at zero volume -- for test runs on a machine someone may
+     * be playing on, where the game waits for a voice line to finish. */
+    if (getenv("RECOMP_AUDIO_MUTE"))
+        IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = XA2_CHANNELS;
