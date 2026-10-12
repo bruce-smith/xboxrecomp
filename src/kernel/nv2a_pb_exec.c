@@ -2516,11 +2516,19 @@ static void xfq_end(void)
         rq_sync();
 }
 
-/* Back-face culling, on the screen-space signed area (y down, so a
- * clockwise triangle on screen has area > 0). It was ignored, so every
- * back face was drawn as well: wasted fill on closed meshes and, where a
- * back face lies on or just under a front one, a z-fight.
- * RECOMP_NO_CULL=1 turns it off for A/B comparisons. */
+/* Back-face culling, on the screen-space signed area.
+ *
+ * Winding is judged against the viewport's own y direction. D3D's usual
+ * viewport maps NDC y up to screen y down (c[58].y < 0); a clockwise
+ * triangle on screen then has area > 0 and FRONT_FACE 0x900 (CW) means
+ * exactly that. A viewport with c[58].y > 0 -- Blinx 2's render-to-texture
+ * passes into its 256x256 targets -- mirrors the image vertically and with it
+ * every triangle's on-screen winding, so the test inverts. Judged on screen
+ * alone, those passes lost their visible faces and kept the hidden ones, and
+ * the main pass, which samples them, tinted the whole attract stage magenta.
+ * The title also switches CULL_FACE between FRONT and BACK per object (both
+ * with FRONT_FACE CW), which is why neither fixed sense was right everywhere.
+ * RECOMP_NO_CULL=1 turns culling off for A/B comparisons. */
 static int cull_triangle(float area)
 {
     static int no_cull = -1;
@@ -2530,6 +2538,8 @@ static int cull_triangle(float area)
         no_cull = getenv("RECOMP_NO_CULL") != NULL;
     if (!s_gpu.cull_enable || no_cull)
         return 0;
+    if (nv2a_vsh_constant(58)[1] > 0.0f)
+        cw = !cw;                               /* y-up viewport */
     front = s_gpu.front_face == 0x901 ? !cw : cw;
     switch (s_gpu.cull_face) {
     case 0x404: if (!front) return 0; break;      /* FRONT */
@@ -3007,13 +3017,14 @@ static void draw_primitive(void)
     }
 
     {
-        uint32_t t0 = s_gpu.tris_drawn;
+        uint32_t t0 = s_gpu.tris_drawn, c0 = s_gpu.tris_culled;
         uint64_t p0 = s_gpu.pixels;
         raster_batch();
         if (s_ftrace == 2) {
             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    " eq %X | z test %u func %X mask %u | tris %u px %llu"
+                    " | cull %u %X %X culled %u\n",
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
@@ -3023,7 +3034,9 @@ static void draw_primitive(void)
                     s_gpu.blend_dfactor, s_gpu.blend_equation,
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
-                    (unsigned long long)(s_gpu.pixels - p0));
+                    (unsigned long long)(s_gpu.pixels - p0),
+                    s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face,
+                    s_gpu.tris_culled - c0);
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
