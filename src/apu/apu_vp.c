@@ -575,12 +575,16 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
  * SGE data pointer resolution
  * ============================================================ */
 
+/* Last sample address a voice read, for the RECOMP_APU_STATS voice dump. */
+static uint32_t g_vp_last_data;
+
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
     assert(entry <= max_sge);
     uint32_t prd_address =
         ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
+    g_vp_last_data = prd_address + addr % TARGET_PAGE_SIZE;
     return prd_address + addr % TARGET_PAGE_SIZE;
 }
 
@@ -808,6 +812,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
+        g_vp_last_data = (uint32_t)segment_offset;
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
         assert(segment_offset != 0);
         assert(segment_length != 0);
@@ -988,6 +993,7 @@ static void voice_process(MCPXAPUState *d,
     dbg->active = true;
     dbg->stereo = stereo;
     dbg->paused = paused;
+    dbg->frames++;
 
     if (paused) return;
 
@@ -1136,6 +1142,16 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    dbg->ea = ea_value;
+    dbg->ba = g_vp_last_data;
+    dbg->fmt = ldl_le_phys(address_space_memory, d->regs[NV_PAPU_VPVADDR]
+                           + v * NV_PAVS_SIZE + NV_PAVS_VOICE_CFG_FMT);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float a = fabsf(samples[i][0]), c = fabsf(samples[i][1]);
+        if (a > dbg->peak_in) dbg->peak_in = a;
+        if (c > dbg->peak_in) dbg->peak_in = c;
+    }
+
     /* Mix into bins */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
@@ -1149,6 +1165,8 @@ static void voice_process(MCPXAPUState *d,
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
+        if (g * dbg->peak_in > dbg->peak_out)
+            dbg->peak_out = g * dbg->peak_in;
     }
 
     /* VP monitor mix */
@@ -1174,6 +1192,9 @@ static void voice_process(MCPXAPUState *d,
  *
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
+
+/* Active voices processed, for the RECOMP_APU_STATS line in apu_core.c. */
+unsigned g_vp_voices_processed;
 
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
@@ -1203,6 +1224,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
+                g_vp_voices_processed++;
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             d->regs[current] = d->regs[next];

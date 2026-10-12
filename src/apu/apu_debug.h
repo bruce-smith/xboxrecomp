@@ -52,6 +52,12 @@ struct McpxApuDebugVoice
     unsigned int samples_per_block;
     uint32_t ebo, cbo, lbo, ba;
     float rate;
+
+    /* RECOMP_APU_STATS: frames processed and the loudest decoded sample
+     * (before volume) and mixed sample (after) since the last report. */
+    unsigned frames;
+    float peak_in, peak_out, ea;
+    uint32_t fmt;
 };
 
 struct McpxApuDebugVp
