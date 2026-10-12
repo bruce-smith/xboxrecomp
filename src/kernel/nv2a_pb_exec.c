@@ -250,6 +250,9 @@ typedef struct {
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
+    /* BUMPENVMAP: the 2x2 matrix (00 01 10 11) and, for _LUM, the luminance
+     * scale and offset (SET_TEXTURE_SET_BUMP_ENV_MAT/_SCALE/_OFFSET). */
+    float    bump_mat[4], bump_scale, bump_offset;
     /* Swizzled, non-DXT: texel index of x at swz[x], of y at swz[width + y].
      * Set on the copies a draw carries (pix_capture), not in s_gpu. */
     const uint32_t *swz;
@@ -324,6 +327,7 @@ static struct {
     Nv2aCombiner rc;
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT */
     uint32_t report_epoch;              /* CLEAR_REPORT_VALUEs so far */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
@@ -828,6 +832,7 @@ typedef struct {
     uint32_t blend_color;
     uint32_t depth_test, depth_func, depth_mask, zpass_enable;
     uint32_t clip_plane_mode;
+    uint32_t other_stage_input;         /* which stage a stage 2/3 reads */
     uint32_t report_epoch;              /* which visibility test counts it */
     Nv2aCombinerPrep rcp;               /* constants unpacked per draw */
     Texture texs[4];
@@ -861,6 +866,7 @@ static void pix_capture(PixState *ps)
     ps->depth_mask = s_gpu.depth_mask;
     ps->zpass_enable = s_gpu.zpass_enable;
     ps->clip_plane_mode = s_gpu.clip_plane_mode;
+    ps->other_stage_input = s_gpu.other_stage_input;
     ps->report_epoch = s_gpu.report_epoch;
     nv2a_rc_prepare(&s_gpu.rc, &ps->rcp);
     memcpy(ps->texs, s_gpu.texs, sizeof ps->texs);
@@ -1153,6 +1159,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1285,6 +1292,16 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
               | (expand((t >>  8) & 0x0F, 4) << 16)
               | (expand((t >>  4) & 0x0F, 4) <<  8)
               |  expand( t        & 0x0F, 4);
+        return 1;
+    }
+
+    /* G8B8: G in the high byte, B in the low one, as the name orders
+     * them; red 0, alpha opaque. Xbox D3D's V8U8 is this format (V high,
+     * U low), so it is what bump maps arrive as -- signed or not is the
+     * texture filter's per-channel bits (rc_texel), not the format. */
+    case 0x17: {                                    /* LIN_G8B8 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = 0xFF000000u | ((t >> 8) << 8) | (t & 0xFFu);
         return 1;
     }
 
@@ -1967,6 +1984,26 @@ static uint32_t tex_face_stride(const Texture *t)
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
  * floats. An unusable stage reads white, so a missing texture multiplies
  * through instead of blacking the pixel out. */
+/* The texture filter's signed bits (28 A, 29 R, 30 G, 31 B): those channels
+ * hold two's-complement bytes, -1..1, not 0..1. Converted per texel before
+ * any filtering, so a bilinear blend of -1/255 and +1/255 is about 0 and
+ * not about one half. D3D sets them for bump maps (V8U8 is G8B8 with G and
+ * B signed). */
+static void texel_unpack(const Texture *t, uint32_t texel, float o[4])
+{
+    nv2a_rc_unpack(texel, o);
+    if (t->filter & 0xF0000000u) {
+        static const int ch[4] = {3, 0, 1, 2};     /* bit 28 + i: A R G B */
+        static const int sh[4] = {24, 16, 8, 0};   /* their byte in ARGB */
+        int i;
+        for (i = 0; i < 4; i++)
+            if (t->filter >> (28 + i) & 1) {
+                float f = (float)(int8_t)(texel >> sh[i]) / 127.0f;
+                o[ch[i]] = f < -1.0f ? -1.0f : f;
+            }
+    }
+}
+
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                      float out[4])
 {
@@ -1989,7 +2026,7 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         for (k = 0; k < 4; k++) {
             if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
                            (uint32_t)(iv + (k >> 1)), &texel))
-                nv2a_rc_unpack(texel, c[k]);
+                texel_unpack(t, texel, c[k]);
             else
                 c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
         }
@@ -2000,14 +2037,15 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
     }
     if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
                    (uint32_t)(int32_t)floorf(v), &texel))
-        nv2a_rc_unpack(texel, out);
+        texel_unpack(t, texel, out);
     else
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+static int rc_stage_fetch(int st, const float c[4], const float prev[4][4],
+                          float out[4])
 {
     const Texture *t = &P->texs[st];
     uint32_t mode = (P->rcp.rc.stage_program >> (st * 5)) & 0x1F, j;
@@ -2053,9 +2091,39 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
                 return 0;
         }
         return 1;
+    case 6: case 7: {                             /* BUMPENVMAP (_LUM) */
+        /* The input stage's texel is an offset (ds, dt) = (b, g), signed --
+         * as the filter's signed bits made it, else from 0..1 -- turned by
+         * this stage's bump matrix and added to this stage's coordinates
+         * (xemu psh.c). Stage 1 reads stage 0; 2 and 3 the stage
+         * SHADER_OTHER_STAGE_INPUT names. Blinx 2's water: a G8B8 normal map
+         * on stage 0 perturbing two reflection/colour maps on 1 and 2. These
+         * read 0 before, so the water was drawn from the combiner's other
+         * terms alone. */
+        int in = st == 1 ? 0 : (int)(P->other_stage_input >> (st == 2 ? 16 : 20)) & 3;
+        const Texture *ti = &P->texs[in];
+        float ds = prev[in][2], dt = prev[in][1], du, dv, u, v;
+        if (!(ti->filter >> 31 & 1)) ds = ds * 2.0f - 1.0f;
+        if (!(ti->filter >> 30 & 1)) dt = dt * 2.0f - 1.0f;
+        du = t->bump_mat[0] * ds + t->bump_mat[2] * dt;
+        dv = t->bump_mat[1] * ds + t->bump_mat[3] * dt;
+        if (!tex_size_from_format(t->color)) {     /* linear: texel units */
+            du *= (float)t->width;
+            dv *= (float)t->height;
+        }
+        u = c[0] + du;
+        v = c[1] + dv;
+        rc_texel(t, 0, u, v, out);
+        if (mode == 7) {
+            float lum = prev[in][0] * t->bump_scale + t->bump_offset;
+            lum = lum < 0.0f ? 0.0f : (lum > 1.0f ? 1.0f : lum);
+            out[0] *= lum; out[1] *= lum; out[2] *= lum;
+        }
+        return 1;
+    }
     default:
-        /* ponytail: bump-env and dot-product modes read zero; they are water
-         * and bump effects -- add them when a title's look depends on one. */
+        /* ponytail: the dot-product and dependent modes read zero -- add
+         * them when a title's look depends on one. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
     }
@@ -2218,7 +2286,7 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
                             for (j = 0; j < 4; j++)
                                 tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
                                        + l2 * T->stc[2][st][j]) / pw;
-                            keep = rc_stage_fetch(st, tc, t[st]);
+                            keep = rc_stage_fetch(st, tc, (const float (*)[4])t, t[st]);
                         }
                         if (!keep)
                             continue;
@@ -2343,7 +2411,7 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
             }
             if (shade) {
                 __m128 col[4], d1[4], fog[4], t[4][4], out[4], pw;
-                float ol[4][4];
+                float ol[4][4], lt[4][4][4];      /* lane, stage, channel */
                 int st;
                 for (k = 0; k < 4; k++) {
                     col[k] = bary3(l0, l1, l2, va->d0[k], vb->d0[k], vc->d0[k]);
@@ -2360,6 +2428,10 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
                     if (!((P->rcp.rc.stage_program >> (st * 5)) & 0x1F)) {
                         t[st][0] = t[st][1] = t[st][2] = zero;
                         t[st][3] = _mm_set1_ps(1.0f);
+                        for (l = 0; l < 4; l++) {
+                            lt[l][st][0] = lt[l][st][1] = lt[l][st][2] = 0.0f;
+                            lt[l][st][3] = 1.0f;
+                        }
                         continue;
                     }
                     for (k = 0; k < 4; k++) {
@@ -2372,11 +2444,11 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
                         if (mask >> l & 1) {
                             for (k = 0; k < 4; k++)
                                 cl[k] = tcl[k][l];
-                            if (!rc_stage_fetch(st, cl, o))
+                            if (!rc_stage_fetch(st, cl, (const float (*)[4])lt[l], o))
                                 mask &= ~(1 << l);     /* clip plane */
                         }
                         for (k = 0; k < 4; k++)
-                            tl[k][l] = o[k];
+                            tl[k][l] = lt[l][st][k] = o[k];
                     }
                     for (k = 0; k < 4; k++)
                         t[st][k] = _mm_loadu_ps(tl[k]);
@@ -5050,6 +5122,11 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
         break;
+    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34:  /* BUMP_ENV_MAT */
+        memcpy(&t->bump_mat[(reg - 0x1B28) / 4], &param, 4);
+        break;
+    case 0x1B38: memcpy(&t->bump_scale, &param, 4); break;  /* BUMP_ENV_SCALE */
+    case 0x1B3C: memcpy(&t->bump_offset, &param, 4); break; /* BUMP_ENV_OFFSET */
     default:
         break;
     }
@@ -5171,6 +5248,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.rc_seen = 1;
         break;
     case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x1E78: s_gpu.other_stage_input = param; break; /* OTHER_STAGE_INPUT */
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
 
     /* Alpha test and fog. */
