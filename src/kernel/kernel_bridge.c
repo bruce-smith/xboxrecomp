@@ -2086,13 +2086,44 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
  * asks for exclusive access, is told it did not get it, and skips the work.
  *
- * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
- * caller that matters is a device model on its own thread; if two of those
- * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * It takes the interrupt object's lock (xbox_InterruptLock), which a device
+ * model holds around every call of that interrupt's service routine. It used
+ * to take none, on the reasoning that nothing else runs at ISR IRQL -- but the
+ * ISR runs on the device model's own host thread, concurrently. Blinx 2's
+ * DirectSound edits its voice lists through KeSynchronizeExecution
+ * (sub_00334B43 -> 0x00334737) while its APU ISR (0x00334DBF) unlinks idle
+ * voices from the same lists on the APU thread; without the lock the ISR
+ * walked a half-edited list and faulted on Flink 0 - 0x4C.
  */
+#define INTR_LOCKS 16
+static CRITICAL_SECTION g_intr_lock[INTR_LOCKS];
+static INIT_ONCE g_intr_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK intr_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    int i;
+    (void)o; (void)p; (void)c;
+    for (i = 0; i < INTR_LOCKS; i++)
+        InitializeCriticalSection(&g_intr_lock[i]);
+    return TRUE;
+}
+
+/* Keyed by the guest KINTERRUPT's address. Recursive per host thread, so an
+ * ISR that itself calls KeSynchronizeExecution on its own interrupt is fine. */
+void xbox_InterruptLock(uint32_t kint)
+{
+    InitOnceExecuteOnce(&g_intr_lock_once, intr_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_intr_lock[(kint >> 4) % INTR_LOCKS]);
+}
+
+void xbox_InterruptUnlock(uint32_t kint)
+{
+    LeaveCriticalSection(&g_intr_lock[(kint >> 4) % INTR_LOCKS]);
+}
+
 static void bridge_KeSynchronizeExecution(void)
 {
+    uint32_t kint    = STACK_ARG(0);
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
     recomp_func_t fn;
@@ -2111,7 +2142,9 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    if (kint) xbox_InterruptLock(kint);
     fn();
+    if (kint) xbox_InterruptUnlock(kint);
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
