@@ -1123,11 +1123,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         memcpy(raw, blk, bb);
         if (cache[slot].key != key || cache[slot].fmt != fmt
             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
-            uint32_t i;
-            for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
-                                      by * 4 + (i >> 2), t->width,
-                                      &cache[slot].px[i]);
+            /* The whole block in one pass: decoding it texel by texel
+             * re-derived the palette sixteen times (bit-identical). */
+            d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
             cache[slot].key = key;
             cache[slot].fmt = fmt;
             cache[slot].raw[0] = raw[0];
