@@ -135,6 +135,24 @@ void nv2a_rc_prepare(const Nv2aCombiner *rc, Nv2aCombinerPrep *p)
     }
     nv2a_rc_unpack(rc->final_c0, p->fc0);
     nv2a_rc_unpack(rc->final_c1, p->fc1);
+    /* Per stage, which results a destination keeps. A stage with nothing
+     * written in a portion skips that portion; one writing only AB skips
+     * C*D. In Blinx 2's hub the program behind two thirds of the pixels has
+     * three stages that write one RGB result and no alpha. */
+    for (s = 0; s < 8; s++) {
+        Nv2aRcStage *S = &p->st[s];
+        uint32_t ocw = rc->color_ocw[s], aocw = rc->alpha_ocw[s];
+        S->ab = ((ocw >> 4) & 0xF) != 0;
+        S->cd = (ocw & 0xF) != 0;
+        S->ms = ((ocw >> 8) & 0xF) != 0;
+        S->color = S->ab || S->cd || S->ms;
+        S->aab = ((aocw >> 4) & 0xF) != 0;
+        S->acd = (aocw & 0xF) != 0;
+        S->ams = ((aocw >> 8) & 0xF) != 0;
+        S->alpha = S->aab || S->acd || S->ams;
+        out_map((ocw >> 12) & 0x38, &S->bias, &S->scale);
+        out_map((aocw >> 12) & 0x38, &S->abias, &S->ascale);
+    }
 }
 
 void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
@@ -179,8 +197,9 @@ void nv2a_rc_eval_prep(const Nv2aCombinerPrep *p, const float v0[4],
         uint32_t icw = rc->color_icw[s], ocw = rc->color_ocw[s];
         uint32_t aicw = rc->alpha_icw[s], aocw = rc->alpha_ocw[s];
         uint32_t fl = ocw >> 12, afl = aocw >> 12;
+        const Nv2aRcStage *S = &p->st[s];
         float A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
-        float aA, aB, aC, aD, aab, acd, ams, bias, scale, dab, dcd;
+        float aA, aB, aC, aD, aab = 0, acd = 0, ams = 0;
         int mux_cd;
 
         memcpy(R[R_C0], p->c0[s], 16);
@@ -189,50 +208,73 @@ void nv2a_rc_eval_prep(const Nv2aCombinerPrep *p, const float v0[4],
                              : ((int)(R[R_R0][3] * 255.0f) & 1);
 
         /* Both portions read before either writes (psh.c emits all the
-         * arithmetic, then the assignments). */
-        read_rgb(R, icw >> 24, A); read_rgb(R, icw >> 16, B);
-        read_rgb(R, icw >> 8, C);  read_rgb(R, icw, D);
-        aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
-        aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
-
-        out_map(fl & 0x38, &bias, &scale);
-        dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
-        dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
-        for (i = 0; i < 3; i++) {
-            float pab = (fl & 2) ? dab : A[i] * B[i];
-            float pcd = (fl & 1) ? dcd : C[i] * D[i];
-            float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            ab[i] = clampf((pab + bias) * scale, -1.0f, 1.0f);
-            cd[i] = clampf((pcd + bias) * scale, -1.0f, 1.0f);
-            ms[i] = clampf((sum + bias) * scale, -1.0f, 1.0f);
+         * arithmetic, then the assignments). Only what some destination
+         * keeps is computed (nv2a_rc_prepare): the same operations in the
+         * same order as evaluating everything, minus the discarded ones. */
+        if (S->color) {
+            int want_ab = S->ab || S->ms, want_cd = S->cd || S->ms;
+            float dab = 0.0f, dcd = 0.0f;
+            if (want_ab) {
+                read_rgb(R, icw >> 24, A); read_rgb(R, icw >> 16, B);
+                if (fl & 2)
+                    dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+            }
+            if (want_cd) {
+                read_rgb(R, icw >> 8, C);  read_rgb(R, icw, D);
+                if (fl & 1)
+                    dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
+            }
+            for (i = 0; i < 3; i++) {
+                float pab = want_ab ? ((fl & 2) ? dab : A[i] * B[i]) : 0.0f;
+                float pcd = want_cd ? ((fl & 1) ? dcd : C[i] * D[i]) : 0.0f;
+                if (S->ab)
+                    ab[i] = clampf((pab + S->bias) * S->scale, -1.0f, 1.0f);
+                if (S->cd)
+                    cd[i] = clampf((pcd + S->bias) * S->scale, -1.0f, 1.0f);
+                if (S->ms) {
+                    float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+                    ms[i] = clampf((sum + S->bias) * S->scale, -1.0f, 1.0f);
+                }
+            }
         }
-        out_map(afl & 0x38, &bias, &scale);
-        {
-            float pab = aA * aB, pcd = aC * aD;
-            float sum = (afl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            aab = clampf((pab + bias) * scale, -1.0f, 1.0f);
-            acd = clampf((pcd + bias) * scale, -1.0f, 1.0f);
-            ams = clampf((sum + bias) * scale, -1.0f, 1.0f);
+        if (S->alpha) {
+            float pab = 0.0f, pcd = 0.0f;
+            if (S->aab || S->ams) {
+                aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
+                pab = aA * aB;
+            }
+            if (S->acd || S->ams) {
+                aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
+                pcd = aC * aD;
+            }
+            if (S->aab)
+                aab = clampf((pab + S->abias) * S->ascale, -1.0f, 1.0f);
+            if (S->acd)
+                acd = clampf((pcd + S->abias) * S->ascale, -1.0f, 1.0f);
+            if (S->ams) {
+                float sum = (afl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+                ams = clampf((sum + S->abias) * S->ascale, -1.0f, 1.0f);
+            }
         }
 
         /* RGB destinations; blue-to-alpha also writes the destination's .a. */
-        if ((ocw >> 4) & 0xF) {
+        if (S->ab) {
             float *d = R[(ocw >> 4) & 0xF];
             d[0] = ab[0]; d[1] = ab[1]; d[2] = ab[2];
             if (fl & 0x80) d[3] = ab[2];
         }
-        if (ocw & 0xF) {
+        if (S->cd) {
             float *d = R[ocw & 0xF];
             d[0] = cd[0]; d[1] = cd[1]; d[2] = cd[2];
             if (fl & 0x40) d[3] = cd[2];
         }
-        if ((ocw >> 8) & 0xF) {
+        if (S->ms) {
             float *d = R[(ocw >> 8) & 0xF];
             d[0] = ms[0]; d[1] = ms[1]; d[2] = ms[2];
         }
-        if ((aocw >> 4) & 0xF) R[(aocw >> 4) & 0xF][3] = aab;
-        if (aocw & 0xF)        R[aocw & 0xF][3] = acd;
-        if ((aocw >> 8) & 0xF) R[(aocw >> 8) & 0xF][3] = ams;
+        if (S->aab) R[(aocw >> 4) & 0xF][3] = aab;
+        if (S->acd) R[aocw & 0xF][3] = acd;
+        if (S->ams) R[(aocw >> 8) & 0xF][3] = ams;
         /* Register 0 is zero whatever was "written" to it. */
         R[R_ZERO][0] = R[R_ZERO][1] = R[R_ZERO][2] = R[R_ZERO][3] = 0.0f;
     }

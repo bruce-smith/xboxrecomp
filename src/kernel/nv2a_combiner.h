@@ -38,9 +38,16 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
 /* A combiner program with its constants unpacked, once per draw call rather
  * than once per pixel. nv2a_rc_eval is prepare + eval. */
 typedef struct {
+    unsigned char color, ab, cd, ms;        /* RGB results some register keeps */
+    unsigned char alpha, aab, acd, ams;     /* alpha results likewise */
+    float bias, scale, abias, ascale;       /* output mapping, RGB and alpha */
+} Nv2aRcStage;
+
+typedef struct {
     Nv2aCombiner rc;
     float c0[8][4], c1[8][4];               /* per stage, COMBINERCOUNT resolved */
     float fc0[4], fc1[4];                   /* final combiner's c0/c1 */
+    Nv2aRcStage st[8];                      /* what each stage's results feed */
 } Nv2aCombinerPrep;
 
 void nv2a_rc_prepare(const Nv2aCombiner *rc, Nv2aCombinerPrep *p);
