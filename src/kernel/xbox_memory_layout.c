@@ -607,6 +607,37 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
+static uint32_t g_sem_device_ptr_va, g_sem_base_ptr_off;
+
+void xbox_Nv2aSemaphoreAt(uint32_t device_ptr_va, uint32_t base_ptr_off)
+{
+    g_sem_base_ptr_off = base_ptr_off;
+    g_sem_device_ptr_va = device_ptr_va;
+    fprintf(stderr, "  NV2A semaphore: releases land at"
+            " *(*(0x%08X) + 0x%X) + offset\n", device_ptr_va, base_ptr_off);
+}
+
+int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
+{
+    uint32_t dev, base;
+
+    if (!g_sem_device_ptr_va || !fence_readable(g_sem_device_ptr_va, 4))
+        return -1;
+    dev = *(volatile uint32_t *)((uintptr_t)g_sem_device_ptr_va + g_memory_offset);
+    if (!fence_readable(dev + g_sem_base_ptr_off, 4))
+        return -1;
+    base = *(volatile uint32_t *)((uintptr_t)(dev + g_sem_base_ptr_off)
+                                  + g_memory_offset);
+    if (!fence_readable(base + offset, 4))
+        return -1;
+    if (g_nv2a_memory)
+        *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10u)
+            = (value << 2) & 0x7Cu;
+    MemoryBarrier();
+    *(volatile uint32_t *)((uintptr_t)(base + offset) + g_memory_offset) = value;
+    return 0;
+}
+
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */

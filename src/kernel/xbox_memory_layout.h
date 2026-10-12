@@ -232,6 +232,18 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Where the GPU's semaphore releases land, for a title whose D3D fences are
+ * semaphore releases in the pushbuffer (SET_SEMAPHORE_OFFSET, then
+ * BACK_END_WRITE_SEMAPHORE_RELEASE with the fence time). The semaphore DMA
+ * object is not modelled, so its base is followed through the device struct
+ * like the fence mirror: *(*(device_ptr_va) + base_ptr_off) + offset.
+ * xbox_Nv2aSemaphoreRelease is the executor's half: it writes the value there
+ * when the stream reaches the release, and mirrors its low bits into PGRAPH
+ * 0x400B10 (bits 2-6), which D3D also compares before calling the GPU idle.
+ * Returns 0 when a target is registered (release done), -1 otherwise. */
+void xbox_Nv2aSemaphoreAt(uint32_t device_ptr_va, uint32_t base_ptr_off);
+int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

@@ -342,6 +342,7 @@ static struct {
     uint32_t cull_enable, cull_face, front_face;
     uint32_t tris_culled;
     uint32_t zeta_offset, zstencil_clear;
+    uint32_t sem_offset, sem_releases;   /* semaphore (D3D fences) */
 } s_gpu;
 
 /* Deferred rasterisation (below): drain everything queued. Counted by call
@@ -2241,7 +2242,23 @@ static struct {
     volatile LONG next_band;                /* next band to claim */
     LONG band_end;
     XfCount cnt[NV_RASTER_MAX_THREADS];
+    /* A fence waiting on this batch (see rq_fence): whoever finishes the
+     * batch's last band -- a worker, or the executor helping in rq_wait --
+     * releases it, so the title sees it as soon as the pixels are written
+     * and the executor never stops for it. rel_armed is taken with an
+     * exchange, so exactly one thread releases. */
+    volatile LONG bands_done;
+    LONG band_total;
+    volatile LONG rel_armed;
+    uint32_t rel_off, rel_val;
 } s_pool;
+
+static void rq_band_done(void)
+{
+    if (InterlockedIncrement(&s_pool.bands_done) == s_pool.band_total
+            && InterlockedExchange(&s_pool.rel_armed, 0))
+        xbox_Nv2aSemaphoreRelease(s_pool.rel_off, s_pool.rel_val);
+}
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -2251,8 +2268,10 @@ static DWORD WINAPI raster_worker(LPVOID arg)
         LONG band;
         WaitForSingleObject(s_pool.start[k], INFINITE);
         while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
-               < s_pool.band_end)
+               < s_pool.band_end) {
             xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
+            rq_band_done();
+        }
         stats_take(&c.written, &c.written_max);
         s_pool.cnt[k] = c;
         if (InterlockedDecrement(&s_pool.pending) == 0)
@@ -2306,8 +2325,10 @@ static void rq_wait(void)
         XfCount c = {0, 0, 0, 0, 0};
         LONG band;
         while ((band = InterlockedIncrement(&s_pool.next_band) - 1)
-               < s_pool.band_end)
+               < s_pool.band_end) {
             xf_band(s_pool.batch->tri, s_pool.batch->n, (int)band, &c);
+            rq_band_done();
+        }
         rq_count(&c);
     }
     WaitForSingleObject(s_pool.done, INFINITE);
@@ -2339,6 +2360,8 @@ static void rq_kick(void)
             s_pool.batch = b;
             s_pool.next_band = b->ymin / NV_BAND;
             s_pool.band_end = (b->ymax + NV_BAND - 1) / NV_BAND;
+            s_pool.band_total = s_pool.band_end - s_pool.next_band;
+            s_pool.bands_done = 0;
             s_pool.pending = s_pool.n;
             s_rq_busy = s_rq_fill;
             for (k = 0; k < s_pool.n; k++)
@@ -2381,6 +2404,51 @@ static void rq_sync_at(int line)
     rq_wait();
     stats_take(&n, &mx);              /* the executor's own direct drawing */
     stats_fold(n, mx);
+}
+
+/* BACK_END_WRITE_SEMAPHORE_RELEASE: D3D's fence.
+ *
+ * By default it is released as soon as the executor reaches it: every
+ * command before it has been read and every vertex fetched, which is what
+ * the title's pushbuffer-space fences (most of Blinx 2's ~9 a frame) need.
+ * Queued pixels may still be sampling textures; the cases where the title
+ * looks at what was drawn (flips, clears, visibility reports, render to
+ * texture) drain the queue already.
+ *
+ * RECOMP_FENCE_STRICT=1 releases only once the pixels are written as well:
+ * the queued work goes to the workers and the release rides on that batch,
+ * so the executor does not stop for it. The title then waits on the
+ * rasteriser at every fence: Blinx 2's hub ran at 12.4 fps that way against
+ * 17.0, and at 11.6 when the executor drained the queue itself (rq_sync). */
+static void rq_fence(uint32_t off, uint32_t val)
+{
+    static int strict = -1;
+    if (strict < 0) {
+        const char *e = getenv("RECOMP_FENCE_STRICT");
+        strict = e && *e == '1';
+    }
+    if (!strict) {
+        xbox_Nv2aSemaphoreRelease(off, val);
+        return;
+    }
+#if defined(_WIN32)
+    if (s_pool.rel_armed)
+        rq_wait();                    /* one fence in flight at a time */
+    rq_kick();
+    if (s_rq_busy >= 0) {
+        s_pool.rel_off = off;
+        s_pool.rel_val = val;
+        InterlockedExchange(&s_pool.rel_armed, 1);
+        /* The batch may have finished before the arm: then release here. */
+        if (s_pool.bands_done >= s_pool.band_total
+                && InterlockedExchange(&s_pool.rel_armed, 0))
+            xbox_Nv2aSemaphoreRelease(off, val);
+        return;
+    }
+#else
+    rq_kick();
+#endif
+    xbox_Nv2aSemaphoreRelease(off, val);
 }
 
 static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
@@ -3836,6 +3904,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+    case 0x1D6C: s_gpu.sem_offset = param; break;     /* SET_SEMAPHORE_OFFSET */
+    case 0x1D70:                     /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+        /* D3D's fence: the GPU writes the fence time once everything before
+         * it is done, and the title waits on that value before reusing what
+         * those commands read. Released here, in stream order, from the
+         * thread that executes the stream, the title waits exactly as long
+         * as the work takes -- not until a 1 ms poll notices. What counts
+         * as done is rq_fence's call. */
+        rq_fence(s_gpu.sem_offset, param);
+        s_gpu.sem_releases++;
+        break;
 
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
@@ -4114,10 +4193,11 @@ void nv2a_pb_exec_report(void)
         last_ms = now;
     }
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
-                    " clears %u | %u unhandled methods (%d distinct)\n",
+                    " clears %u | %u unhandled methods (%d distinct)"
+                    " | %u fences released\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
-            s_gpu.unhandled_total, s_unhandled_count);
+            s_gpu.unhandled_total, s_unhandled_count, s_gpu.sem_releases);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
