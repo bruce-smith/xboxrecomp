@@ -2924,9 +2924,14 @@ static void rq_wait_until(LONG keep)
 static void rq_wait(void)
 {
     int k;
-    if (s_pool.head == s_pool.tail)
-        return;
-    rq_wait_until(0);
+    /* Fold the counts even when nothing is in flight: a batch retired by an
+     * earlier reap (rq_kick, rq_queue_overlaps) left its counts in cnt[], and
+     * returning early here added them at some later drain instead. That
+     * reached GET_REPORT -- visibility counts short by whole batches, or
+     * carried past CLEAR_REPORT_VALUE into the next test -- and the per-draw
+     * trace's pixel counts. */
+    if (s_pool.head != s_pool.tail)
+        rq_wait_until(0);
     for (k = 0; k <= s_pool.n; k++) {
         XfCount z = {0, 0, 0, 0, 0};
         rq_count(&s_pool.cnt[k]);
