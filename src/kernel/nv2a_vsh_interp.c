@@ -374,6 +374,15 @@ static vec4 read_src(const VshSrc *d, const float in[NV2A_VSH_INPUTS][4],
     return r;
 }
 
+/* The NV2A clamps the colour outputs oD0/oD1 to [0,1] before they are
+ * interpolated (xemu does the same). Written as minps/maxps compute it, so
+ * the four-lane path matches bit for bit, NaN included (-> 0). */
+static float clamp01(float v)
+{
+    v = v > 0.0f ? v : 0.0f;
+    return v < 1.0f ? v : 1.0f;
+}
+
 static void write_masked(float *dst, const vec4 *src, uint32_t mask)
 {
     if (mask & 8) dst[0] = src->v[0];
@@ -469,7 +478,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     vec4 temp[12], opos;
     float outregs[13][4];
-    int a0 = 0;
+    int a0 = 0, i;
     uint32_t s;
 
     memset(temp, 0, sizeof temp);
@@ -526,8 +535,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
         if (ins->final) {
             memcpy(out->pos, opos.v, sizeof out->pos);
-            memcpy(out->d0, outregs[3], sizeof out->d0);
-            memcpy(out->d1, outregs[4], sizeof out->d1);
+            for (i = 0; i < 4; i++) {
+                out->d0[i] = clamp01(outregs[3][i]);
+                out->d1[i] = clamp01(outregs[4][i]);
+            }
             memcpy(out->fog, outregs[5], sizeof out->fog);
             memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
@@ -793,6 +804,13 @@ static int run4_with(const struct Nv2aVshProg *p, const float (*cst)[4],
                            : j == 2 ? offsetof(Nv2aVshOutput, d1)
                            : j == 3 ? offsetof(Nv2aVshOutput, fog)
                            : offsetof(Nv2aVshOutput, tex) + (size_t)(j - 4) * 16;
+                if (j == 1 || j == 2) {               /* colours: clamp01 */
+                    const __m128 z = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
+                    r0 = _mm_min_ps(_mm_max_ps(r0, z), one);
+                    r1 = _mm_min_ps(_mm_max_ps(r1, z), one);
+                    r2 = _mm_min_ps(_mm_max_ps(r2, z), one);
+                    r3 = _mm_min_ps(_mm_max_ps(r3, z), one);
+                }
                 _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
                 _mm_storeu_ps((float *)((char *)out[0] + off), r0);
                 _mm_storeu_ps((float *)((char *)out[1] + off), r1);
