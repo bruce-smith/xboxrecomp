@@ -5105,8 +5105,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             /* A new test: draws from here count in a fresh epoch. */
             uint32_t e;
             int k;
-            if (s_rep_n >= NV_ZEPOCHS / 2)
-                rq_sync();                /* far behind: let the queue catch up */
+            /* Far behind, or the epoch about to be reused still has a test
+             * pending (CLEARs without GETs between): let the queue catch up
+             * before its counters are zeroed. */
+            if (s_rep_n >= NV_ZEPOCHS / 2 ||
+                (s_rep_n && s_gpu.report_epoch + 1 - s_rep[s_rep_head].epoch
+                                >= NV_ZEPOCHS))
+                rq_sync();
             e = ++s_gpu.report_epoch & (NV_ZEPOCHS - 1);
             s_zpe_total[e] = 0;
             for (k = 0; k <= s_pool.n; k++)
