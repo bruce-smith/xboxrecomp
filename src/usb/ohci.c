@@ -692,6 +692,79 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
  * delivers its reports on an interrupt endpoint, and those EDs hang off the
  * HCCA interrupt table rather than HcControlHeadED. Walking only the control
  * list enumerates a device perfectly and then never hears from it again. */
+/* The endpoint history, for a HeadP that goes bad.
+ *
+ * Blinx 2's intermittent freeze ends with its interrupt-IN ED holding HeadP
+ * 0xFFFFFFF0: the pad stops reporting, and a rumble request waiting on the
+ * same stack never completes. By then whoever wrote it is long gone. So keep
+ * the last few retirements and every HeadP change the controller did not make
+ * itself, and print them once, the first time a visited ED's head is not a
+ * descriptor. Cheap enough to leave on. */
+#define HIST_N 64
+typedef struct {
+    uint32_t seq, kind, ed, td, a, b, c, d;  /* kind 1 retire, 2 driver wrote HeadP */
+} HistEntry;
+static HistEntry s_hist[HIST_N];
+static unsigned  s_hist_seq;
+static struct { uint32_t ed, head; } s_written[16];   /* the model's last HeadP */
+
+static void hist_add(uint32_t kind, uint32_t ed, uint32_t td, uint32_t a,
+                     uint32_t b, uint32_t c, uint32_t d)
+{
+    HistEntry *h = &s_hist[s_hist_seq % HIST_N];
+    h->seq = s_hist_seq++;
+    h->kind = kind; h->ed = ed; h->td = td; h->a = a; h->b = b; h->c = c; h->d = d;
+}
+
+static void head_written(uint32_t ed, uint32_t head)
+{
+    int i, free_slot = -1;
+    for (i = 0; i < 16; i++) {
+        if (s_written[i].ed == ed) { s_written[i].head = head; return; }
+        if (!s_written[i].ed && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { s_written[free_slot].ed = ed; s_written[free_slot].head = head; }
+}
+
+/* Called on every ED visit: notes a HeadP the driver changed, and dumps the
+ * history the first time a head is not a descriptor. */
+static void head_check(OhciController *hc, uint32_t ed, uint32_t ed0,
+                       uint32_t head, uint32_t tail)
+{
+    static int dumped;
+    int i;
+
+    for (i = 0; i < 16; i++)
+        if (s_written[i].ed == ed) {
+            if (s_written[i].head != head) {
+                hist_add(2, ed, 0, s_written[i].head, head, tail, ed0);
+                s_written[i].head = head;
+            }
+            break;
+        }
+    if (dumped || (head & ED_PTR_MASK) == tail || (head & ED_HEAD_HALT)
+            || guest_ok(head & ED_PTR_MASK, 16))
+        return;
+    dumped = 1;
+    fprintf(stderr, "  [OHCI%d] BAD HeadP: ED %08X info=%08X head=%08X tail=%08X"
+            " -- last %u events, oldest first:\n", hc->index, ed, ed0, head, tail,
+            s_hist_seq < HIST_N ? s_hist_seq : HIST_N);
+    for (i = 0; i < HIST_N; i++) {
+        const HistEntry *h = &s_hist[(s_hist_seq + i) % HIST_N];
+        if (!h->kind)
+            continue;
+        if (h->kind == 1)
+            fprintf(stderr, "  [OHCI%d]   #%u retire ED %08X TD %08X info=%08X "
+                    "cbp=%08X next=%08X be=%08X\n", hc->index, h->seq, h->ed,
+                    h->td, h->a, h->b, h->c, h->d);
+        else
+            fprintf(stderr, "  [OHCI%d]   #%u driver set ED %08X head %08X -> "
+                    "%08X (tail %08X info %08X)\n", hc->index, h->seq, h->ed,
+                    h->a, h->b, h->c, h->d);
+    }
+    fflush(stderr);
+}
+
 static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
 {
     int completed = 0, guard = 0;
@@ -701,6 +774,8 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
         uint32_t tail = rd32(ed + 4) & ED_PTR_MASK;
         uint32_t head = rd32(ed + 8);
         int tguard = 0;
+
+        head_check(hc, ed, ed0, head, tail);
 
         if (s_trace) {
             static unsigned n;
@@ -718,7 +793,32 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
-            uint32_t cc = ohci_do_td(hc, ed0, td);
+            uint32_t cc;
+
+            hist_add(1, ed, td, rd32(td), rd32(td + 4), rd32(td + 8),
+                     rd32(td + 12));
+            cc = ohci_do_td(hc, ed0, td);
+
+            /* Retire it in the order the hardware does: HeadP moves past
+             * the descriptor first, and only then is the descriptor's NextTD
+             * reused as the done-queue link.
+             *
+             * This used to clobber NextTD first and write HeadP once, after
+             * the whole ED. The driver runs alongside the controller, and
+             * XPP's DPC walks an ED from HeadP through NextTD to retire the
+             * rest of a transfer after a short packet (sub_0036D772). Between
+             * the two writes it can find HeadP still on a descriptor whose
+             * NextTD is now a done-queue link: Blinx 2 followed 0xFFFFFFFF
+             * there and faulted in the DPC, and a transfer lost the same way
+             * fits its other hang -- the game spinning in sub_0005E060 for a
+             * rumble request that never leaves ERROR_IO_PENDING. The trailing
+             * write-back also wrote HeadP even when nothing moved, which
+             * can put back a stale value over one the driver just set. */
+            head = next | (head & ED_HEAD_TOGGLE);
+            if (cc != TD_CC_NOERROR)
+                head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
+            wr32(ed + 8, head);
+            head_written(ed, head);
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
@@ -727,13 +827,9 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             *done_head = td;
             completed++;
 
-            head = next | (head & ED_HEAD_TOGGLE);
-            if (cc != TD_CC_NOERROR) {
-                head |= ED_HEAD_HALT;       /* a stall halts the endpoint */
+            if (cc != TD_CC_NOERROR)
                 break;
-            }
         }
-        wr32(ed + 8, head);
         ed = rd32(ed + 12) & ED_PTR_MASK;
     }
 
