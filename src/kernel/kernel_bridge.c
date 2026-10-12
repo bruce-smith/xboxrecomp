@@ -3330,9 +3330,21 @@ static void bridge_XeSection(int load)
         count--;
     BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET) = count;
 
-    if (KERNEL_LOG_ON())
-        fprintf(stderr, "  [XBE] Xe%sSection(0x%08X) refcount=%u\n",
-                load ? "Load" : "Unload", section, count);
+    {
+        static LONG logged;
+        if (KERNEL_LOG_ON() || InterlockedIncrement(&logged) <= 64) {
+            uint32_t name = BRIDGE_MEM32(section + 0x14);
+            char nm[9] = {0};
+            int k;
+            for (k = 0; k < 8 && name; k++) {
+                nm[k] = (char)BRIDGE_MEM8(name + k);
+                if (!nm[k]) break;
+            }
+            fprintf(stderr, "  [XBE] Xe%sSection(%s) va 0x%08X size 0x%X refcount=%u\n",
+                    load ? "Load" : "Unload", nm, BRIDGE_MEM32(section + 4),
+                    BRIDGE_MEM32(section + 8), count);
+        }
+    }
     g_eax = 0;
 }
 
