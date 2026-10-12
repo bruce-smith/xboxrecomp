@@ -230,7 +230,12 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* Indices one draw can carry. Was 4096, and the rest of a longer draw was
+ * dropped without a word: Blinx 2's sea surface is one 4592-index draw of
+ * quads (rows of the camera-facing grid out to 89 degrees, then a row at
+ * the horizon), so its last rows were never drawn and the open sea showed
+ * the dark base pass beneath. A draw past this cap is logged once. */
+#define NV_MAX_INDICES  16384
 #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
@@ -5386,6 +5391,17 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* A draw longer than NV_MAX_INDICES: the rest is dropped. Said once. */
+static void idx_overflow(void)
+{
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [GPU] a draw has more than %d indices; the rest is"
+                        " not drawn%c", NV_MAX_INDICES, 10);
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -5680,6 +5696,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        if (i < count)
+            idx_overflow();
         break;
     }
 
@@ -5688,6 +5706,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+        } else if (s_gpu.prim) {
+            idx_overflow();
         }
         break;
 
