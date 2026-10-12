@@ -556,6 +556,43 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* RECOMP_PAD_REST=lx,ly,rx,ry[,lt,rt]: pad 0 reports this resting state from
+ * the moment it arrives, the way a drifting or held host pad does. A
+ * diagnostic for "with a real pad plugged in the title acts on input nobody
+ * gave" -- it reproduces the pad's values without the pad. Applied under any
+ * scripted press, which still overrides the axes it names. */
+static void pad_rest_apply(int pad, uint8_t *out)
+{
+    static int parsed = -1;
+    static int16_t ax[4];
+    static uint8_t trig[2];
+    if (parsed < 0) {
+        const char *s = getenv("RECOMP_PAD_REST");
+        parsed = 0;
+        if (s && *s) {
+            long v[6] = {0};
+            int n = 0;
+            char *end;
+            while (n < 6) {
+                v[n++] = strtol(s, &end, 0);
+                if (*end != ',') break;
+                s = end + 1;
+            }
+            for (n = 0; n < 4; n++) ax[n] = (int16_t)v[n];
+            trig[0] = (uint8_t)v[4]; trig[1] = (uint8_t)v[5];
+            parsed = 1;
+            fprintf(stderr, "  PAD: resting state L=(%d,%d) R=(%d,%d) LT=%u RT=%u\n",
+                    ax[0], ax[1], ax[2], ax[3], trig[0], trig[1]);
+            fflush(stderr);
+        }
+    }
+    if (parsed != 1 || pad != 0)
+        return;
+    memcpy(&out[12], ax, sizeof ax);
+    out[10] = trig[0];
+    out[11] = trig[1];
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -610,6 +647,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         synth = 0;
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
+        pad_rest_apply(pad, out);
         pad_script_apply(pad, out);
         return 20;
     }
@@ -627,6 +665,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    pad_rest_apply(pad, out);
     pad_script_apply(pad, out);
     return 20;
 }
