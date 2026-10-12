@@ -180,6 +180,43 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     log_mapping_once();
     result = XInputGetState(dwPort, &xi_state);
+
+    /* The host pad's first few changes, raw (before deadzones), with the
+     * time since the first poll. Always on and capped, because the question
+     * it answers comes from a player's own run with a real controller -- "the
+     * intro movie skipped by itself" -- and no scripted run reproduces that
+     * pad. The log then says whether, and what, the pad sent at that moment. */
+    {
+        static XINPUT_GAMEPAD last[XBOX_MAX_CONTROLLERS];
+        static DWORD last_result[XBOX_MAX_CONTROLLERS] = {
+            0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+        static ULONGLONG t0;
+        static LONG logged;
+        const XINPUT_GAMEPAD *g = &xi_state.Gamepad;
+        if (!t0)
+            t0 = GetTickCount64();
+        if (result != last_result[dwPort]
+            || (result == ERROR_SUCCESS && memcmp(g, &last[dwPort], sizeof *g))) {
+            if (InterlockedIncrement(&logged) <= 24) {
+                if (result == ERROR_SUCCESS)
+                    fprintf(stderr, "  [HOSTPAD] t=%llu ms port %lu: buttons=%04X "
+                            "LT=%u RT=%u L=(%d,%d) R=(%d,%d)\n",
+                            GetTickCount64() - t0, (unsigned long)dwPort,
+                            g->wButtons, g->bLeftTrigger, g->bRightTrigger,
+                            g->sThumbLX, g->sThumbLY, g->sThumbRX, g->sThumbRY);
+                else if (last_result[dwPort] == ERROR_SUCCESS
+                         || last_result[dwPort] == 0xFFFFFFFFu)
+                    fprintf(stderr, "  [HOSTPAD] t=%llu ms port %lu: no host pad "
+                            "(%lu)\n", GetTickCount64() - t0,
+                            (unsigned long)dwPort, (unsigned long)result);
+                fflush(stderr);
+            }
+            last_result[dwPort] = result;
+            if (result == ERROR_SUCCESS)
+                last[dwPort] = *g;
+        }
+    }
+
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
