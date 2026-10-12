@@ -4200,7 +4200,10 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    /* A progress marker, rare enough to cost nothing: every 200 draws was
+     * ~270 lines a second in Blinx 2's hub, and the executor then waited on
+     * stderr's lock behind every other thread's logging. */
+    if ((s_gpu.draws % 20000) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
