@@ -2707,8 +2707,14 @@ typedef struct {
     uint32_t nin;
     float (*in)[NV2A_VSH_INPUTS][4];    /* NV_RQ_GVERTS */
     float (*cst)[NV2A_VSH_CONSTANTS][4];/* NV_RQ_GEO */
-    volatile LONG geo_next, geo_left;
-    int barrier;                        /* waits for every earlier batch */
+    /* Next job to claim, tagged with the batch's number in the high half
+     * (geo_claim_take). A plain counter let a worker that saw the slot just
+     * before it was retired claim a job of the batch filled into it next:
+     * geo_left then reached 0 a job early, and the bands started on
+     * triangles still being set up. */
+    volatile LONG64 geo_claim;
+    volatile LONG geo_left;
+    int barrier;                       /* waits for every earlier batch */
 } RasterBatch;
 
 #define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
@@ -2989,6 +2995,25 @@ static void rq_geo_finish(RasterBatch *b, int slot)
     ReleaseSRWLockExclusive(&s_pool.lock);
 }
 
+/* Claim the next geometry job of batch `seq`, or -1 if it has none left or
+ * the slot no longer holds that batch. */
+static LONG geo_claim_take(RasterBatch *rb, LONG seq)
+{
+    for (;;) {
+        LONG64 v = rb->geo_claim;
+        LONG j = (LONG)(v & 0xFFFFFFFF);
+        if ((LONG)(v >> 32) != seq || j >= rb->ngeo)
+            return -1;
+        if (InterlockedCompareExchange64(&rb->geo_claim, v + 1, v) == v)
+            return j;
+    }
+}
+
+static int geo_has_jobs(const RasterBatch *rb)
+{
+    return (LONG)(rb->geo_claim & 0xFFFFFFFF) < rb->ngeo;
+}
+
 /* Claim and run one geometry job of the oldest batch that has one left. */
 static int rq_geo_work(int k)
 {
@@ -3003,10 +3028,7 @@ static int rq_geo_work(int k)
         uint32_t i;
 
         if (s_pool.slot_seq[slot] != seq || s_pool.geo_ready[slot]
-            || rb->geo_next >= rb->ngeo)
-            continue;
-        j = InterlockedIncrement(&rb->geo_next) - 1;
-        if (j >= rb->ngeo)
+            || (j = geo_claim_take(rb, seq)) < 0)
             continue;
         J = &rb->geo[j];
         if (!s_pool.xf_scratch[k])
@@ -3039,7 +3061,7 @@ static int rq_any_work(void)
     for (seq = s_pool.tail; seq < s_pool.head; seq++) {
         int slot = seq % NV_RQ_DEPTH;
         if (s_pool.slot_seq[slot] == seq && !s_pool.geo_ready[slot]
-            && s_rq[slot]->geo_next < s_rq[slot]->ngeo)
+            && geo_has_jobs(s_rq[slot]))
             return 1;
     }
     for (b = 0; b < s_pool.nbands; b++)
@@ -3183,7 +3205,7 @@ void nv2a_pb_exec_dump_state(void)
                 (long)s_pool.left[i], (long)s_pool.geo_ready[i],
                 (long)s_pool.barrier[i], s_pool.band0[i], s_pool.band1[i],
                 b ? b->ngeo : -1, b ? (long)b->geo_left : -1L,
-                b ? (long)b->geo_next : -1L, b ? b->n : 0u);
+                b ? (long)(b->geo_claim & 0xFFFFFFFF) : -1L, b ? b->n : 0u);
     }
     for (i = 0; i < s_pool.nbands; i++) {
         if (s_pool.band_busy[i])
@@ -3234,7 +3256,7 @@ static void rq_kick(void)
                  * hands it to the bands. */
                 s_pool.done[slot] = 0;
                 s_pool.geo_ready[slot] = 0;
-                b->geo_next = 0;
+                b->geo_claim = (LONG64)s_pool.head << 32;
                 b->geo_left = b->ngeo;
             } else {
                 int b0 = b->ymin / NV_BAND;
