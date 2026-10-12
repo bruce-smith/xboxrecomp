@@ -270,6 +270,8 @@ static void maybe_dump(void)
     }
 }
 
+unsigned long nv2a_vsh_decodes;               /* for RECOMP_VSH_TIME */
+
 static void decode_program(void)
 {
     static struct Nv2aVshProg t;
@@ -277,6 +279,7 @@ static void decode_program(void)
     uint32_t s, h = 2166136261u;
     size_t i;
 
+    nv2a_vsh_decodes++;
     memset(&t, 0, sizeof t);
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const uint32_t *ins = s_program[s];

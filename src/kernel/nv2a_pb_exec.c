@@ -626,6 +626,7 @@ static uint32_t surface_bpp(void)
  * after-draw dumps stand down then, or they would put duplicate frames into
  * the sequence. */
 static int s_flip_dumping;
+static int s_flip_naming;   /* RECOMP_FB_DUMP_FLIPS is set: see dump names */
 
 static void dump_surface_bmp(void)
 {
@@ -655,8 +656,15 @@ static void dump_surface_bmp(void)
 
     /* Flip dumps are named by flip number, which the frame summary
      * (RECOMP_FRAME_SUMMARY) prints too, so a bad frame finds its draws. */
+    /* Other dumps (the periodic report's, the first after-draw ones) are
+     * taken mid-frame. Numbered like the flips they overwrote flip dumps of
+     * the same number with half-drawn frames -- no HUD, no reflection yet --
+     * which looked exactly like a rendering glitch. So under flip dumping
+     * they get an 'r' and their own sequence. */
     if (s_flip_dumping)
         snprintf(path, sizeof path, "%s%05u.bmp", prefix, s_gpu.flips);
+    else if (s_flip_naming)
+        snprintf(path, sizeof path, "%sr%05d.bmp", prefix, seq);
     else
         snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
     seq++;
@@ -3770,7 +3778,8 @@ static void raster_batch_program(void)
      * for A/B runs of the interpreter. */
 #if defined(_WIN32)
     static int vtime = -1;
-    LARGE_INTEGER vt0;
+    static uint64_t fticks, batches;
+    LARGE_INTEGER vt0, vf0, vf1;
     if (vtime < 0)
         vtime = getenv("RECOMP_VSH_TIME") != NULL;
     if (vtime)
@@ -3785,6 +3794,10 @@ static void raster_batch_program(void)
         const float (*ip[4])[4];
         Nv2aVshOutput *op[4];
         uint32_t l, a;
+#if defined(_WIN32)
+        if (vtime)
+            QueryPerformanceCounter(&vf0);
+#endif
         for (l = 0; l < 4; l++) {
             uint32_t j = i + l < n ? i + l : n - 1;
             for (a = 0; a < NV2A_VSH_INPUTS; a++)
@@ -3792,6 +3805,12 @@ static void raster_batch_program(void)
             ip[l] = (const float (*)[4])in[l];
             op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
         }
+#if defined(_WIN32)
+        if (vtime) {
+            QueryPerformanceCounter(&vf1);
+            fticks += (uint64_t)(vf1.QuadPart - vf0.QuadPart);
+        }
+#endif
         if (!nv2a_vsh_run4(ip, op))
             return;                                    /* no program loaded */
     }
@@ -3803,12 +3822,18 @@ static void raster_batch_program(void)
         QueryPerformanceCounter(&vt1);
         ticks += (uint64_t)(vt1.QuadPart - vt0.QuadPart);
         verts += n;
+        batches++;
         if (GetTickCount() - last > 10000 && verts) {
             QueryPerformanceFrequency(&f);
-            fprintf(stderr, "[VSHTIME] %.1f ns/vertex over %llu vertices (%.0f ms)%c",
+            extern unsigned long nv2a_vsh_decodes;
+            fprintf(stderr, "[VSHTIME] %.1f ns/vertex over %llu vertices (%.0f ms),"
+                    " fetch %.0f ms, %llu batches, %lu decodes%c",
                     1e9 * (double)ticks / (double)f.QuadPart / (double)verts,
-                    (unsigned long long)verts, 1e3 * (double)ticks / (double)f.QuadPart, 10);
-            ticks = verts = 0;
+                    (unsigned long long)verts, 1e3 * (double)ticks / (double)f.QuadPart,
+                    1e3 * (double)fticks / (double)f.QuadPart,
+                    (unsigned long long)batches, nv2a_vsh_decodes, 10);
+            nv2a_vsh_decodes = 0;
+            ticks = verts = fticks = batches = 0;
             last = GetTickCount();
         }
     }
@@ -4218,6 +4243,11 @@ static void draw_primitive(void)
                     s_gpu.draws, s_gpu.color_offset,
                     (unsigned long long)(s_gpu.xf_pixels - x0),
                     (unsigned long long)(s_gpu.csum - c0));
+            fprintf(stderr, " bl %u %X/%X f0 %08X %08X %08X %08X fc %08X d0a %.3f zp %u",
+                    s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                    s_gpu.rc.factor0[0], s_gpu.rc.factor0[1], s_gpu.rc.factor0[2],
+                    s_gpu.rc.factor0[3], s_gpu.rc.final_c0, s_xf[0].d0[3],
+                    s_gpu.zpass_enable);
             c0 = s_gpu.csum;
             x0 = s_gpu.xf_pixels;
             for (st = 0; st < 4; st++) {
@@ -5001,6 +5031,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 spec = getenv("RECOMP_FB_DUMP_FLIPS");
             if (spec) {
                 int on = strcmp(spec, "1") == 0;
+                s_flip_naming = 1;
                 if (!on) {
                     FILE *f = fopen(spec, "rb");
                     if (f) { fclose(f); on = 1; }
