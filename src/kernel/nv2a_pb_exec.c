@@ -4022,55 +4022,109 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
+/* A polygon vertex while clipping: the vertex, its clip-space position, and
+ * whether it is an original vertex (drawn as it came, see below). */
+typedef struct {
+    Nv2aVshOutput v;
+    float c[4];
+    int keep;
+} ClipVert;
+
+/* Clip-space distance of v to plane `pl`: 0 the near plane (z >= 0, D3D's
+ * clip space), 1 the w > NV_CLIP_W guard. */
+static float clip_dist(const ClipVert *v, int pl)
+{
+    return pl == 0 ? v->c[2] : v->c[3] - NV_CLIP_W;
+}
+
+/* One Sutherland-Hodgman pass of polygon in[0..n) against plane pl. */
+static int clip_poly(const ClipVert *in, int n, int pl, ClipVert *out)
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++) {
+        const ClipVert *p = &in[i], *q = &in[(i + 1) % n];
+        float dp = clip_dist(p, pl), dq = clip_dist(q, pl);
+        if (dp >= 0.0f)
+            out[m++] = *p;
+        if ((dp >= 0.0f) != (dq >= 0.0f)) {
+            float t = dp / (dp - dq);
+            Nv2aVshOutput va = p->v, vb = q->v;
+            int j;
+            for (j = 0; j < 3; j++) { va.pos[j] = p->c[j]; vb.pos[j] = q->c[j]; }
+            va.pos[3] = p->c[3]; vb.pos[3] = q->c[3];
+            xf_lerp(&va, &vb, t, &out[m].v);
+            for (j = 0; j < 4; j++)
+                out[m].c[j] = p->c[j] + (q->c[j] - p->c[j]) * t;
+            out[m].keep = 0;
+            m++;
+        }
+    }
+    return m;
+}
+
+/* Near-plane clipping, against the real near plane.
+ *
+ * This used to clip at w = NV_CLIP_W (1e-3) only. A triangle that reaches
+ * behind the camera -- Blinx 2's sea, a plane around the whole island --
+ * then got a vertex at w = 0.001: millions of pixels off screen, with a
+ * screen depth around -2e10. The rest of the triangle's depth was
+ * interpolated from that in float, and came out far too near over most of
+ * the open sea. The bump-mapped water surface drawn over it then failed
+ * its LESS depth test there, and that part of the sea stayed the dark base
+ * pass instead of turquoise.
+ *
+ * D3D's clip space puts the near plane at z = 0 (0 <= z <= w), and that is
+ * where the console clips. The vertex program's output is already in screen
+ * space (divided by w, viewport applied, w kept), so each vertex is taken
+ * back: clip = (screen - offset) / scale * w, which holds for any w != 0. The
+ * polygon is clipped against z >= 0, then against w > NV_CLIP_W as a guard
+ * for vertices at the eye, re-projected and fanned. An original vertex
+ * inside both planes is drawn exactly as it came: a round trip moves it by
+ * a rounding error, its neighbours drawn unclipped do not move, and the
+ * shared edge would open into a crack. */
 static void geo_clipped(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
                         const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                         const Nv2aVshOutput *c)
 {
     const Nv2aVshOutput *in[3];
-    Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
-    int keep[4];                /* poly[i] is an original vertex, unprojected */
-    int n = 0, i, j;
+    ClipVert p0[3], p1[5], p2[6];
+    float k[3], o[3];
+    int n, i, j, inside = 1, outside0 = 1, outside1 = 1;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
-        geo_triangle(g, st, put, sink, a, b, c);
-        return;
-    }
-    if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
-        && c->pos[3] <= NV_CLIP_W) {
-        st->behind++;                         /* wholly behind: nothing */
-        return;
-    }
     for (i = 0; i < 3; i++) { k[i] = g->k[i]; o[i] = g->o[i]; }
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
-        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
-        if (pin) {
-            /* As it came, not taken to clip space and back: the round trip
-             * moves it by a rounding error, its neighbours drawn unclipped
-             * do not move, and the shared edge opened into a crack -- the
-             * stair-stepped black lines along the ground near the camera. */
-            keep[n] = 1;
-            poly[n++] = *p;
-        }
-        if (pin != qin) {
-            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
-            va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
-            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
-            keep[n] = 0;
-            xf_lerp(&va, &vb, t, &poly[n++]);
-        }
+        float w = in[i]->pos[3];
+        p0[i].v = *in[i];
+        p0[i].keep = 1;
+        xf_to_clip(in[i], k, o, p0[i].c);
+        p0[i].c[3] = w;
+        if (k[2] == 0.0f || w != w)
+            p0[i].c[2] = w;               /* no depth scale: w alone decides */
+        if (p0[i].c[2] != p0[i].c[2])
+            p0[i].c[2] = -1.0f;           /* NaN: outside */
+        if (!(clip_dist(&p0[i], 0) >= 0.0f && clip_dist(&p0[i], 1) >= 0.0f))
+            inside = 0;
+        if (clip_dist(&p0[i], 0) >= 0.0f) outside0 = 0;
+        if (clip_dist(&p0[i], 1) >= 0.0f) outside1 = 0;
     }
+    if (inside) {
+        geo_triangle(g, st, put, sink, a, b, c);
+        return;
+    }
+    if (outside0 || outside1) {
+        st->behind++;                         /* wholly behind: nothing */
+        return;
+    }
+    n = clip_poly(p0, 3, 0, p1);
+    n = clip_poly(p1, n, 1, p2);
     /* Back to screen space: divide by the (now positive) w, viewport. */
     for (i = 0; i < n; i++)
-        if (!keep[i])
+        if (!p2[i].keep)
             for (j = 0; j < 3; j++)
-                poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+                p2[i].v.pos[j] = p2[i].c[j] / p2[i].c[3] * k[j] + o[j];
     for (i = 1; i + 1 < n; i++)
-        geo_triangle(g, st, put, sink, &poly[0], &poly[i], &poly[i + 1]);
+        geo_triangle(g, st, put, sink, &p2[0].v, &p2[i].v, &p2[i + 1].v);
 }
 
 /* The live state, for a draw about to be set up. Run on the executor. */
