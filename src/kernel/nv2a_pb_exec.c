@@ -2690,6 +2690,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput poly[4], va, vb;
     float k[3], o[3], ca[3], cb[3];
+    int keep[4];                /* poly[i] is an original vertex, unprojected */
     int n = 0, i, j;
 
     if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
@@ -2710,10 +2711,12 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
         int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
         if (pin) {
-            va = *p;
-            xf_to_clip(p, k, o, ca);
-            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
-            poly[n++] = va;
+            /* As it came, not taken to clip space and back: the round trip
+             * moves it by a rounding error, its neighbours drawn unclipped
+             * do not move, and the shared edge opened into a crack -- the
+             * stair-stepped black lines along the ground near the camera. */
+            keep[n] = 1;
+            poly[n++] = *p;
         }
         if (pin != qin) {
             float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
@@ -2721,13 +2724,15 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
             xf_to_clip(p, k, o, ca);
             xf_to_clip(q, k, o, cb);
             for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
+            keep[n] = 0;
             xf_lerp(&va, &vb, t, &poly[n++]);
         }
     }
     /* Back to screen space: divide by the (now positive) w, viewport. */
     for (i = 0; i < n; i++)
-        for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+        if (!keep[i])
+            for (j = 0; j < 3; j++)
+                poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
 }
