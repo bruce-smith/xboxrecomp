@@ -161,6 +161,15 @@ void xbox_InputInit(void)
     }
 }
 
+/* Radial, like XInput's own guidance: inside the circle the stick is centred. */
+static void stick_deadzone(SHORT x, SHORT y, int dz, SHORT *ox, SHORT *oy)
+{
+    if ((long long)x * x + (long long)y * y <= (long long)dz * dz)
+        x = y = 0;
+    *ox = x;
+    *oy = y;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -202,13 +211,24 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+    /* XInput's deadzones, which the raw state does not apply. A trigger
+     * resting at a few counts is an analog button half-pressed to a title
+     * -- the Xbox reads triggers like A/B/X/Y -- and a stick at rest is
+     * rarely at 0. Either can read as input the player never gave (a movie
+     * that skips on any press). Outside the deadzones values pass as is. */
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
+        xi_state.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+            ? xi_state.Gamepad.bLeftTrigger : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
+        xi_state.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD
+            ? xi_state.Gamepad.bRightTrigger : 0;
 
-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    stick_deadzone(xi_state.Gamepad.sThumbLX, xi_state.Gamepad.sThumbLY,
+                   XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
+                   &pState->Gamepad.sThumbLX, &pState->Gamepad.sThumbLY);
+    stick_deadzone(xi_state.Gamepad.sThumbRX, xi_state.Gamepad.sThumbRY,
+                   XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
+                   &pState->Gamepad.sThumbRX, &pState->Gamepad.sThumbRY);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
