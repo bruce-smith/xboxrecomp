@@ -2042,6 +2042,39 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
+/* The DPC running right now, for reports from other threads.
+ *
+ * DPCs and timers share the kernel timer thread, which also raises vblank, so
+ * a DPC that never returns freezes the title: Blinx 2's results screen did,
+ * and the only trace was a dispatch-lock holder whose guest frame was
+ * kernel_run_dpc's own. These name it. */
+static volatile uint32_t g_dpc_running_routine, g_dpc_running_va, g_dpc_entry_esp;
+static volatile ULONGLONG g_dpc_running_since;
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+
+void xbox_DpcDumpRunning(void)
+{
+    uint32_t routine = g_dpc_running_routine, esp = g_dpc_entry_esp, i, shown = 0;
+    if (!routine) {
+        fprintf(stderr, "  [DPC] none running\n");
+        return;
+    }
+    fprintf(stderr, "  [DPC] running: KDPC 0x%08X routine 0x%08X for %llu ms; "
+            "guest code words below its entry esp 0x%08X:", g_dpc_running_va,
+            routine, GetTickCount64() - g_dpc_running_since, esp);
+    /* Most recent frames are lowest; scan 4 KB down from the entry. Stale
+     * words show up too -- this is a hint, not an unwind. */
+    for (i = 1; i <= 1024 && shown < 24 && esp > i * 4; i++) {
+        uint32_t w = BRIDGE_MEM32(esp - i * 4);
+        if (w >= g_xbox_code_lo && w < g_xbox_code_hi) {
+            fprintf(stderr, " %08X", w);
+            shown++;
+        }
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
@@ -2088,7 +2121,12 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
                 xbox_IrqlDumpHolders();
             }
         }
+        g_dpc_running_va = dpc_va;
+        g_dpc_entry_esp = g_esp;
+        g_dpc_running_since = GetTickCount64();
+        g_dpc_running_routine = routine;
         fn();
+        g_dpc_running_routine = 0;
         xbox_IrqlLeaveInterrupt(_irql);
     }
     return 1;

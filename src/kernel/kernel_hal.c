@@ -147,6 +147,7 @@ static void dispatch_lock(DWORD timeout_ms, const char *who)
                     " running unlocked\n", who, (unsigned long)GetCurrentThreadId(),
                     (unsigned long)timeout_ms);
             xbox_IrqlDumpHolders();
+            xbox_DpcDumpRunning();
         }
     }
 }

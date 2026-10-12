@@ -1844,6 +1844,9 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * CPU loop polling a global is exactly the case neither of those covers.
      */
     xbox_PeekSample("peek");
+    /* A DPC that never returns stops the timer thread, and with it vblank. */
+    xbox_IrqlDumpHolders();
+    xbox_DpcDumpRunning();
     /* The pushbuffer pointers, unconditionally.
      *
      * "Extend the table as more handshakes turn up -- run the title and the
