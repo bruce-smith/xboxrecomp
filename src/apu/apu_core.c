@@ -77,12 +77,21 @@ extern int xbox_ContiguousOwnsPhys(uint32_t phys);
 /* A title's sound buffers can also be ordinary heap memory, which
  * MmGetPhysicalAddress tags when its number collides with the arena's (see
  * XBOX_PHYS_RAM_TAG): Blinx 2's every movie, title-music and most effect
- * voice read silence out of the window before. */
+ * voice read silence out of the window before.
+ *
+ * With that tagging on, the arena numbers from 0x1000, inside the image's
+ * range, so an untagged number the arena owns is window memory even there
+ * (as in OHCI's bus_resolve). Checking the image first read DirectSound's
+ * contiguous voice, SGE and notifier structures out of the title's own
+ * code and data, and wrote voice notifications into it: static on the
+ * music, the opening movie silent. */
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if ((uint32_t)addr & XBOX_PHYS_RAM_TAG)
         return g_apu_ram_ptr + a;
+    if (xbox_PhysNeedsRamTag(0x1000u) && xbox_ContiguousOwnsPhys(a))
+        return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (xbox_ContiguousOwnsPhys(a))
