@@ -269,3 +269,34 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
         fputc('\n', stderr);
     fflush(stderr);
 }
+
+/* An unresolved-call stub ran.
+ *
+ * tools.recomp turns a call to an address it never disassembled into a stub
+ * that only pops the return address, so whatever that code did -- draw a
+ * model, start a sound -- silently does not happen, and the symptom shows up
+ * far away as something missing rather than as an error. Each stub calls
+ * this, and the first call to each address is logged with the guest address
+ * it was called from. Those are the addresses worth seeding
+ * (blinx2-recomp/seeds/seed_functions.json): "[STUB] unresolved 0x...". */
+#define STUB_SLOTS 1024u
+static volatile uint32_t s_stub_seen[STUB_SLOTS];
+
+void recomp_stub_hit(uint32_t addr)
+{
+    uint32_t i = (addr * 2654435761u) % STUB_SLOTS, n;
+    for (n = 0; n < STUB_SLOTS; n++, i = (i + 1) % STUB_SLOTS) {
+        uint32_t cur = s_stub_seen[i];
+        if (cur == addr)
+            return;                              /* reported already */
+        if (cur == 0) {
+            uint32_t ret = 0;
+            s_stub_seen[i] = addr;   /* racing first hits may both print */
+            if (g_esp)
+                ret = *(const uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + g_esp);
+            fprintf(stderr, "[STUB] unresolved 0x%08X called (return to 0x%08X)\n",
+                    addr, ret);
+            return;
+        }
+    }
+}

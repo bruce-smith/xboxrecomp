@@ -3222,11 +3222,17 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # Silently skipping code is how a missing model or sound looks;
+            # the runtime logs each stub's first call ([STUB] lines) so the
+            # ones that matter can be seeded.
+            stub_lines.append("extern void recomp_stub_hit(uint32_t addr);")
+            stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"recomp_stub_hit(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
