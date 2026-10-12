@@ -3465,12 +3465,25 @@ static int rq_barrier(int k)
     return 1;
 }
 
+/* A batch full mid-draw (or before a clear job) is handed over, and what is
+ * still to come goes into the next one. A barrier set for that draw has to
+ * move with it (RECOMP_ASYNC_SYNC): left on the full batch only, the rest of
+ * the draw sat in a batch whose bands may start before the render-to-texture
+ * pass it samples is drawn everywhere. Kept on the full batch as well -- an
+ * extra barrier only costs some overlap. */
+static void rq_kick_carry(void)
+{
+    int bar = s_rq[s_rq_fill]->barrier;
+    rq_kick();
+    s_rq[s_rq_fill]->barrier = bar;
+}
+
 /* A clear job into the batch being filled, in order with the triangles. */
 static void rq_push_job(const XfTri *T)
 {
     RasterBatch *b = s_rq[s_rq_fill];
     if (b->n == NV_RQ_TRIS) {
-        rq_kick();
+        rq_kick_carry();
         b = s_rq[s_rq_fill];
     }
     b->tri[b->n++] = *T;
@@ -3732,7 +3745,7 @@ static void xfq_push(XfTri *T)
         (void)surface_swizzled();
     b = s_rq[s_rq_fill];
     if (b->n == NV_RQ_TRIS || (!s_rq_ps && b->nst == NV_RQ_STATES)) {
-        rq_kick();
+        rq_kick_carry();
         b = s_rq[s_rq_fill];
     }
     if (!s_rq_ps)
@@ -3776,7 +3789,7 @@ static int geo_queue(const Nv2aVshProg *prog, uint32_t n)
     b = s_rq[s_rq_fill];
     if (b->n + cap > NV_RQ_TRIS || b->nst == NV_RQ_STATES
         || b->ngeo == NV_RQ_GEO || b->nin + n > NV_RQ_GVERTS) {
-        rq_kick();
+        rq_kick_carry();
         b = s_rq[s_rq_fill];
     }
     b = rq_draw_state(b, g.bpp);
