@@ -2412,8 +2412,11 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
 }
 
 /* Render to texture: a draw that samples memory the queue is still writing
- * has to wait for it. Every stage with a texture counts, used or not --
- * a stale binding costs a sync, not a wrong picture. */
+ * has to wait for it. Only stages the draw can sample count: those the
+ * shader stage program enables, or stage 0 before the combiners are
+ * programmed. Counting every bound stage made stale bindings -- a reflection
+ * target left on stage 1 -- drain the queue ~40 times a frame in Blinx 2's
+ * hub. */
 static void rq_check_textures(void)
 {
     int st;
@@ -2421,6 +2424,9 @@ static void rq_check_textures(void)
         const Texture *t = &s_gpu.texs[st];
         uint32_t lo, hi;
         if (!t->valid)
+            continue;
+        if (s_gpu.rc_seen ? !((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
+                          : st != 0)
             continue;
         lo = t->offset;
         hi = lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
