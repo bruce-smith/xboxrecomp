@@ -3085,7 +3085,43 @@ static int rq_in_flight(void)
 {
     return s_pool.head != s_pool.tail;
 }
+
+/* For the stall watchdog: the pool's bookkeeping, read racily -- a stuck
+ * pool does not move, so a torn read is not the question. */
+void nv2a_pb_exec_dump_state(void)
+{
+    int i, owed = 0, busy = 0, shown = 0;
+    fprintf(stderr, "  [RQ] head %ld tail %ld done_prefix %ld fill %d"
+            " reports pending %d (oldest seq %ld) epoch %u\n",
+            (long)s_pool.head, (long)s_pool.tail, (long)s_pool.done_prefix,
+            s_rq_fill, s_rep_n, s_rep_n ? (long)s_rep[s_rep_head].seq : -1L,
+            s_gpu.report_epoch);
+    for (i = 0; i < NV_RQ_DEPTH; i++) {
+        const RasterBatch *b = s_rq[i];
+        fprintf(stderr, "  [RQ] slot %d: seq %ld done %ld left %ld geo_ready %ld"
+                " barrier %ld bands %d..%d ngeo %d geo_left %ld geo_next %ld"
+                " tris %u\n", i, (long)s_pool.slot_seq[i], (long)s_pool.done[i],
+                (long)s_pool.left[i], (long)s_pool.geo_ready[i],
+                (long)s_pool.barrier[i], s_pool.band0[i], s_pool.band1[i],
+                b ? b->ngeo : -1, b ? (long)b->geo_left : -1L,
+                b ? (long)b->geo_next : -1L, b ? b->n : 0u);
+    }
+    for (i = 0; i < s_pool.nbands; i++) {
+        if (s_pool.band_busy[i])
+            busy++;
+        if (s_pool.band_next[i] < s_pool.head) {
+            owed++;
+            if (shown++ < 8)
+                fprintf(stderr, "  [RQ] band %d owes from seq %ld%s\n", i,
+                        (long)s_pool.band_next[i],
+                        s_pool.band_busy[i] ? " (busy)" : "");
+        }
+    }
+    fprintf(stderr, "  [RQ] %d of %d bands owe work, %d busy\n",
+            owed, s_pool.nbands, busy);
+}
 #else
+void nv2a_pb_exec_dump_state(void) { }
 void *nv2a_pb_exec_raster_thread(int k) { (void)k; return NULL; }
 static int raster_pool_size(void) { return 1; }
 static void rq_wait(void) { }

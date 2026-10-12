@@ -1746,6 +1746,51 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
+#if defined(_WIN32) && defined(_M_X64)
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+/* Another host thread's native stack, named through the PDB when the game
+ * loaded its symbols (main.c's SymInitialize). For a stall where the guest
+ * waits on the pushbuffer: the guest stack shows only that it waits, the
+ * executor's and the raster workers' show what they wait on. */
+static void wd_host_stack(HANDLE th, const char *name, int depth)
+{
+    CONTEXT ctx;
+    int d;
+    if (!th || SuspendThread(th) == (DWORD)-1)
+        return;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(th, &ctx)) {
+        fprintf(stderr, "  %s:", name);
+        for (d = 0; d < depth && ctx.Rip; d++) {
+            DWORD64 base = 0, disp = 0, at = ctx.Rip;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+            char buf[sizeof(SYMBOL_INFO) + 128];
+            SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+            if (!rf) {                      /* leaf: return address at [rsp] */
+                ctx.Rip = *(DWORD64 *)ctx.Rsp;
+                ctx.Rsp += 8;
+            } else {
+                void *hd; DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf,
+                                 &ctx, &hd, &ef, NULL);
+            }
+            memset(buf, 0, sizeof buf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 127;
+            if (SymFromAddr(GetCurrentProcess(), at, &disp, sym))
+                fprintf(stderr, " %s+0x%llX", sym->Name, (unsigned long long)disp);
+            else
+                fprintf(stderr, " %016llX", (unsigned long long)at);
+        }
+        fprintf(stderr, "\n");
+    }
+    ResumeThread(th);
+}
+#endif
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
@@ -1823,6 +1868,22 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 WD_NV2A(NV2A_PFIFO_REF), WD_NV2A(NV2A_PFIFO_DMA_SUBROUTINE));
 #undef WD_NV2A
     }
+#if defined(_WIN32) && defined(_M_X64)
+    /* Where the executor and the raster pool are, for a stall with GET
+     * behind PUT: the executor stopped mid-segment, so what it waits on. */
+    {
+        extern void *nv2a_pb_exec_raster_thread(int k);
+        extern void nv2a_pb_exec_dump_state(void);
+        char nm[32];
+        int k;
+        wd_host_stack((HANDLE)xbox_Nv2aWorkerThread(), "executor", 12);
+        for (k = 0; k < 32 && nv2a_pb_exec_raster_thread(k); k++) {
+            snprintf(nm, sizeof nm, "raster %d", k);
+            wd_host_stack((HANDLE)nv2a_pb_exec_raster_thread(k), nm, 6);
+        }
+        nv2a_pb_exec_dump_state();
+    }
+#endif
 
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
