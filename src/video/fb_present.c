@@ -255,6 +255,23 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 InterlockedExchange(&s_linear, !s_linear);
             return 0;
         }
+        /* A key already held when the window got the focus is not a press.
+         *
+         * Windows sends a held key's auto-repeats (lParam bit 30: the key
+         * was already down) to whichever window has the focus, so Enter
+         * still held from launching the exe, or a key held through an
+         * Alt+Tab, arrived here as Start held -- and a title skips its
+         * movies on Start. Only a key whose first press this window saw
+         * counts; the next real press after release does. */
+        if ((unsigned)w < 256 && (l & (1 << 30)) && !s_key_down[w]) {
+            static LONG noted;
+            if (InterlockedIncrement(&noted) <= 8) {
+                fprintf(stderr, "  [FBWIN] ignoring vk=0x%02X: held down before "
+                        "the window had focus\n", (unsigned)w);
+                fflush(stderr);
+            }
+            return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
