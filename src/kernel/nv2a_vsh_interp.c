@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -191,6 +192,7 @@ typedef struct {
     uint8_t mux, reg, neg, rel;
     uint8_t sw[4];
     uint16_t idx;                           /* input or constant index */
+    uint8_t ident;                          /* swizzle is .xyzw */
 } VshSrc;
 
 typedef struct {
@@ -237,6 +239,7 @@ static void decode_src(const uint32_t *ins, int which, VshSrc *d)
     d->sw[2] = (uint8_t)((swz >> 2) & 3); d->sw[3] = (uint8_t)(swz & 3);
     d->rel = (uint8_t)field(ins, 3, 1, 1);
     d->idx = (uint16_t)(d->mux == 2 ? field(ins, 1, 9, 4) : field(ins, 1, 13, 8));
+    d->ident = d->sw[0] == 0 && d->sw[1] == 1 && d->sw[2] == 2 && d->sw[3] == 3;
 }
 
 /* RECOMP_VSH_DUMP: disassemble each distinct program once, when decoded. */
@@ -543,21 +546,33 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
 typedef struct { __m128 c[4]; } vec4x4;   /* component k, lanes 0..3 */
 
-static vec4x4 rd4(const VshSrc *d, const vec4x4 *vin,
-                  const vec4x4 *temp, const vec4x4 *opos, const int a0[4],
-                  const float (*s_const)[4])
+/* Source operand d, as a pointer: straight at the register when the swizzle
+ * is .xyzw and there is no negate, else swizzled into `scratch`. Operands
+ * used to be built and returned by value -- three 64-byte copies a source --
+ * which was most of the interpreter's time, not the arithmetic. */
+static const vec4x4 *src4(const VshSrc *d, const vec4x4 *vin,
+                          const vec4x4 *temp, const vec4x4 *opos,
+                          const int a0[4], const float (*s_const)[4],
+                          vec4x4 *scratch)
 {
-    vec4x4 s, r;
+    const vec4x4 *s;
+    vec4x4 g;
     int k;
 
     if (d->mux == 1) {
-        s = (d->reg == 12) ? *opos : temp[d->reg < 12 ? d->reg : 0];
+        s = (d->reg == 12) ? opos : &temp[d->reg < 12 ? d->reg : 0];
     } else if (d->mux == 2) {
-        s = vin[d->idx];
+        s = &vin[d->idx];
     } else if (!d->rel) {
-        int ci = d->idx < NV2A_VSH_CONSTANTS ? d->idx : 0;
+        const float *c = s_const[d->idx < NV2A_VSH_CONSTANTS ? d->idx : 0];
         for (k = 0; k < 4; k++)
-            s.c[k] = _mm_set1_ps(s_const[ci][k]);
+            scratch->c[k] = _mm_set1_ps(c[d->sw[k]]);
+        if (d->neg) {
+            const __m128 sign = _mm_set1_ps(-0.0f);
+            for (k = 0; k < 4; k++)
+                scratch->c[k] = _mm_xor_ps(scratch->c[k], sign);
+        }
+        return scratch;
     } else {
         int ci[4], l;
         for (l = 0; l < 4; l++) {
@@ -566,17 +581,20 @@ static vec4x4 rd4(const VshSrc *d, const vec4x4 *vin,
                 ci[l] = 0;
         }
         for (k = 0; k < 4; k++)
-            s.c[k] = _mm_set_ps(s_const[ci[3]][k], s_const[ci[2]][k],
+            g.c[k] = _mm_set_ps(s_const[ci[3]][k], s_const[ci[2]][k],
                                 s_const[ci[1]][k], s_const[ci[0]][k]);
+        s = &g;
     }
+    if (d->ident && !d->neg && s != &g)
+        return s;
     for (k = 0; k < 4; k++)
-        r.c[k] = s.c[d->sw[k]];
+        scratch->c[k] = s->c[d->sw[k]];
     if (d->neg) {
         const __m128 sign = _mm_set1_ps(-0.0f);
         for (k = 0; k < 4; k++)
-            r.c[k] = _mm_xor_ps(r.c[k], sign);
+            scratch->c[k] = _mm_xor_ps(scratch->c[k], sign);
     }
-    return r;
+    return scratch;
 }
 
 static void wr4(vec4x4 *dst, const vec4x4 *src, uint32_t mask)
@@ -592,19 +610,18 @@ static __m128 sel4(__m128 m, __m128 a, __m128 b)
     return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
 }
 
-static vec4x4 mac4(uint32_t op, const vec4x4 *a, const vec4x4 *b,
-                   const vec4x4 *c, int a0[4])
+static void mac4(uint32_t op, const vec4x4 *a, const vec4x4 *b,
+                 const vec4x4 *c, int a0[4], vec4x4 *rp)
 {
-    vec4x4 r = *a;
     __m128 t, one = _mm_set1_ps(1.0f), zero = _mm_setzero_ps();
     int k;
 
     switch (op) {
-    case 1: break;
-    case 2: for (k = 0; k < 4; k++) r.c[k] = _mm_mul_ps(a->c[k], b->c[k]); break;
-    case 3: for (k = 0; k < 4; k++) r.c[k] = _mm_add_ps(a->c[k], c->c[k]); break;
+    case 1: *rp = *a; break;
+    case 2: for (k = 0; k < 4; k++) rp->c[k] = _mm_mul_ps(a->c[k], b->c[k]); break;
+    case 3: for (k = 0; k < 4; k++) rp->c[k] = _mm_add_ps(a->c[k], c->c[k]); break;
     case 4: for (k = 0; k < 4; k++)
-                r.c[k] = _mm_add_ps(_mm_mul_ps(a->c[k], b->c[k]), c->c[k]);
+                rp->c[k] = _mm_add_ps(_mm_mul_ps(a->c[k], b->c[k]), c->c[k]);
             break;
     case 5: case 6: case 7:
         t = _mm_add_ps(_mm_add_ps(_mm_mul_ps(a->c[0], b->c[0]),
@@ -612,49 +629,48 @@ static vec4x4 mac4(uint32_t op, const vec4x4 *a, const vec4x4 *b,
                        _mm_mul_ps(a->c[2], b->c[2]));
         if (op == 6) t = _mm_add_ps(t, b->c[3]);
         if (op == 7) t = _mm_add_ps(t, _mm_mul_ps(a->c[3], b->c[3]));
-        r.c[0] = r.c[1] = r.c[2] = r.c[3] = t;
+        rp->c[0] = rp->c[1] = rp->c[2] = rp->c[3] = t;
         break;
     case 8:
-        r.c[0] = one;
-        r.c[1] = _mm_mul_ps(a->c[1], b->c[1]);
-        r.c[2] = a->c[2];
-        r.c[3] = b->c[3];
+        rp->c[0] = one;
+        rp->c[1] = _mm_mul_ps(a->c[1], b->c[1]);
+        rp->c[2] = a->c[2];
+        rp->c[3] = b->c[3];
         break;
     /* minps/maxps are exactly a < b ? a : b and a > b ? a : b, NaN and
      * signed zeros included -- the scalar code's definitions. */
-    case 9:  for (k = 0; k < 4; k++) r.c[k] = _mm_min_ps(a->c[k], b->c[k]); break;
-    case 10: for (k = 0; k < 4; k++) r.c[k] = _mm_max_ps(a->c[k], b->c[k]); break;
+    case 9:  for (k = 0; k < 4; k++) rp->c[k] = _mm_min_ps(a->c[k], b->c[k]); break;
+    case 10: for (k = 0; k < 4; k++) rp->c[k] = _mm_max_ps(a->c[k], b->c[k]); break;
     case 11: for (k = 0; k < 4; k++)
-                 r.c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), one, zero);
+                 rp->c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), one, zero);
              break;
     case 12: for (k = 0; k < 4; k++)
-                 r.c[k] = sel4(_mm_cmpge_ps(a->c[k], b->c[k]), one, zero);
+                 rp->c[k] = sel4(_mm_cmpge_ps(a->c[k], b->c[k]), one, zero);
              break;
     case 13: {
         float x[4];
         int l;
+        *rp = *a;
         _mm_storeu_ps(x, a->c[0]);
         for (l = 0; l < 4; l++)
             a0[l] = (int)floorf(x[l] + 0.001f);
         break;
     }
-    default: break;
+    default: *rp = *a; break;
     }
-    return r;
 }
 
-static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
+static void ilu4(uint32_t op, const vec4x4 *c, vec4x4 *rp)
 {
-    vec4x4 r = *c;
     int k, l;
 
     switch (op) {
-    case 1: break;
+    case 1: *rp = *c; break;
     case 2: {                                       /* rcp: 1/x, +inf for +-0 */
         __m128 x = c->c[0];
         __m128 v = _mm_div_ps(_mm_set1_ps(1.0f), x);
         v = sel4(_mm_cmpeq_ps(x, _mm_setzero_ps()), _mm_set1_ps(INFINITY), v);
-        r.c[0] = r.c[1] = r.c[2] = r.c[3] = v;
+        rp->c[0] = rp->c[1] = rp->c[2] = rp->c[3] = v;
         break;
     }
     case 3: {                                       /* rcc: 1/x, clamped */
@@ -667,13 +683,13 @@ static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
         __m128 neg = _mm_cmplt_ps(f, zero), mag = _mm_andnot_ps(sign, f);
         f = sel4(_mm_cmplt_ps(mag, lo), sel4(neg, _mm_or_ps(lo, sign), lo), f);
         f = sel4(_mm_cmpgt_ps(mag, hi), sel4(neg, _mm_or_ps(hi, sign), hi), f);
-        r.c[0] = r.c[1] = r.c[2] = r.c[3] = f;
+        rp->c[0] = rp->c[1] = rp->c[2] = rp->c[3] = f;
         break;
     }
     case 4: {                                       /* rsq: 1/sqrt(|x|) */
         __m128 x = _mm_andnot_ps(_mm_set1_ps(-0.0f), c->c[0]);
         __m128 v = _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(x));
-        r.c[0] = r.c[1] = r.c[2] = r.c[3] = v;
+        rp->c[0] = rp->c[1] = rp->c[2] = rp->c[3] = v;
         break;
     }
     default: {                                      /* per lane, scalar */
@@ -689,11 +705,10 @@ static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
                 rs[k][l] = rv.v[k];
         }
         for (k = 0; k < 4; k++)
-            r.c[k] = _mm_loadu_ps(rs[k]);
+            rp->c[k] = _mm_loadu_ps(rs[k]);
         break;
     }
     }
-    return r;
 }
 
 /* Four vertices through program `p` with constants `cst`; touches no state
@@ -725,18 +740,19 @@ static int run4_with(const struct Nv2aVshProg *p, const float (*cst)[4],
 
     for (s = 0; s < p->n; s++) {
         const VshIns *ins = &p->ins[s];
-        vec4x4 a, b, c, mres, ires;
+        vec4x4 sa, sb, sc, mres, ires;
+        const vec4x4 *a = NULL, *b = NULL, *c = NULL;
 
-        if (ins->reads & 1) a = rd4(&ins->src[0], vin, temp, &opos, a0, cst);
-        if (ins->reads & 2) b = rd4(&ins->src[1], vin, temp, &opos, a0, cst);
-        if (ins->reads & 4) c = rd4(&ins->src[2], vin, temp, &opos, a0, cst);
+        if (ins->reads & 1) a = src4(&ins->src[0], vin, temp, &opos, a0, cst, &sa);
+        if (ins->reads & 2) b = src4(&ins->src[1], vin, temp, &opos, a0, cst, &sb);
+        if (ins->reads & 4) c = src4(&ins->src[2], vin, temp, &opos, a0, cst, &sc);
         /* An idle unit's result is 0: an output may still name it. */
         if (ins->mac)
-            mres = mac4(ins->mac, &a, &b, &c, a0);
+            mac4(ins->mac, a, b, c, a0, &mres);
         else
             memset(&mres, 0, sizeof mres);
         if (ins->ilu)
-            ires = ilu4(ins->ilu, &c);
+            ilu4(ins->ilu, c, &ires);
         else
             memset(&ires, 0, sizeof ires);
         if (ins->mac && ins->mac != 13 && ins->mac_mask) {
@@ -757,22 +773,22 @@ static int run4_with(const struct Nv2aVshProg *p, const float (*cst)[4],
                 wr4(&outregs[ins->oaddr], src, ins->omask);
         }
         if (ins->final) {
+            /* Back to one vertex per output: a 4x4 transpose per register. */
             static const int reg_of[8] = {0, 3, 4, 5, 9, 10, 11, 12};
-            for (l = 0; l < 4; l++) {
-                float *dst[8];
-                int j;
-                dst[0] = out[l]->pos;  dst[1] = out[l]->d0;
-                dst[2] = out[l]->d1;   dst[3] = out[l]->fog;
-                dst[4] = out[l]->tex[0]; dst[5] = out[l]->tex[1];
-                dst[6] = out[l]->tex[2]; dst[7] = out[l]->tex[3];
-                for (j = 0; j < 8; j++) {
-                    const vec4x4 *rg = reg_of[j] ? &outregs[reg_of[j]] : &opos;
-                    for (k = 0; k < 4; k++) {
-                        float lane[4];
-                        _mm_storeu_ps(lane, rg->c[k]);
-                        dst[j][k] = lane[l];
-                    }
-                }
+            int j;
+            for (j = 0; j < 8; j++) {
+                const vec4x4 *rg = reg_of[j] ? &outregs[reg_of[j]] : &opos;
+                __m128 r0 = rg->c[0], r1 = rg->c[1], r2 = rg->c[2], r3 = rg->c[3];
+                size_t off = j == 0 ? offsetof(Nv2aVshOutput, pos)
+                           : j == 1 ? offsetof(Nv2aVshOutput, d0)
+                           : j == 2 ? offsetof(Nv2aVshOutput, d1)
+                           : j == 3 ? offsetof(Nv2aVshOutput, fog)
+                           : offsetof(Nv2aVshOutput, tex) + (size_t)(j - 4) * 16;
+                _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+                _mm_storeu_ps((float *)((char *)out[0] + off), r0);
+                _mm_storeu_ps((float *)((char *)out[1] + off), r1);
+                _mm_storeu_ps((float *)((char *)out[2] + off), r2);
+                _mm_storeu_ps((float *)((char *)out[3] + off), r3);
             }
             return 1;
         }
