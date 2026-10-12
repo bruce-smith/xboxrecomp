@@ -92,6 +92,79 @@ int xbox_IrqlRaisedCount(void)
     return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
 }
 
+/* DISPATCH_LEVEL as the lock it is on the console.
+ *
+ * The Xbox has one processor. A thread that raises to DISPATCH_LEVEL cannot be
+ * preempted, and no DPC runs until it lowers again, so XDK code uses the raise
+ * as its lock: XPP's transfer submit (sub_0036E89D in Blinx 2) raises, appends
+ * to the host controller's pending list [hcd+0x41C] and drains it, then
+ * lowers, and the USB DPC that completes transfers drains the same list with
+ * no lock of its own. Here the level was only thread-local, and DPCs run on
+ * the kernel timer thread whatever any other thread's IRQL is. The DPC and the
+ * game thread's XInputGetState edited the list at once, the list grew a cycle,
+ * and the game froze walking it (sub_0036E7A5) in about 1 run in 4 with USB
+ * on. RECOMP_DPC_RACE_TRACE caught XPP's DPC (0x0036DBCB) starting while the
+ * main thread was raised.
+ *
+ * So crossing up into DISPATCH_LEVEL takes one process-wide lock and crossing
+ * back down releases it: guest raises and host-run DPCs both hold it, which
+ * gives the guest the uniprocessor exclusion it was written for. ISRs do not
+ * take it -- on the console they preempt DISPATCH_LEVEL -- and taking it there
+ * cost the NV2A vblank a fifth of its rate. A mutex rather than a critical
+ * section because the wait is bounded: a leaked raise (see KfLowerIrql) would
+ * otherwise stop every DPC for good. Running past the bound is logged.
+ * RECOMP_DISPATCH_LOCK=0 turns it off. */
+#if defined(_WIN32)
+static HANDLE s_dispatch_mutex;
+static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
+static XBOX_THREAD_LOCAL int t_dispatch_held;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char *e = getenv("RECOMP_DISPATCH_LOCK");
+    (void)o; (void)p; (void)c;
+    if (!e || *e != '0')
+        s_dispatch_mutex = CreateMutexA(NULL, FALSE, NULL);
+    return TRUE;
+}
+
+static void dispatch_lock(DWORD timeout_ms, const char *who)
+{
+    DWORD r;
+
+    InitOnceExecuteOnce(&s_dispatch_once, dispatch_lock_init, NULL, NULL);
+    if (!s_dispatch_mutex)
+        return;
+    r = WaitForSingleObject(s_dispatch_mutex, timeout_ms);
+    if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
+        t_dispatch_held = 1;
+        return;
+    }
+    {
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 20) {
+            fprintf(stderr, "  [IRQL] %s on tid %lu waited %lu ms for DISPATCH_LEVEL;"
+                    " running unlocked\n", who, (unsigned long)GetCurrentThreadId(),
+                    (unsigned long)timeout_ms);
+            xbox_IrqlDumpHolders();
+        }
+    }
+}
+
+static void dispatch_unlock(void)
+{
+    if (t_dispatch_held) {
+        t_dispatch_held = 0;
+        ReleaseMutex(s_dispatch_mutex);
+    }
+}
+#else
+static void dispatch_lock(DWORD timeout_ms, const char *who) { (void)timeout_ms; (void)who; }
+static void dispatch_unlock(void) { }
+#endif
+
+#define DISPATCH_WAIT_THREAD_MS 2000u   /* a guest raise or a DPC */
+
 static int  s_trace = -1;
 static volatile LONG s_traced = 0;
 
@@ -176,8 +249,16 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
+    /* Taken before the count goes up and dropped after it comes down. Only
+     * for DISPATCH_LEVEL itself: an ISR (device IRQL) preempts a raised
+     * thread on the console, so host-delivered ISRs stay outside the lock and
+     * keep the device models' own holdoff gates. */
+    if (now && new_level == DISPATCH_LEVEL)
+        dispatch_lock(DISPATCH_WAIT_THREAD_MS, "raise/DPC");
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
+    if (!now)
+        dispatch_unlock();
     InterlockedIncrement(&s_transitions);
     if (now)
         irql_holder_add(ra);

@@ -2071,7 +2071,26 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        int _irql = xbox_IrqlEnterInterrupt(2);
+        /* RECOMP_DPC_RACE_TRACE: a DPC is running while some other thread is
+         * also at DISPATCH_LEVEL -- impossible on the console, and the cause
+         * of the XPP pending-list hang (see the dispatch lock, kernel_hal.c).
+         * With that lock this only fires when a wait timed out. */
+        static int race = -1;
+        if (race < 0)
+            race = getenv("RECOMP_DPC_RACE_TRACE") != NULL;
+        if (race && _irql < 2 && xbox_IrqlRaisedCount() > 1) {
+            static volatile LONG n;
+            if (InterlockedIncrement(&n) <= 40) {
+                fprintf(stderr, "  [DPCRACE] DPC 0x%08X routine 0x%08X runs "
+                        "while another thread is raised:\n", dpc_va, routine);
+                xbox_IrqlDumpHolders();
+            }
+        }
+        fn();
+        xbox_IrqlLeaveInterrupt(_irql);
+    }
     return 1;
 }
 
