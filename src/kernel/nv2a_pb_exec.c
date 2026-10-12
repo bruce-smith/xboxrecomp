@@ -3026,14 +3026,19 @@ static void rq_kick(void)
     s_rq_ps = NULL;
 }
 
-static struct { int line; uint32_t n; } s_sync_sites[24];
+/* Drains by call site: how many found work pending, and how long the
+ * executor waited in them (ms) -- the drains sit on the kick-ack path. */
+static struct { int line; uint32_t n; double ms; } s_sync_sites[24];
 
 static void rq_sync_at(int line)
 {
     uint64_t n;
     uint32_t mx;
+    int i = 24;
+#if defined(_WIN32)
+    LARGE_INTEGER t0, t1, f;
+#endif
     if (rq_in_flight() || (s_rq[s_rq_fill] && s_rq[s_rq_fill]->n)) {
-        int i;
         for (i = 0; i < 24 && s_sync_sites[i].line && s_sync_sites[i].line != line; i++)
             ;
         if (i < 24) {
@@ -3041,8 +3046,20 @@ static void rq_sync_at(int line)
             s_sync_sites[i].n++;
         }
     }
+#if defined(_WIN32)
+    if (i < 24)
+        QueryPerformanceCounter(&t0);
+#endif
     rq_kick();
     rq_wait();
+#if defined(_WIN32)
+    if (i < 24) {
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        s_sync_sites[i].ms += 1e3 * (double)(t1.QuadPart - t0.QuadPart)
+                            / (double)f.QuadPart;
+    }
+#endif
     stats_take(&n, &mx);              /* the executor's own direct drawing */
     stats_fold(n, mx);
 }
@@ -5463,7 +5480,8 @@ void nv2a_pb_exec_report(void)
         int i;
         fprintf(stderr, "[GPU] raster drains with work pending, by line:");
         for (i = 0; i < 24 && s_sync_sites[i].line; i++)
-            fprintf(stderr, " %d:%u", s_sync_sites[i].line, s_sync_sites[i].n);
+            fprintf(stderr, " %d:%u/%.0fms", s_sync_sites[i].line, s_sync_sites[i].n,
+                    s_sync_sites[i].ms);
         fputc(10, stderr);
     }
     fprintf(stderr, "[GPU] raster batches: %u to the pool, %u inline;"
