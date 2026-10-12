@@ -2185,6 +2185,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RQ_TRIS   4096
 #define NV_RQ_STATES 256
 #define NV_RQ_SURFS  8
+#define NV_RQ_TEXS   16
 
 typedef struct {
     int n, nst, nsurf;                  /* nsurf < 0: too many to track */
@@ -2194,6 +2195,10 @@ typedef struct {
     Nv2aVshOutput v[NV_RQ_TRIS][3];
     PixState st[NV_RQ_STATES];
     uint32_t surf_lo[NV_RQ_SURFS], surf_hi[NV_RQ_SURFS];
+    /* What the batch's draws sample, so a later draw that renders into one of
+     * them starts a new batch (see rq_tex_overlaps). ntex < 0: too many. */
+    int ntex;
+    uint32_t tex_lo[NV_RQ_TEXS], tex_hi[NV_RQ_TEXS];
 } RasterBatch;
 
 #define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
@@ -2492,7 +2497,7 @@ static void rq_kick(void)
         }
     }
     b = s_rq[s_rq_fill];
-    b->n = b->nst = b->nsurf = 0;
+    b->n = b->nst = b->nsurf = b->ntex = 0;
     b->px = 0;
     b->ymin = 1 << 30;
     b->ymax = 0;
@@ -2596,23 +2601,119 @@ static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
  * programmed. Counting every bound stage made stale bindings -- a reflection
  * target left on stage 1 -- drain the queue ~40 times a frame in Blinx 2's
  * hub. */
+/* The memory texture stage `st` can sample in the current draw, or 0. */
+static int draw_samples(int st, uint32_t *lo, uint32_t *hi)
+{
+    const Texture *t = &s_gpu.texs[st];
+    if (!t->valid)
+        return 0;
+    if (s_gpu.rc_seen ? !((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
+                      : st != 0)
+        return 0;
+    *lo = t->offset;
+    *hi = *lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
+    return 1;
+}
+
 static void rq_check_textures(void)
 {
     int st;
     for (st = 0; st < 4; st++) {
-        const Texture *t = &s_gpu.texs[st];
         uint32_t lo, hi;
-        if (!t->valid)
+        if (!draw_samples(st, &lo, &hi))
             continue;
-        if (s_gpu.rc_seen ? !((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
-                          : st != 0)
-            continue;
-        lo = t->offset;
-        hi = lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
         if (rq_queue_overlaps(lo, hi)) {
             rq_sync();
             return;
         }
+    }
+}
+
+/* The other half of render to texture: a draw that renders into memory a
+ * queued draw still samples. Bands run in parallel, each through every
+ * triangle of every batch in order, and different bands may be on different
+ * batches, so one band could be writing the new image while another, still on
+ * the earlier draw, samples rows of it -- part old texture, part new. Such a
+ * draw drains the queue first. Only sampled ranges that are render targets
+ * (a surface drawn into lately) are tracked: an ordinary texture is never
+ * written by a draw, and tracking every one would overflow the list and
+ * drain all the time. Checked before the draw's own textures are noted, so a
+ * draw sampling its own target (undefined on the console too) does not
+ * drain. */
+#define NV_RT_SEEN 16
+static struct { uint32_t lo, hi; } s_rt_seen[NV_RT_SEEN];
+static int s_rt_next;
+
+static void rt_seen_note(uint32_t lo, uint32_t hi)
+{
+    int i;
+    for (i = 0; i < NV_RT_SEEN; i++)
+        if (s_rt_seen[i].lo == lo && s_rt_seen[i].hi == hi)
+            return;
+    s_rt_seen[s_rt_next].lo = lo;
+    s_rt_seen[s_rt_next].hi = hi;
+    s_rt_next = (s_rt_next + 1) % NV_RT_SEEN;
+}
+
+static int rt_seen_overlaps(uint32_t lo, uint32_t hi)
+{
+    int i;
+    for (i = 0; i < NV_RT_SEEN; i++)
+        if (lo < s_rt_seen[i].hi && s_rt_seen[i].lo < hi)
+            return 1;
+    return 0;
+}
+
+static int rq_tex_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
+{
+    int i;
+    if (!b->n)
+        return 0;
+    if (b->ntex < 0)
+        return 1;
+    for (i = 0; i < b->ntex; i++)
+        if (lo < b->tex_hi[i] && b->tex_lo[i] < hi)
+            return 1;
+    return 0;
+}
+
+/* Does anything queued -- filling or still being drawn -- sample [lo, hi)? */
+static int rq_queue_samples(uint32_t lo, uint32_t hi)
+{
+    if (s_rq[s_rq_fill] && rq_tex_overlaps(s_rq[s_rq_fill], lo, hi))
+        return 1;
+#if defined(_WIN32)
+    {
+        LONG seq;
+        rq_reap();
+        for (seq = s_pool.tail; seq < s_pool.head; seq++)
+            if (!s_pool.done[seq % NV_RQ_DEPTH]
+                && rq_tex_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
+                return 1;
+    }
+#endif
+    return 0;
+}
+
+static void rq_note_textures(RasterBatch *b)
+{
+    int st, i;
+    for (st = 0; st < 4 && b->ntex >= 0; st++) {
+        uint32_t lo, hi;
+        if (!draw_samples(st, &lo, &hi) || !rt_seen_overlaps(lo, hi))
+            continue;
+        for (i = 0; i < b->ntex; i++)
+            if (b->tex_lo[i] == lo && b->tex_hi[i] == hi)
+                break;
+        if (i < b->ntex)
+            continue;
+        if (b->ntex == NV_RQ_TEXS) {
+            b->ntex = -1;
+            break;
+        }
+        b->tex_lo[b->ntex] = lo;
+        b->tex_hi[b->ntex] = hi;
+        b->ntex++;
     }
 }
 
@@ -2665,17 +2766,25 @@ static void xfq_push(XfTri *T)
         b = s_rq[s_rq_fill];
     }
     if (!s_rq_ps) {
-        PixState *ps = &b->st[b->nst];
+        const SwzTable *swz = surface_swizzled();
         uint32_t lo = dma_resolve(s_gpu.color_offset), bytes;
+        PixState *ps;
+        bytes = swz ? swz->w * swz->h * T->bpp
+                    : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
+        if (rq_queue_samples(lo, lo + bytes)) {
+            rq_sync();
+            b = s_rq[s_rq_fill];
+        }
+        rt_seen_note(lo, lo + bytes);
+        ps = &b->st[b->nst];
         pix_capture(ps);
         if (b->nst && memcmp(ps, &b->st[b->nst - 1], sizeof *ps) == 0)
             ps = &b->st[b->nst - 1];
         else
             b->nst++;
         s_rq_ps = ps;
-        bytes = ps->swz ? ps->swz->w * ps->swz->h * T->bpp
-                        : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
         rq_note_surface(b, lo, lo + bytes);
+        rq_note_textures(b);
     }
     i = b->n++;
     b->v[i][0] = *T->va;
