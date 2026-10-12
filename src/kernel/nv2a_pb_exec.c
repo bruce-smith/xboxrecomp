@@ -3040,6 +3040,34 @@ static int band_has_work(int b)
     return s_pool.band_next[b] < s_pool.head && !s_pool.band_busy[b];
 }
 
+/* RECOMP_RQ_STATS=1: where the raster pool's time goes, per frame, every
+ * 60 flips -- workers asleep because every band with work waits (on a
+ * batch's geometry, or a barrier) or because there is none, the executor
+ * waiting for a ring slot or a drain, and the batches it kicked. */
+static struct {
+    volatile LONG64 blk_geo_us, blk_bar_us, idle_us, wait_us;
+    volatile LONG64 kicks, barriers, tris;
+} s_rqst;
+static int s_rqst_on = -1;
+static __declspec(thread) int t_blk_why;    /* 1 geometry, 2 barrier */
+
+static int rqst_on(void)
+{
+    if (s_rqst_on < 0)
+        s_rqst_on = getenv("RECOMP_RQ_STATS") != NULL;
+    return s_rqst_on;
+}
+
+static LONG64 rqst_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (LONG64)(t.QuadPart * 1000000 / f.QuadPart);
+}
+
 /* Claim one band that owes a batch and draw it through every batch
  * submitted so far. Returns 0 if there was nothing to claim. */
 static int rq_work_one(int k, int *start)
@@ -3066,18 +3094,28 @@ static int rq_work_one(int k, int *start)
                 /* Its triangles are still being set up, so which bands it
                  * touches is not known yet. */
                 blocked = 1;
+                t_blk_why = 1;
                 break;
             }
             in = s_pool.slot_seq[slot] == seq
                  && b >= s_pool.band0[slot] && b < s_pool.band1[slot];
             MemoryBarrier();
-            if (in && s_pool.slot_seq[slot] == seq && s_pool.barrier[slot]
+            if (s_pool.slot_seq[slot] == seq && s_pool.barrier[slot]
                 && s_pool.done_prefix < seq) {
                 /* Render to texture, either way round: this batch samples
                  * what an earlier one draws, or draws what an earlier one
                  * samples, anywhere on the surface -- so it waits for all
-                 * of them, not only for this band. */
+                 * of them, not only for this band. Every band stops here,
+                 * also those the batch does not touch: then everything
+                 * after a barrier is ordered after everything before it,
+                 * and a later draw sampling the same target needs no
+                 * barrier of its own (s_rq_bar_seq). Holding back only the
+                 * batch's own bands took ~17 barriers a frame in stage 01-01
+                 * -- one per batch that sampled a render target still
+                 * drawing -- and the workers slept 25-55% of the frame on
+                 * them. */
                 blocked = 1;
+                t_blk_why = 2;
                 break;
             }
             if (in && s_pool.slot_seq[slot] == seq) {
@@ -3239,16 +3277,28 @@ static DWORD WINAPI raster_worker(LPVOID arg)
             /* Every band with work is waiting on a batch (its geometry, or
              * a barrier): sleep until a batch finishes rather than spin --
              * spinning workers starved the executor of its core. */
+        {
+            LONG64 t0 = rqst_on() ? rqst_us() : 0;
             AcquireSRWLockExclusive(&s_pool.lock);
             SleepConditionVariableSRW(&s_pool.done_cv, &s_pool.lock, 1, 0);
             ReleaseSRWLockExclusive(&s_pool.lock);
+            if (t0)
+                InterlockedAdd64(t_blk_why == 2 ? &s_rqst.blk_bar_us
+                                                : &s_rqst.blk_geo_us,
+                                 rqst_us() - t0);
             continue;
         }
+        }
+        {
+        LONG64 t0 = rqst_on() ? rqst_us() : 0;
         AcquireSRWLockExclusive(&s_pool.lock);
         while (!rq_any_work())
             SleepConditionVariableSRW(&s_pool.work_cv, &s_pool.lock,
                                       INFINITE, 0);
         ReleaseSRWLockExclusive(&s_pool.lock);
+        if (t0)
+            InterlockedAdd64(&s_rqst.idle_us, rqst_us() - t0);
+        }
     }
     return 0;
 }
@@ -3302,10 +3352,16 @@ static void rq_reap(void)
 static void rq_wait_until(LONG keep)
 {
     int start = 0;
+    LONG64 t0 = 0;
     for (;;) {
         rq_reap();
-        if (s_pool.head - s_pool.tail <= keep)
+        if (s_pool.head - s_pool.tail <= keep) {
+            if (t0)
+                InterlockedAdd64(&s_rqst.wait_us, rqst_us() - t0);
             return;
+        }
+        if (!t0 && rqst_on())
+            t0 = rqst_us();
         if (rq_geo_work(s_pool.n) || rq_work_one(s_pool.n, &start) == 1)
             continue;
         AcquireSRWLockExclusive(&s_pool.lock);
@@ -3426,6 +3482,12 @@ static void rq_kick(void)
                 s_pool.done[slot] = b1 == b0;
                 s_pool.geo_ready[slot] = 1;
             }
+            if (rqst_on()) {
+                InterlockedIncrement64(&s_rqst.kicks);
+                InterlockedAdd64(&s_rqst.tris, b->n);
+                if (b->barrier)
+                    InterlockedIncrement64(&s_rqst.barriers);
+            }
             AcquireSRWLockExclusive(&s_pool.lock);
             InterlockedIncrement(&s_pool.head);
             rq_advance_prefix();              /* a batch with no rows is done */
@@ -3545,6 +3607,18 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
     b->nsurf++;
 }
 
+/* The latest barrier batch (async): every band waits there for every
+ * batch before it, so batches before it are already ordered ahead of
+ * anything queued from then on and need no further barrier. */
+#if defined(_WIN32)
+static LONG s_rq_bar_seq;
+
+static LONG rq_unordered_from(void)
+{
+    return s_rq_bar_seq > s_pool.tail ? s_rq_bar_seq : s_pool.tail;
+}
+#endif
+
 /* Does anything queued -- filling or still being drawn -- write [lo, hi)? */
 static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
 {
@@ -3554,7 +3628,7 @@ static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
     {
         LONG seq;
         rq_reap();
-        for (seq = s_pool.tail; seq < s_pool.head; seq++)
+        for (seq = rq_unordered_from(); seq < s_pool.head; seq++)
             if (!s_pool.done[seq % NV_RQ_DEPTH]
                 && rq_surf_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
                 return 1;
@@ -3623,20 +3697,10 @@ static int rq_barrier(int k)
     if (k == 2)
         rq_kick();
     s_rq[s_rq_fill]->barrier = 1;
+#if defined(_WIN32)
+    s_rq_bar_seq = s_pool.head;           /* the number it is kicked with */
+#endif
     return 1;
-}
-
-/* A batch full mid-draw (or before a clear job) is handed over, and what is
- * still to come goes into the next one. A barrier set for that draw has to
- * move with it (RECOMP_ASYNC_SYNC): left on the full batch only, the rest of
- * the draw sat in a batch whose bands may start before the render-to-texture
- * pass it samples is drawn everywhere. Kept on the full batch as well -- an
- * extra barrier only costs some overlap. */
-static void rq_kick_carry(void)
-{
-    int bar = s_rq[s_rq_fill]->barrier;
-    rq_kick();
-    s_rq[s_rq_fill]->barrier = bar;
 }
 
 /* A clear job into the batch being filled, in order with the triangles. */
@@ -3644,7 +3708,7 @@ static void rq_push_job(const XfTri *T)
 {
     RasterBatch *b = s_rq[s_rq_fill];
     if (b->n == NV_RQ_TRIS) {
-        rq_kick_carry();
+        rq_kick();
         b = s_rq[s_rq_fill];
     }
     b->tri[b->n++] = *T;
@@ -3782,7 +3846,7 @@ static int rq_queue_samples(uint32_t lo, uint32_t hi)
     {
         LONG seq;
         rq_reap();
-        for (seq = s_pool.tail; seq < s_pool.head; seq++)
+        for (seq = rq_unordered_from(); seq < s_pool.head; seq++)
             if (!s_pool.done[seq % NV_RQ_DEPTH]
                 && rq_tex_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
                 return 1;
@@ -3908,7 +3972,7 @@ static void xfq_push(XfTri *T)
         (void)surface_swizzled();
     b = s_rq[s_rq_fill];
     if (b->n == NV_RQ_TRIS || (!s_rq_ps && b->nst == NV_RQ_STATES)) {
-        rq_kick_carry();
+        rq_kick();
         b = s_rq[s_rq_fill];
     }
     if (!s_rq_ps)
@@ -3952,7 +4016,7 @@ static int geo_queue(const Nv2aVshProg *prog, uint32_t n)
     b = s_rq[s_rq_fill];
     if (b->n + cap > NV_RQ_TRIS || b->nst == NV_RQ_STATES
         || b->ngeo == NV_RQ_GEO || b->nin + n > NV_RQ_GVERTS) {
-        rq_kick_carry();
+        rq_kick();
         b = s_rq[s_rq_fill];
     }
     b = rq_draw_state(b, g.bpp);
@@ -5729,6 +5793,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_INCREMENT_WRITE:
         rq_sync();                       /* the frame is finished */
+#if defined(_WIN32)
+        if (rqst_on() && s_gpu.flips % 60 == 59) {
+            double f = 60.0;
+            fprintf(stderr, "[RQSTATS] per frame: workers asleep %.1f ms blocked"
+                    " on geometry, %.1f ms on barriers, %.1f ms idle (summed over"
+                    " %d); executor waited %.1f ms; %.1f batches (%.1f barrier),"
+                    " %.0f tris each%c",
+                    s_rqst.blk_geo_us / 1e3 / f, s_rqst.blk_bar_us / 1e3 / f,
+                    s_rqst.idle_us / 1e3 / f, s_pool.n, s_rqst.wait_us / 1e3 / f,
+                    s_rqst.kicks / f, s_rqst.barriers / f,
+                    s_rqst.kicks ? (double)s_rqst.tris / s_rqst.kicks : 0.0, 10);
+            memset((void *)&s_rqst, 0, sizeof s_rqst);
+        }
+#endif
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
