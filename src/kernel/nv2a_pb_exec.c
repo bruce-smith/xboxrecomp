@@ -324,6 +324,7 @@ static struct {
     Nv2aCombiner rc;
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t report_epoch;              /* CLEAR_REPORT_VALUEs so far */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
     float    fog_param[2];
@@ -827,6 +828,7 @@ typedef struct {
     uint32_t blend_color;
     uint32_t depth_test, depth_func, depth_mask, zpass_enable;
     uint32_t clip_plane_mode;
+    uint32_t report_epoch;              /* which visibility test counts it */
     Nv2aCombinerPrep rcp;               /* constants unpacked per draw */
     Texture texs[4];
     uint32_t self_sample;               /* a stage samples the colour surface */
@@ -859,6 +861,7 @@ static void pix_capture(PixState *ps)
     ps->depth_mask = s_gpu.depth_mask;
     ps->zpass_enable = s_gpu.zpass_enable;
     ps->clip_plane_mode = s_gpu.clip_plane_mode;
+    ps->report_epoch = s_gpu.report_epoch;
     nv2a_rc_prepare(&s_gpu.rc, &ps->rcp);
     memcpy(ps->texs, s_gpu.texs, sizeof ps->texs);
     {
@@ -923,6 +926,9 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+static int rq_async(void);
+static int rq_clear_job(uint8_t *mem, uint32_t bpp);
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -930,7 +936,8 @@ static void clear_surface(uint32_t param)
     uint32_t y, x;
     const SwzTable *swz;
 
-    rq_sync();                            /* queued pixels land first */
+    if (!rq_async())
+        rq_sync();                        /* queued pixels land first */
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
@@ -944,7 +951,10 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
-    if ((swz = surface_swizzled()) != NULL) {
+    if (rq_async() && rq_clear_job(mem, bpp)) {
+        y = s_gpu.clip_h;                 /* queued: skip both pixel loops */
+        swz = NULL;
+    } else if ((swz = surface_swizzled()) != NULL) {
         /* Pixel by pixel through the swizzle tables. A clip covering the whole
          * surface could be one fill, but clears are not where the time goes. */
         uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
@@ -1868,11 +1878,20 @@ static float *zbuf_current(int create)
     return s_zbufs[i].z;
 }
 
+static int rq_async(void);
+static int rq_zclear_job(float *z, float v);
+
 static void zbuf_clear(void)
 {
-    rq_sync();
-    float *z = zbuf_current(1), v = zclear_value();
+    float *z, v;
     size_t k;
+    if (rq_async()) {
+        z = zbuf_current(1);
+        if (z && rq_zclear_job(z, zclear_value()))
+            return;
+    }
+    rq_sync();
+    z = zbuf_current(1); v = zclear_value();
     if (z)
         for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
             z[k] = v;
@@ -2117,12 +2136,23 @@ typedef struct {
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
     const PixState *ps;                 /* the draw's state, for P */
+    /* Not a triangle but an ordered job over its rectangle (rq_push_job):
+     * 1 colour clear, 2 depth clear. */
+    int job;
+    uint32_t jcolor, jpitch, jbase;
+    float jz;
+    const SwzTable *jswz;
 } XfTri;
+
+/* Z-pass counts per visibility test (report epoch), so a test can be
+ * answered when its own batches are done, without draining the queue. */
+#define NV_ZEPOCHS 64
 
 typedef struct {
     uint64_t depth_fail, pixels, written;
     uint32_t zpass, written_max;
     uint64_t csum;                      /* r+g+b shaded, for the draw trace */
+    uint32_t zpe[NV_ZEPOCHS];           /* z-pass per report epoch */
 } XfCount;
 
 /* Rows y0, y0+step, ... < y1 of triangle T, one pixel at a time: the
@@ -2208,7 +2238,7 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
                 if (zp && P->depth_mask)
                     *zp = z;
                 if (P->zpass_enable)
-                    cnt->zpass++;
+                    { cnt->zpass++; cnt->zpe[P->report_epoch & (NV_ZEPOCHS - 1)]++; }
                 if (!(P->color_mask & 0x01010101u))
                     continue;              /* colour writes off: depth only */
                 cnt->pixels++;
@@ -2368,7 +2398,7 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
                 if (T->zb && P->depth_mask)
                     T->zb[(size_t)y * NV_ZBUF_W + x + l] = zl[l];
                 if (P->zpass_enable)
-                    cnt->zpass++;
+                    { cnt->zpass++; cnt->zpe[P->report_epoch & (NV_ZEPOCHS - 1)]++; }
                 if (!(P->color_mask & 0x01010101u))
                     continue;
                 cnt->pixels++;
@@ -2599,6 +2629,7 @@ typedef struct {
     float (*in)[NV2A_VSH_INPUTS][4];    /* NV_RQ_GVERTS */
     float (*cst)[NV2A_VSH_CONSTANTS][4];/* NV_RQ_GEO */
     volatile LONG geo_next, geo_left;
+    int barrier;                        /* waits for every earlier batch */
 } RasterBatch;
 
 #define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
@@ -2623,11 +2654,52 @@ static int s_rq_each = -1;              /* RECOMP_RASTER_BATCH=0 */
 #define NV_BAND 4
 
 /* A batch in order on the calling thread: no pool. */
+/* Rows [y0, y1) of a clear job, in the band that owns them. The colour
+ * clear writes the same values clear_surface does; the depth clear fills
+ * the job's rectangle of its depth buffer. */
+static void xf_job_rows(const XfTri *T, int y0, int y1)
+{
+    int y, x, lo = y0 > T->miny ? y0 : T->miny, hi = y1 < T->maxy ? y1 : T->maxy;
+    if (T->job == 2) {
+        for (y = lo; y < hi; y++)
+            for (x = T->minx; x < T->maxx; x++)
+                T->zb[(size_t)y * NV_ZBUF_W + x] = T->jz;
+        return;
+    }
+    {
+        uint16_t v16 = (uint16_t)(((T->jcolor >> 8) & 0xF800)
+                                | ((T->jcolor >> 5) & 0x07E0)
+                                | ((T->jcolor >> 3) & 0x001F));
+        const SwzTable *swz = T->jswz;
+        for (y = lo; y < hi; y++) {
+            if (swz) {
+                if ((uint32_t)y >= swz->h)
+                    break;
+                for (x = T->minx; x < T->maxx && (uint32_t)x < swz->w; x++) {
+                    uint8_t *p = T->mem + T->jbase + swz->x[x] + swz->y[y];
+                    if (T->bpp == 4) *(uint32_t *)p = T->jcolor;
+                    else if (T->bpp == 2) *(uint16_t *)p = v16;
+                }
+            } else {
+                uint8_t *row = T->mem + T->jbase + (size_t)y * T->jpitch;
+                for (x = T->minx; x < T->maxx; x++) {
+                    if (T->bpp == 4) ((uint32_t *)row)[x] = T->jcolor;
+                    else if (T->bpp == 2) ((uint16_t *)row)[x] = v16;
+                }
+            }
+        }
+    }
+}
+
 static void xf_rows_queue(const XfTri *q, int qn, XfCount *cnt)
 {
     int i;
-    for (i = 0; i < qn; i++)
-        xf_rows(&q[i], q[i].miny, 1, cnt);
+    for (i = 0; i < qn; i++) {
+        if (q[i].job)
+            xf_job_rows(&q[i], q[i].miny, q[i].maxy);
+        else
+            xf_rows(&q[i], q[i].miny, 1, cnt);
+    }
 }
 
 /* One band through every triangle of a batch. */
@@ -2638,8 +2710,12 @@ static void xf_band(const XfTri *q, int qn, int band, XfCount *cnt)
         const XfTri *T = &q[i];
         int lo = y0 > T->miny ? y0 : T->miny;
         int hi = y1 < T->maxy ? y1 : T->maxy;
-        if (lo < hi)
-            xf_rows_span(T, lo, hi, 1, cnt);
+        if (lo < hi) {
+            if (T->job)
+                xf_job_rows(T, lo, hi);
+            else
+                xf_rows_span(T, lo, hi, 1, cnt);
+        }
     }
 }
 
@@ -2683,11 +2759,39 @@ static struct {
     volatile LONG done[NV_RQ_DEPTH];
     volatile LONG slot_seq[NV_RQ_DEPTH];    /* which batch a slot holds */
     volatile LONG geo_ready[NV_RQ_DEPTH];   /* its geometry is all set up */
+    volatile LONG barrier[NV_RQ_DEPTH];     /* waits for every earlier batch */
+    volatile LONG done_prefix;              /* batches 0..n-1 all drawn */
     Nv2aVshOutput *xf_scratch[NV_RASTER_MAX_THREADS + 1];
     GeoStats gst[NV_RASTER_MAX_THREADS + 1];
     int nbands;                             /* bands any batch has used */
     XfCount cnt[NV_RASTER_MAX_THREADS + 1]; /* + 1: the executor helping */
 } s_pool;
+
+/* Visibility reports waiting for the batches before them (RECOMP_ASYNC_SYNC):
+ * written by whoever extends done_prefix past `seq`. */
+#define NV_REPORTS_PENDING 32
+static struct { uint32_t at, epoch; LONG seq; uint64_t stamp; }
+    s_rep[NV_REPORTS_PENDING];
+static int s_rep_head, s_rep_n;             /* under s_pool.lock */
+static uint32_t s_zpe_total[NV_ZEPOCHS];    /* folded at drains */
+static void rq_report_write(uint32_t at, uint64_t stamp, uint32_t epoch);
+
+/* Under s_pool.lock: extend the run of batches drawn in full, and answer
+ * the visibility tests that were waiting for them. */
+static void rq_advance_prefix(void)
+{
+    LONG d = s_pool.done_prefix;
+    while (d < s_pool.head && s_pool.slot_seq[d % NV_RQ_DEPTH] == d
+           && s_pool.done[d % NV_RQ_DEPTH])
+        d++;
+    s_pool.done_prefix = d;
+    while (s_rep_n && s_rep[s_rep_head].seq < d) {
+        rq_report_write(s_rep[s_rep_head].at, s_rep[s_rep_head].stamp,
+                        s_rep[s_rep_head].epoch);
+        s_rep_head = (s_rep_head + 1) % NV_REPORTS_PENDING;
+        s_rep_n--;
+    }
+}
 
 static int band_has_work(int b)
 {
@@ -2698,16 +2802,18 @@ static int band_has_work(int b)
  * submitted so far. Returns 0 if there was nothing to claim. */
 static int rq_work_one(int k, int *start)
 {
-    int nb = s_pool.nbands, i;
+    int nb = s_pool.nbands, i, blocked = 0, any_blocked = 0;
 
     for (i = 0; i < nb; i++) {
         int b = (*start + i) % nb;
         LONG seq;
         XfCount *c = &s_pool.cnt[k];
 
+        LONG start_seq;
         if (!band_has_work(b)
             || InterlockedCompareExchange(&s_pool.band_busy[b], 1, 0))
             continue;
+        start_seq = s_pool.band_next[b];
         while ((seq = s_pool.band_next[b]) < s_pool.head) {
             int slot = seq % NV_RQ_DEPTH, in;
             /* A band the batch does not touch can fall behind until the
@@ -2717,13 +2823,21 @@ static int rq_work_one(int k, int *start)
             if (s_pool.slot_seq[slot] == seq && !s_pool.geo_ready[slot]) {
                 /* Its triangles are still being set up, so which bands it
                  * touches is not known yet. */
-                InterlockedExchange(&s_pool.band_busy[b], 0);
-                *start = b + 1;
-                return 2;
+                blocked = 1;
+                break;
             }
             in = s_pool.slot_seq[slot] == seq
                  && b >= s_pool.band0[slot] && b < s_pool.band1[slot];
             MemoryBarrier();
+            if (in && s_pool.slot_seq[slot] == seq && s_pool.barrier[slot]
+                && s_pool.done_prefix < seq) {
+                /* Render to texture, either way round: this batch samples
+                 * what an earlier one draws, or draws what an earlier one
+                 * samples, anywhere on the surface -- so it waits for all
+                 * of them, not only for this band. */
+                blocked = 1;
+                break;
+            }
             if (in && s_pool.slot_seq[slot] == seq) {
                 const RasterBatch *rb = s_rq[slot];
                 uint64_t wn;
@@ -2737,6 +2851,7 @@ static int rq_work_one(int k, int *start)
                 if (InterlockedDecrement(&s_pool.left[slot]) == 0) {
                     AcquireSRWLockExclusive(&s_pool.lock);
                     s_pool.done[slot] = 1;
+                    rq_advance_prefix();
                     WakeAllConditionVariable(&s_pool.done_cv);
                     ReleaseSRWLockExclusive(&s_pool.lock);
                 }
@@ -2746,9 +2861,17 @@ static int rq_work_one(int k, int *start)
         }
         InterlockedExchange(&s_pool.band_busy[b], 0);
         *start = b + 1;
+        if (blocked) {
+            /* Stopped at a batch it may not start yet: whatever it drew
+             * before that counts as work, otherwise try the other bands. */
+            blocked = 0;
+            any_blocked = 1;
+            if (s_pool.band_next[b] == start_seq)
+                continue;
+        }
         return 1;
     }
-    return 0;
+    return any_blocked ? 2 : 0;
 }
 
 static void geo_slot_sink(void *sink, XfTri *T);
@@ -2781,6 +2904,7 @@ static void rq_geo_finish(RasterBatch *b, int slot)
     s_pool.done[slot] = b1 == b0;
     MemoryBarrier();
     s_pool.geo_ready[slot] = 1;
+    rq_advance_prefix();
     WakeAllConditionVariable(&s_pool.work_cv);
     WakeAllConditionVariable(&s_pool.done_cv);
     ReleaseSRWLockExclusive(&s_pool.lock);
@@ -2853,7 +2977,14 @@ static DWORD WINAPI raster_worker(LPVOID arg)
             continue;
         switch (rq_work_one(k, &start)) {
         case 1: continue;
-        case 2: SwitchToThread(); continue; /* a batch's geometry is not done */
+        case 2:
+            /* Every band with work is waiting on a batch (its geometry, or
+             * a barrier): sleep until a batch finishes rather than spin --
+             * spinning workers starved the executor of its core. */
+            AcquireSRWLockExclusive(&s_pool.lock);
+            SleepConditionVariableSRW(&s_pool.done_cv, &s_pool.lock, 1, 0);
+            ReleaseSRWLockExclusive(&s_pool.lock);
+            continue;
         }
         AcquireSRWLockExclusive(&s_pool.lock);
         while (!rq_any_work())
@@ -2905,9 +3036,7 @@ void *nv2a_pb_exec_raster_thread(int k)
 /* Retire finished batches in order, so their slots can be refilled. */
 static void rq_reap(void)
 {
-    while (s_pool.tail < s_pool.head
-           && s_pool.done[s_pool.tail % NV_RQ_DEPTH])
-        s_pool.tail++;
+    s_pool.tail = s_pool.done_prefix;
 }
 
 /* Wait until at most `keep` batches are in flight, drawing bands alongside
@@ -2942,7 +3071,10 @@ static void rq_wait(void)
         rq_wait_until(0);
     for (k = 0; k <= s_pool.n; k++) {
         XfCount z = {0, 0, 0, 0, 0};
+        int e;
         rq_count(&s_pool.cnt[k]);
+        for (e = 0; e < NV_ZEPOCHS; e++)
+            s_zpe_total[e] += s_pool.cnt[k].zpe[e];
         s_pool.cnt[k] = z;
         geo_fold(&s_pool.gst[k]);
         memset(&s_pool.gst[k], 0, sizeof s_pool.gst[k]);
@@ -2981,6 +3113,7 @@ static void rq_kick(void)
              * store below the plain ones that follow. */
             s_pool.slot_seq[slot] = s_pool.head;
             MemoryBarrier();
+            s_pool.barrier[slot] = b->barrier;
             if (b->ngeo) {
                 /* Rows unknown until its geometry is set up: rq_geo_finish
                  * hands it to the bands. */
@@ -3001,6 +3134,7 @@ static void rq_kick(void)
             }
             AcquireSRWLockExclusive(&s_pool.lock);
             InterlockedIncrement(&s_pool.head);
+            rq_advance_prefix();              /* a batch with no rows is done */
             WakeAllConditionVariable(&s_pool.work_cv);
             ReleaseSRWLockExclusive(&s_pool.lock);
             s_gpu.rq_pooled++;
@@ -3020,6 +3154,7 @@ static void rq_kick(void)
     b->n = b->nst = b->nsurf = b->ntex = 0;
     b->ngeo = 0;
     b->nin = 0;
+    b->barrier = 0;
     b->px = 0;
     b->ymin = 1 << 30;
     b->ymax = 0;
@@ -3120,7 +3255,7 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
 static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
 {
     if (s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
-        return 1;
+        return 2;
 #if defined(_WIN32)
     {
         LONG seq;
@@ -3154,6 +3289,117 @@ static int draw_samples(int st, uint32_t *lo, uint32_t *hi)
     return 1;
 }
 
+/* RECOMP_ASYNC_SYNC=1: the per-frame sync points stop draining the queue
+ * on the executor. Each one emptied the pipeline -- the executor waited,
+ * the title waited on the executor, and the workers then idled while the
+ * executor walked on -- and removing any single one only moved the wait to
+ * the next (P8's per-site timings). Render-to-texture hazards become
+ * barrier batches, clears become ordered jobs, visibility reports are
+ * written when their batches are done; the flip is the one drain left.
+ * Changed only at a flip, where everything is drained. */
+static int rq_ready(void);
+static int rq_queue_samples(uint32_t lo, uint32_t hi);
+static int s_async = -1;
+
+static int rq_async(void)
+{
+    if (s_async < 0) {
+        const char *e = getenv("RECOMP_ASYNC_SYNC");
+        s_async = e && *e == '1' && raster_pool_size() > 1 && rq_ready();
+    }
+    return s_async;
+}
+
+/* Order what comes next after everything queued, for a render-to-texture
+ * hazard of kind `k` (rq_queue_overlaps / rq_queue_samples: 2, the batch
+ * being filled is involved and is closed; 1, only batches already drawing).
+ * Returns whether there was one. */
+static int rq_barrier(int k)
+{
+    if (!k)
+        return 0;
+    if (!rq_async()) {
+        rq_sync();
+        return 1;
+    }
+    if (k == 2)
+        rq_kick();
+    s_rq[s_rq_fill]->barrier = 1;
+    return 1;
+}
+
+/* A clear job into the batch being filled, in order with the triangles. */
+static void rq_push_job(const XfTri *T)
+{
+    RasterBatch *b = s_rq[s_rq_fill];
+    if (b->n == NV_RQ_TRIS) {
+        rq_kick();
+        b = s_rq[s_rq_fill];
+    }
+    b->tri[b->n++] = *T;
+    if (T->miny < b->ymin) b->ymin = T->miny;
+    if (T->maxy > b->ymax) b->ymax = T->maxy;
+}
+
+static void rq_report_write(uint32_t at, uint64_t stamp, uint32_t epoch)
+{
+    static int force = -1;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t zc = s_zpe_total[epoch & (NV_ZEPOCHS - 1)], zero = 0;
+    int k;
+    for (k = 0; k <= s_pool.n; k++)
+        zc += s_pool.cnt[k].zpe[epoch & (NV_ZEPOCHS - 1)];
+    if (force < 0)
+        force = getenv("RECOMP_ZPASS_FORCE") != NULL;
+    if (force)
+        zc = 100000;
+    memcpy(mem + at, &stamp, 8);
+    memcpy(mem + at + 8, &zc, 4);
+    MemoryBarrier();
+    memcpy(mem + at + 12, &zero, 4);       /* done, last */
+}
+
+/* Colour clear of the clip rectangle as an ordered job (RECOMP_ASYNC_SYNC):
+ * each band clears its own rows, after the draws queued before it and
+ * before those after. */
+static int rq_clear_job(uint8_t *mem, uint32_t bpp)
+{
+    XfTri J;
+    const SwzTable *swz = surface_swizzled();
+    uint32_t lo = s_gpu.color_base, hi;
+
+    hi = lo + (swz ? swz->w * swz->h * bpp
+                   : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch);
+    (void)rq_barrier(rq_queue_samples(lo, hi));    /* a queued draw samples it */
+    memset(&J, 0, sizeof J);
+    J.job = 1;
+    J.mem = mem;
+    J.bpp = bpp;
+    J.jbase = s_gpu.color_base;
+    J.jpitch = s_gpu.pitch;
+    J.jcolor = s_gpu.clear_color;
+    J.jswz = swz;
+    J.minx = (int)s_gpu.clip_x; J.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    J.miny = (int)s_gpu.clip_y; J.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    rq_push_job(&J);
+    rq_note_surface(s_rq[s_rq_fill], lo, hi);     /* a later sample orders after */
+    return 1;
+}
+
+/* Depth clear of the whole buffer as an ordered job. */
+static int rq_zclear_job(float *z, float v)
+{
+    XfTri J;
+    memset(&J, 0, sizeof J);
+    J.job = 2;
+    J.zb = z;
+    J.jz = v;
+    J.minx = 0; J.maxx = NV_ZBUF_W;
+    J.miny = 0; J.maxy = NV_ZBUF_H;
+    rq_push_job(&J);
+    return 1;
+}
+
 static void rq_check_textures(void)
 {
     int st;
@@ -3161,10 +3407,8 @@ static void rq_check_textures(void)
         uint32_t lo, hi;
         if (!draw_samples(st, &lo, &hi))
             continue;
-        if (rq_queue_overlaps(lo, hi)) {
-            rq_sync();
+        if (rq_barrier(rq_queue_overlaps(lo, hi)))
             return;
-        }
     }
 }
 
@@ -3220,7 +3464,7 @@ static int rq_tex_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 static int rq_queue_samples(uint32_t lo, uint32_t hi)
 {
     if (s_rq[s_rq_fill] && rq_tex_overlaps(s_rq[s_rq_fill], lo, hi))
-        return 1;
+        return 2;
 #if defined(_WIN32)
     {
         LONG seq;
@@ -3303,10 +3547,8 @@ static RasterBatch *rq_draw_state(RasterBatch *b, uint32_t bpp)
 
     bytes = swz ? swz->w * swz->h * bpp
                 : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
-    if (rq_queue_samples(lo, lo + bytes)) {
-        rq_sync();
+    if (rq_barrier(rq_queue_samples(lo, lo + bytes)))
         b = s_rq[s_rq_fill];
-    }
     rt_seen_note(lo, lo + bytes);
     ps = &b->st[b->nst];
     pix_capture(ps);
@@ -4859,7 +5101,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
-        rq_sync();
+        if (rq_async()) {
+            /* A new test: draws from here count in a fresh epoch. */
+            uint32_t e;
+            int k;
+            if (s_rep_n >= NV_ZEPOCHS / 2)
+                rq_sync();                /* far behind: let the queue catch up */
+            e = ++s_gpu.report_epoch & (NV_ZEPOCHS - 1);
+            s_zpe_total[e] = 0;
+            for (k = 0; k <= s_pool.n; k++)
+                s_pool.cnt[k].zpe[e] = 0;
+        } else
+            rq_sync();
         s_gpu.zpass_count = 0;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
@@ -4876,6 +5129,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp;
+        if (rq_async()) {
+            /* Answered when the batches before it are done, by whichever
+             * thread finishes them (rq_advance_prefix). The title polls the
+             * slot until its last word reads 0, as it would for the GPU. */
+            stamp = (uint64_t)s_gpu.reports++ * 1000u;
+            rq_kick();
+            AcquireSRWLockExclusive(&s_pool.lock);
+            if (s_rep_n < NV_REPORTS_PENDING && s_pool.done_prefix < s_pool.head) {
+                int i = (s_rep_head + s_rep_n) % NV_REPORTS_PENDING;
+                s_rep[i].at = at;
+                s_rep[i].stamp = stamp;
+                s_rep[i].epoch = s_gpu.report_epoch;
+                s_rep[i].seq = s_pool.head - 1;
+                s_rep_n++;
+                ReleaseSRWLockExclusive(&s_pool.lock);
+            } else {
+                ReleaseSRWLockExclusive(&s_pool.lock);
+                rq_sync();
+                rq_report_write(at, stamp, s_gpu.report_epoch);
+            }
+            break;
+        }
         rq_sync();                         /* every queued pixel counted */
         stamp = (uint64_t)s_gpu.reports++ * 1000u;
         memcpy(mem + at, &stamp, 8);
