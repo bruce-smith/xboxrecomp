@@ -246,6 +246,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
+        if (addr == NV_PAPU_FECTL)
+            mcpx_apu_fe_release(d);
         /* Starting the APU has to start the frame thread.
          *
          * The thread idles on pause_requested, which init sets and only the

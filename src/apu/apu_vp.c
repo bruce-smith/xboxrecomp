@@ -186,9 +186,21 @@ static struct {
     bool primed;
 } g_rs[MCPX_HW_MAX_VOICES];
 
+static bool fe_trapped(MCPXAPUState *d)
+{
+    return (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+           == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+}
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
+
+    /* A second idle voice while the first trap is still being serviced waits
+     * for the next frame (it is still idle and still listed then). Latching
+     * it would change FEDECPARAM under the service routine. */
+    if (method == SE2FE_IDLE_VOICE && fe_trapped(d))
+        return;
 
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
@@ -558,13 +570,20 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
  * VP MMIO read/write (exposed to apu_core.c)
  * ============================================================ */
 
+/* Methods written while the front end is trapped (mcpx_apu_vp_write). */
+#define PIO_QUEUE 1024
+static struct { uint32_t method, arg; } g_pio_q[PIO_QUEUE];
+static int g_pio_head, g_pio_count;
+
 uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 {
     (void)opaque; (void)size;
 
     switch (addr) {
     case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+        /* Room in the FIFO, which only fills while the FE is trapped. */
+        return (PIO_QUEUE - g_pio_count) >= 0x80 ? 0x80
+             : (uint64_t)(PIO_QUEUE - g_pio_count);
     default:
         break;
     }
@@ -577,8 +596,50 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
-    fe_method(d, (uint32_t)addr, (uint32_t)val);
+    /* The title's PIO methods, in order, under the APU lock.
+     *
+     * They used to run on the title's thread with no lock at all, while the
+     * frame thread walked and edited the same voice lists. And they ran even
+     * while the front end was trapped: when the VP traps an idle voice it
+     * latches the voice in FEDECMETH/FEDECPARAM and raises the interrupt, and
+     * the next method the title wrote overwrote the latch before DirectSound's
+     * service routine read it. Blinx 2's routine (0x00334DBF) then unlinked a
+     * "voice" named by some other method's argument and faulted on its null
+     * list link (sub_00335C18, Flink 0 - 0x4C) as the attract stage started
+     * its effects. On hardware a trapped front end executes nothing; methods
+     * wait in the PIO FIFO until software releases the trap. So do they here:
+     * see mcpx_apu_fe_release. */
+    qemu_mutex_lock(&d->lock);
+    if (fe_trapped(d) || g_pio_count) {
+        if (g_pio_count < PIO_QUEUE) {
+            int tail = (g_pio_head + g_pio_count) % PIO_QUEUE;
+            g_pio_q[tail].method = (uint32_t)addr;
+            g_pio_q[tail].arg = (uint32_t)val;
+            g_pio_count++;
+        } else {
+            static int shown;
+            if (!shown++)
+                fprintf(stderr, "[APU] PIO queue full while the FE is trapped;"
+                                " dropping methods\n");
+        }
+    } else {
+        fe_method(d, (uint32_t)addr, (uint32_t)val);
+    }
+    qemu_mutex_unlock(&d->lock);
+}
+
+/* FECTL was written: if that released the trap, run what queued meanwhile. */
+void mcpx_apu_fe_release(MCPXAPUState *d)
+{
+    qemu_mutex_lock(&d->lock);
+    while (g_pio_count && !fe_trapped(d)) {
+        uint32_t m = g_pio_q[g_pio_head].method;
+        uint32_t a = g_pio_q[g_pio_head].arg;
+        g_pio_head = (g_pio_head + 1) % PIO_QUEUE;
+        g_pio_count--;
+        fe_method(d, m, a);
+    }
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================
