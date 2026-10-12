@@ -192,6 +192,8 @@ static bool fe_trapped(MCPXAPUState *d)
            == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
 }
 
+static unsigned g_vp_frames;   /* VP frames run, for RECOMP_APU_TRAP_TRACE */
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -201,6 +203,19 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
      * it would change FEDECPARAM under the service routine. */
     if (method == SE2FE_IDLE_VOICE && fe_trapped(d))
         return;
+
+    /* RECOMP_APU_TRAP_TRACE: each idle-voice trap, by voice and VP frame.
+     * One voice trapping frame after frame is a voice the title's service
+     * routine never takes off the hardware list. */
+    if (method == SE2FE_IDLE_VOICE) {
+        static int trace = -1;
+        static unsigned n;   /* racy, but only a print limit */
+        if (trace < 0)
+            trace = getenv("RECOMP_APU_TRAP_TRACE") != NULL;
+        if (trace && ++n <= 400)
+            fprintf(stderr, "  [APUTRAP] idle voice %u, VP frame %u\n",
+                    argument, g_vp_frames);
+    }
 
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
@@ -1326,6 +1341,7 @@ unsigned g_vp_voices_processed;
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    g_vp_frames++;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {

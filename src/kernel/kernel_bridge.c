@@ -2131,6 +2131,11 @@ void xbox_DpcDumpRunning(void)
             CloseHandle(th);
         }
     }
+    /* And whatever the game knows about the structures this DPC walks. Read
+     * from this thread while the DPC keeps running: a snapshot, not atomic. */
+    if (g_dpc_spin_hook && g_dpc_running_routine == routine)
+        g_dpc_spin_hook(g_dpc_running_va, routine,
+                        BRIDGE_MEM32(g_dpc_running_va + 16), g_dpc_clock_reads);
     fflush(stderr);
 }
 
