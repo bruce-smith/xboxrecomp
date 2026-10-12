@@ -197,10 +197,12 @@ typedef struct {
     VshSrc src[3];
     uint8_t mac, ilu, mac_mask, ilu_mask, tdst;
     uint8_t omask, oaddr, out_ilu, out_o, final;
+    uint8_t reads;                          /* bit k: source k is used */
 } VshIns;
 
 static VshIns s_dec[NV2A_VSH_SLOTS];
 static uint32_t s_dec_n;
+static uint16_t s_dec_inputs;               /* v[i] some used source reads */
 
 static void decode_src(const uint32_t *ins, int which, VshSrc *d)
 {
@@ -226,6 +228,7 @@ static void decode_program(void)
 {
     uint32_t s;
     s_dec_n = 0;
+    s_dec_inputs = 0;
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const uint32_t *ins = s_program[s];
         VshIns *d = &s_dec[s_dec_n++];
@@ -242,6 +245,19 @@ static void decode_program(void)
         d->out_ilu = (uint8_t)field(ins, 3, 2, 1);
         d->out_o = (uint8_t)field(ins, 3, 11, 1);
         d->final = (uint8_t)field(ins, 3, 0, 1);
+        /* Which sources the ops read: every MAC op reads A; B all but mov,
+         * add and arl; C add and mad, and every ILU op. An unread source
+         * cannot change a result, so the four-lane path skips fetching it. */
+        d->reads = 0;
+        if (d->mac)
+            d->reads |= 1;
+        if (d->mac == 2 || (d->mac >= 4 && d->mac <= 12))
+            d->reads |= 2;
+        if (d->mac == 3 || d->mac == 4 || d->ilu)
+            d->reads |= 4;
+        for (k = 0; k < 3; k++)
+            if ((d->reads >> k & 1) && d->src[k].mux == 2)
+                s_dec_inputs |= (uint16_t)(1u << d->src[k].idx);
         if (d->final)
             break;
     }
@@ -310,7 +326,10 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
     case 8: r.v[0] = 1.0f; r.v[1] = a.v[1] * b.v[1];            /* dst */
             r.v[2] = a.v[2]; r.v[3] = b.v[3]; break;
     case 9: for (i = 0; i < 4; i++) r.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; break;
-    case 10: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? a.v[i] : b.v[i]; break;
+    /* max is a > b ? a : b -- b on a tie, so max(-0, 0) is 0. That is what
+     * MSVC compiled the old `a >= b ? a : b` to anyway (maxss), and it is
+     * exactly maxps, which the four-lane path uses. */
+    case 10: for (i = 0; i < 4; i++) r.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; break;
     case 11: for (i = 0; i < 4; i++) r.v[i] = a.v[i] < b.v[i] ? 1.0f : 0.0f; break;
     case 12: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 1.0f : 0.0f; break;
     case 13: *a0 = (int)floorf(a.v[0] + 0.001f); break;         /* arl */
@@ -478,7 +497,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
 typedef struct { __m128 c[4]; } vec4x4;   /* component k, lanes 0..3 */
 
-static vec4x4 rd4(const VshSrc *d, const float (*const in[4])[4],
+static vec4x4 rd4(const VshSrc *d, const vec4x4 *vin,
                   const vec4x4 *temp, const vec4x4 *opos, const int a0[4])
 {
     vec4x4 s, r;
@@ -487,9 +506,7 @@ static vec4x4 rd4(const VshSrc *d, const float (*const in[4])[4],
     if (d->mux == 1) {
         s = (d->reg == 12) ? *opos : temp[d->reg < 12 ? d->reg : 0];
     } else if (d->mux == 2) {
-        for (k = 0; k < 4; k++)
-            s.c[k] = _mm_set_ps(in[3][d->idx][k], in[2][d->idx][k],
-                                in[1][d->idx][k], in[0][d->idx][k]);
+        s = vin[d->idx];
     } else if (!d->rel) {
         int ci = d->idx < NV2A_VSH_CONSTANTS ? d->idx : 0;
         for (k = 0; k < 4; k++)
@@ -556,12 +573,10 @@ static vec4x4 mac4(uint32_t op, const vec4x4 *a, const vec4x4 *b,
         r.c[2] = a->c[2];
         r.c[3] = b->c[3];
         break;
-    case 9:  for (k = 0; k < 4; k++)
-                 r.c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), a->c[k], b->c[k]);
-             break;
-    case 10: for (k = 0; k < 4; k++)
-                 r.c[k] = sel4(_mm_cmpge_ps(a->c[k], b->c[k]), a->c[k], b->c[k]);
-             break;
+    /* minps/maxps are exactly a < b ? a : b and a > b ? a : b, NaN and
+     * signed zeros included -- the scalar code's definitions. */
+    case 9:  for (k = 0; k < 4; k++) r.c[k] = _mm_min_ps(a->c[k], b->c[k]); break;
+    case 10: for (k = 0; k < 4; k++) r.c[k] = _mm_max_ps(a->c[k], b->c[k]); break;
     case 11: for (k = 0; k < 4; k++)
                  r.c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), one, zero);
              break;
@@ -588,6 +603,26 @@ static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
 
     switch (op) {
     case 1: break;
+    case 2: {                                       /* rcp: 1/x, +inf for +-0 */
+        __m128 x = c->c[0];
+        __m128 v = _mm_div_ps(_mm_set1_ps(1.0f), x);
+        v = sel4(_mm_cmpeq_ps(x, _mm_setzero_ps()), _mm_set1_ps(INFINITY), v);
+        r.c[0] = r.c[1] = r.c[2] = r.c[3] = v;
+        break;
+    }
+    case 3: {                                       /* rcc: 1/x, clamped */
+        /* As the scalar code: the magnitude is held to [5.42101e-20,
+         * 1.884467e19] keeping the sign (f < 0), NaN passes through. Done per
+         * lane in scalar it was the D3D epilogue's cost on every vertex. */
+        const __m128 sign = _mm_set1_ps(-0.0f), zero = _mm_setzero_ps();
+        const __m128 lo = _mm_set1_ps(5.42101e-20f), hi = _mm_set1_ps(1.884467e19f);
+        __m128 f = _mm_div_ps(_mm_set1_ps(1.0f), c->c[0]);
+        __m128 neg = _mm_cmplt_ps(f, zero), mag = _mm_andnot_ps(sign, f);
+        f = sel4(_mm_cmplt_ps(mag, lo), sel4(neg, _mm_or_ps(lo, sign), lo), f);
+        f = sel4(_mm_cmpgt_ps(mag, hi), sel4(neg, _mm_or_ps(hi, sign), hi), f);
+        r.c[0] = r.c[1] = r.c[2] = r.c[3] = f;
+        break;
+    }
     case 4: {                                       /* rsq: 1/sqrt(|x|) */
         __m128 x = _mm_andnot_ps(_mm_set1_ps(-0.0f), c->c[0]);
         __m128 v = _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(x));
@@ -616,7 +651,7 @@ static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
 
 int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
 {
-    vec4x4 temp[12], opos, outregs[13];
+    vec4x4 temp[12], opos, outregs[13], vin[NV2A_VSH_INPUTS];
     int a0[4] = {0, 0, 0, 0};
     uint32_t s;
     int k, l;
@@ -635,20 +670,33 @@ int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
     outregs[3].c[3] = outregs[4].c[3] = _mm_set1_ps(1.0f);
     outregs[9].c[3] = outregs[10].c[3] = outregs[11].c[3]
                     = outregs[12].c[3] = _mm_set1_ps(1.0f);
+    /* Each input the program reads, as lanes, once -- not gathered from the
+     * four vertices again at every read. */
+    for (k = 0; k < NV2A_VSH_INPUTS; k++)
+        if (s_dec_inputs >> k & 1) {
+            __m128 r0 = _mm_loadu_ps(in[0][k]), r1 = _mm_loadu_ps(in[1][k]);
+            __m128 r2 = _mm_loadu_ps(in[2][k]), r3 = _mm_loadu_ps(in[3][k]);
+            _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+            vin[k].c[0] = r0; vin[k].c[1] = r1;
+            vin[k].c[2] = r2; vin[k].c[3] = r3;
+        }
 
     for (s = 0; s < s_dec_n; s++) {
         const VshIns *ins = &s_dec[s];
-        vec4x4 a = rd4(&ins->src[0], in, temp, &opos, a0);
-        vec4x4 b = rd4(&ins->src[1], in, temp, &opos, a0);
-        vec4x4 c = rd4(&ins->src[2], in, temp, &opos, a0);
-        vec4x4 mres, ires;
+        vec4x4 a, b, c, mres, ires;
 
-        memset(&mres, 0, sizeof mres);
-        memset(&ires, 0, sizeof ires);
+        if (ins->reads & 1) a = rd4(&ins->src[0], vin, temp, &opos, a0);
+        if (ins->reads & 2) b = rd4(&ins->src[1], vin, temp, &opos, a0);
+        if (ins->reads & 4) c = rd4(&ins->src[2], vin, temp, &opos, a0);
+        /* An idle unit's result is 0: an output may still name it. */
         if (ins->mac)
             mres = mac4(ins->mac, &a, &b, &c, a0);
+        else
+            memset(&mres, 0, sizeof mres);
         if (ins->ilu)
             ires = ilu4(ins->ilu, &c);
+        else
+            memset(&ires, 0, sizeof ires);
         if (ins->mac && ins->mac != 13 && ins->mac_mask) {
             vec4x4 *d = ins->tdst == 12 ? &opos
                       : (ins->tdst < 12 ? &temp[ins->tdst] : NULL);
