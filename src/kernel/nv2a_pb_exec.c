@@ -3060,6 +3060,16 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    /* RECOMP_VSH_TIME=1: fetch + vertex-program time per vertex, every 10 s,
+     * for A/B runs of the interpreter. */
+#if defined(_WIN32)
+    static int vtime = -1;
+    LARGE_INTEGER vt0;
+    if (vtime < 0)
+        vtime = getenv("RECOMP_VSH_TIME") != NULL;
+    if (vtime)
+        QueryPerformanceCounter(&vt0);
+#endif
     /* Four at a time (nv2a_vsh_run4, bit-identical to one at a time): the
      * vertex program was a third of the executor in Blinx 2's hub. A short
      * tail repeats its last vertex to fill the lanes. */
@@ -3079,6 +3089,24 @@ static void raster_batch_program(void)
         if (!nv2a_vsh_run4(ip, op))
             return;                                    /* no program loaded */
     }
+#if defined(_WIN32)
+    if (vtime) {
+        static uint64_t ticks, verts;
+        static DWORD last;
+        LARGE_INTEGER vt1, f;
+        QueryPerformanceCounter(&vt1);
+        ticks += (uint64_t)(vt1.QuadPart - vt0.QuadPart);
+        verts += n;
+        if (GetTickCount() - last > 10000 && verts) {
+            QueryPerformanceFrequency(&f);
+            fprintf(stderr, "[VSHTIME] %.1f ns/vertex over %llu vertices (%.0f ms)%c",
+                    1e9 * (double)ticks / (double)f.QuadPart / (double)verts,
+                    (unsigned long long)verts, 1e3 * (double)ticks / (double)f.QuadPart, 10);
+            ticks = verts = 0;
+            last = GetTickCount();
+        }
+    }
+#endif
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
