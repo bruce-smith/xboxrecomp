@@ -343,6 +343,7 @@ static struct {
     uint32_t tris_culled;
     uint32_t zeta_offset, zstencil_clear;
     uint32_t sem_offset, sem_releases;   /* semaphore (D3D fences) */
+    uint64_t csum;                       /* shaded colour sum (FRAME_SUMMARY=2) */
 } s_gpu;
 
 /* Deferred rasterisation (below): drain everything queued. Counted by call
@@ -651,7 +652,13 @@ static void dump_surface_bmp(void)
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
+    /* Flip dumps are named by flip number, which the frame summary
+     * (RECOMP_FRAME_SUMMARY) prints too, so a bad frame finds its draws. */
+    if (s_flip_dumping)
+        snprintf(path, sizeof path, "%s%05u.bmp", prefix, s_gpu.flips);
+    else
+        snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
+    seq++;
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -2057,6 +2064,7 @@ typedef struct {
 typedef struct {
     uint64_t depth_fail, pixels, written;
     uint32_t zpass, written_max;
+    uint64_t csum;                      /* r+g+b shaded, for the draw trace */
 } XfCount;
 
 /* Rows y0, y0+step, ... < y1 of triangle T. */
@@ -2144,6 +2152,7 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
                 if (!(P->color_mask & 0x01010101u))
                     continue;              /* colour writes off: depth only */
                 cnt->pixels++;
+                cnt->csum += ((argb >> 16) & 0xFF) + ((argb >> 8) & 0xFF) + (argb & 0xFF);
             }
             put_pixel(T->mem, T->bpp, x, y, argb);
         }
@@ -2248,6 +2257,7 @@ static void rq_count(const XfCount *c)
     s_gpu.xf_depth_fail += c->depth_fail;
     s_gpu.xf_pixels += c->pixels;
     s_gpu.zpass_count += c->zpass;
+    s_gpu.csum += c->csum;
     stats_fold(c->written, c->written_max);
 }
 
@@ -2490,7 +2500,7 @@ static void rq_kick(void)
         } else
 #endif
         {
-            XfCount c = {0, 0, 0, 0, 0};
+            XfCount c = {0, 0, 0, 0, 0, 0};
             xf_rows_queue(b->tri, b->n, &c);
             rq_count(&c);
             s_gpu.rq_inline++;
@@ -2749,7 +2759,7 @@ static void xfq_push(XfTri *T)
     int i;
 
     if (!rq_ready()) {
-        XfCount c = {0, 0, 0, 0, 0};
+        XfCount c = {0, 0, 0, 0, 0, 0};
         pix_capture(&s_live);
         T->ps = &s_live;
         xf_rows(T, T->miny, 1, &c);
@@ -3311,6 +3321,124 @@ static void frame_trace_flip(void)
     }
 }
 
+/* RECOMP_FRAME_SUMMARY=1: one line per presented frame -- which surfaces it
+ * drew into, how many draws and triangles each, and the visibility-test
+ * results it reported. Unlike the frame trace it does not drain per draw, so
+ * it leaves the timing alone and can run for thousands of frames; a frame
+ * that looks wrong in a flip dump (named by the same flip number) shows
+ * whether the title submitted something different or the same work came out
+ * differently. */
+#define FSUM_SURFS 12
+#define FSUM_REPS  24
+static int s_fsum = -1;
+static struct { uint32_t off, w, h, draws, tris; } s_fsum_s[FSUM_SURFS];
+static int s_fsum_n;
+static uint32_t s_fsum_rep[FSUM_REPS];
+static int s_fsum_nrep;
+#define FSUM_FOGS 6
+static struct { uint32_t mode, color; float p0, p1; uint32_t draws;
+                float omin, omax; } s_fsum_fog[FSUM_FOGS];
+static int s_fsum_nfog;
+#define FSUM_CLEARS 16
+static struct { uint32_t off, param, color, x, y, w, h, at; } s_fsum_clr[FSUM_CLEARS];
+static int s_fsum_nclr;
+static uint32_t s_fsum_draws;           /* draws this frame, for "at" */
+
+extern void xbox_WatchNote(uint32_t lo, uint32_t hi, uint32_t kind);
+extern volatile uint32_t g_watch_flip;
+
+static void fsum_draw(uint32_t tris)
+{
+    int i;
+    {
+        uint32_t lo = dma_resolve(s_gpu.color_offset);
+        int st;
+        xbox_WatchNote(lo, lo + (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, 1);
+        for (st = 0; st < 4; st++) {
+            uint32_t tlo, thi;
+            if (draw_samples(st, &tlo, &thi))
+                xbox_WatchNote(tlo, thi, 2);
+        }
+    }
+    for (i = 0; i < s_fsum_n; i++)
+        if (s_fsum_s[i].off == s_gpu.color_offset && s_fsum_s[i].w == s_gpu.clip_w)
+            break;
+    if (i == s_fsum_n) {
+        if (s_fsum_n == FSUM_SURFS)
+            return;
+        s_fsum_n++;
+        s_fsum_s[i].off = s_gpu.color_offset;
+        s_fsum_s[i].w = s_gpu.clip_w;
+        s_fsum_s[i].h = s_gpu.clip_h;
+        s_fsum_s[i].draws = s_fsum_s[i].tris = 0;
+    }
+    s_fsum_s[i].draws++;
+    s_fsum_s[i].tris += tris;
+    s_fsum_draws++;
+    if (s_gpu.fog_enable && tris && (s_gpu.xf_mode & 3) == 2) {
+        float of = s_xf[0].fog[0];
+        for (i = 0; i < s_fsum_nfog; i++)
+            if (s_fsum_fog[i].mode == s_gpu.fog_mode
+             && s_fsum_fog[i].color == s_gpu.fog_color
+             && s_fsum_fog[i].p0 == s_gpu.fog_param[0]
+             && s_fsum_fog[i].p1 == s_gpu.fog_param[1])
+                break;
+        if (i == s_fsum_nfog) {
+            if (s_fsum_nfog == FSUM_FOGS)
+                return;
+            s_fsum_nfog++;
+            s_fsum_fog[i].mode = s_gpu.fog_mode;
+            s_fsum_fog[i].color = s_gpu.fog_color;
+            s_fsum_fog[i].p0 = s_gpu.fog_param[0];
+            s_fsum_fog[i].p1 = s_gpu.fog_param[1];
+            s_fsum_fog[i].draws = 0;
+            s_fsum_fog[i].omin = s_fsum_fog[i].omax = of;
+        }
+        s_fsum_fog[i].draws++;
+        if (of < s_fsum_fog[i].omin) s_fsum_fog[i].omin = of;
+        if (of > s_fsum_fog[i].omax) s_fsum_fog[i].omax = of;
+    }
+}
+
+static void fsum_flip(void)
+{
+    int i;
+    if (s_fsum <= 0)
+        return;
+    {
+        static uint64_t px0, zf0;
+        static uint32_t dg0, off0, bh0, cu0;
+        fprintf(stderr, "[FSUM] flip %u present %08X | px %llu zfail %llu degen %u"
+                " off %u behind %u culled %u |", s_gpu.flips, s_gpu.drawn_offset,
+                (unsigned long long)(s_gpu.xf_pixels - px0),
+                (unsigned long long)(s_gpu.xf_depth_fail - zf0),
+                s_gpu.xf_degenerate - dg0, s_gpu.xf_offscreen - off0,
+                s_gpu.tris_behind - bh0, s_gpu.tris_culled - cu0);
+        px0 = s_gpu.xf_pixels; zf0 = s_gpu.xf_depth_fail;
+        dg0 = s_gpu.xf_degenerate; off0 = s_gpu.xf_offscreen;
+        bh0 = s_gpu.tris_behind; cu0 = s_gpu.tris_culled;
+    }
+    for (i = 0; i < s_fsum_n; i++)
+        fprintf(stderr, " %08X %ux%u d%u t%u;", s_fsum_s[i].off, s_fsum_s[i].w,
+                s_fsum_s[i].h, s_fsum_s[i].draws, s_fsum_s[i].tris);
+    fprintf(stderr, " | rep");
+    for (i = 0; i < s_fsum_nrep; i++)
+        fprintf(stderr, " %u", s_fsum_rep[i]);
+    fprintf(stderr, " | clr");
+    for (i = 0; i < s_fsum_nclr; i++)
+        fprintf(stderr, " %08X %X %08X %u,%u+%ux%u @%u;", s_fsum_clr[i].off,
+                s_fsum_clr[i].param, s_fsum_clr[i].color, s_fsum_clr[i].x,
+                s_fsum_clr[i].y, s_fsum_clr[i].w, s_fsum_clr[i].h, s_fsum_clr[i].at);
+    fprintf(stderr, " | fog");
+    for (i = 0; i < s_fsum_nfog; i++)
+        fprintf(stderr, " %X/%08X/%g/%g d%u o%g..%g;", s_fsum_fog[i].mode,
+                s_fsum_fog[i].color, s_fsum_fog[i].p0, s_fsum_fog[i].p1,
+                s_fsum_fog[i].draws, s_fsum_fog[i].omin, s_fsum_fog[i].omax);
+    fputc(10, stderr);
+    s_fsum_n = s_fsum_nrep = s_fsum_nfog = s_fsum_nclr = 0;
+    s_fsum_draws = 0;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3345,6 +3473,46 @@ static void draw_primitive(void)
         uint32_t b0 = s_gpu.tris_behind, z0 = s_gpu.zpass_count;
         uint64_t p0 = s_gpu.pixels, f0 = s_gpu.xf_depth_fail;
         raster_batch();
+        if (s_fsum < 0)
+        {
+            const char *e = getenv("RECOMP_FRAME_SUMMARY");
+            s_fsum = e ? (*e == '2' ? 2 : 1) : 0;
+        }
+        if (s_fsum)
+            fsum_draw(s_gpu.tris_drawn - t0);
+        if (s_fsum == 2 && s_gpu.tris_drawn != t0) {
+            /* One line per draw: what it read and what it shaded. Needs
+             * RECOMP_RASTER_BATCH=0 so the colour sum is this draw's. */
+            static uint64_t c0, x0;
+            int st;
+            rq_sync();
+            fprintf(stderr, "[FDRAW] %u %u %08X px %llu c %llu", s_gpu.flips,
+                    s_gpu.draws, s_gpu.color_offset,
+                    (unsigned long long)(s_gpu.xf_pixels - x0),
+                    (unsigned long long)(s_gpu.csum - c0));
+            c0 = s_gpu.csum;
+            x0 = s_gpu.xf_pixels;
+            for (st = 0; st < 4; st++) {
+                uint32_t lo, hi;
+                if (draw_samples(st, &lo, &hi)) {
+                    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + lo;
+                    uint32_t h = 2166136261u, k, n = hi - lo < 4096 ? hi - lo : 4096;
+                    for (k = 0; k < n; k += 4)
+                        h = (h ^ *(const uint32_t *)(m + k)) * 16777619u;
+                    fprintf(stderr, " t%d %08X f%02X h%08X", st, lo,
+                            s_gpu.texs[st].color, h);
+                    if (s_gpu.texs[st].color == 0x0B && s_gpu.texs[st].palette) {
+                        const uint32_t *pal = (const uint32_t *)
+                            ((const uint8_t *)xbox_GetMemoryOffset() + s_gpu.texs[st].palette);
+                        h = 2166136261u;
+                        for (k = 0; k < 256; k++)
+                            h = (h ^ pal[k]) * 16777619u;
+                        fprintf(stderr, " pal %08X h%08X", s_gpu.texs[st].palette, h);
+                    }
+                }
+            }
+            fputc(10, stderr);
+        }
         if (s_ftrace == 2) {
             fprintf(stderr, "[FTRACE] alpha %u %X ref %X | zpass %u %u zfail %llu"
                     " | cmask %08X%c", s_gpu.alpha_test, s_gpu.alpha_func,
@@ -3374,6 +3542,13 @@ static void draw_primitive(void)
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
                         s_xf[2].pos[0], s_xf[2].pos[1], 10);
+            if ((s_gpu.xf_mode & 3) == 2)
+                fprintf(stderr, "[FTRACE]     d0 %.3g %.3g %.3g %.3g  d1 %.3g %.3g %.3g %.3g"
+                        "  ofog %g | fog %u mode %X col %08X p %g %g%c",
+                        s_xf[0].d0[0], s_xf[0].d0[1], s_xf[0].d0[2], s_xf[0].d0[3],
+                        s_xf[0].d1[0], s_xf[0].d1[1], s_xf[0].d1[2], s_xf[0].d1[3],
+                        s_xf[0].fog[0], s_gpu.fog_enable, s_gpu.fog_mode,
+                        s_gpu.fog_color, s_gpu.fog_param[0], s_gpu.fog_param[1], 10);
             if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
@@ -3921,6 +4096,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 force = getenv("RECOMP_ZPASS_FORCE") != NULL;
             if (force)
                 zc = 100000;
+            if (s_fsum > 0 && s_fsum_nrep < FSUM_REPS)
+                s_fsum_rep[s_fsum_nrep++] = zc;
             memcpy(mem + at + 8, &zc, 4);
         }
         memset(mem + at + 12, 0, 4);
@@ -3940,6 +4117,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
+        if (s_fsum > 0 && s_fsum_nclr < FSUM_CLEARS) {
+            int c = s_fsum_nclr++;
+            s_fsum_clr[c].off = s_gpu.color_offset;
+            s_fsum_clr[c].param = param;
+            s_fsum_clr[c].color = s_gpu.clear_color;
+            s_fsum_clr[c].x = s_gpu.clip_x; s_fsum_clr[c].y = s_gpu.clip_y;
+            s_fsum_clr[c].w = s_gpu.clip_w; s_fsum_clr[c].h = s_gpu.clip_h;
+            s_fsum_clr[c].at = s_fsum_draws;
+        }
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
@@ -4084,6 +4270,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     dump_surface_bmp();
             }
         }
+        fsum_flip();
+        g_watch_flip = s_gpu.flips;
         s_gpu.drawn_stale = 1;
 
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {

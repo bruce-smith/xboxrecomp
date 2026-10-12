@@ -12,6 +12,7 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#include <intrin.h>
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
@@ -2994,6 +2995,57 @@ static int g_heap_block_count = 0;
  * the main one), and the table above is shared state. */
 static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 
+/* RECOMP_ZERO_WATCH=1 (diagnostic): the NV2A executor notes the surfaces it
+ * renders into and the textures it samples (xbox_WatchNote), and every
+ * allocation's zero fill and every free is checked against them. A block
+ * handed out over memory a queued or presented draw still uses shows up here
+ * by name instead of as a black band in one frame. */
+static struct { uint32_t lo, hi, kind, flip; } g_watch[64];
+static volatile LONG g_watch_next;
+volatile uint32_t g_watch_flip;
+
+static int watch_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_ZERO_WATCH") != NULL;
+    return on;
+}
+
+void xbox_WatchNote(uint32_t lo, uint32_t hi, uint32_t kind)
+{
+    int i;
+    if (!watch_on() || hi <= lo)
+        return;
+    for (i = 0; i < 64; i++)
+        if (g_watch[i].lo == lo && g_watch[i].hi == hi) {
+            g_watch[i].flip = g_watch_flip;
+            g_watch[i].kind = kind;
+            return;
+        }
+    i = (int)(InterlockedIncrement(&g_watch_next) & 63);
+    g_watch[i].lo = lo; g_watch[i].hi = hi; g_watch[i].kind = kind;
+    g_watch[i].flip = g_watch_flip;
+}
+
+void xbox_WatchCheck(uint32_t va, uint32_t size, const char *who)
+{
+    int i;
+    if (!watch_on() || !size)
+        return;
+    for (i = 0; i < 64; i++) {
+        if (va < g_watch[i].hi && g_watch[i].lo < va + size
+            && g_watch_flip - g_watch[i].flip < 8) {
+            fprintf(stderr, "  [ZWATCH] %s 0x%08X+%u overlaps %s 0x%08X-0x%08X"
+                    " used at flip %u (now %u) ret %p%c", who, va, size,
+                    g_watch[i].kind == 1 ? "surface" : "texture",
+                    g_watch[i].lo, g_watch[i].hi, g_watch[i].flip, g_watch_flip,
+                    _ReturnAddress(), 10);
+            return;
+        }
+    }
+}
+
 /* RECOMP_HEAP_RECLAIM: give memory back properly.
  *
  * Reuse below hands a whole freed block to whatever asks next, however small,
@@ -3052,6 +3104,7 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
         g_heap_blocks[i].free = 0;
         if (back && !heap_insert_free(i + 1, start + size, back))
             g_heap_blocks[i].size += back;   /* table full: keep it attached */
+        xbox_WatchCheck(start, size, "heap reuse");
         memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
         return start;
     }
@@ -3324,8 +3377,10 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
     if (reclaim)
         ReleaseSRWLockExclusive(&g_contig_lock);
-    if (result)
+    if (result) {
+        xbox_WatchCheck(result, size, "contig alloc");
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    }
     return result;
 }
 
@@ -3341,6 +3396,7 @@ int xbox_ContiguousFree(uint32_t addr)
     for (i = 0; i < g_contig_block_count; i++) {
         if (g_contig_blocks[i].addr != addr || g_contig_blocks[i].free)
             continue;
+        xbox_WatchCheck(addr, g_contig_blocks[i].size, "contig free");
         g_contig_blocks[i].free = 1;
         found = 1;
         if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
