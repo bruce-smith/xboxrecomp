@@ -198,13 +198,19 @@ static void note_jump(uint32_t from, uint32_t target)
     }
 }
 
+/* in_call: 0 a segment [va, end_va) whose JUMP ends it, 1 a subroutine (up
+ * to its RETURN), 2 the ring: from GET to PUT (end_va), following JUMPs like
+ * the GPU's own fetch, so a wrap is taken wherever the title put it. */
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                         uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+    int ring = in_call == 2;
 
-    while (va < end_va && words < 0x100000u) {
+    if (ring)
+        in_call = 0;
+    while ((ring ? va != end_va : va < end_va) && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
@@ -215,7 +221,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             (*jumps)++;
             if (!in_call) {
                 note_jump(va - 4, target);
-                break;                        /* the ring: a jump ends it */
+                if (!ring)
+                    break;                    /* a segment: a jump ends it */
+                va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+                continue;
             }
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
@@ -240,7 +249,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && (ring || va < end_va); i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
@@ -259,16 +268,45 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
+static int pb_scan_enabled(void)
+{
+    static int scan = -1;
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (scan < 0)
+        scan = getenv("RECOMP_PB_SCAN") != NULL;
+    return scan || s_exec_enabled;
+}
+
+/* Everything the title submitted since the last kick: the ring from the old
+ * PUT (where GET now stands) to the new one, through the wrap JUMP if there
+ * is one. Guessing the wrap from the highest PUT seen instead skipped the
+ * commands between that and the real JUMP -- fences among them, and a title
+ * waiting on one of those never woke. */
+void nv2a_pb_scan_ring(uint32_t get_va, uint32_t put_va)
+{
+    uint32_t jumps = 0, unknown = 0, words;
+
+    if (!pb_scan_enabled() || get_va == put_va)
+        return;
+    words = pb_walk(get_va, put_va, 2, &jumps, &unknown);
+    if (words >= 0x100000u) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "[PB] ring walk 0x%08X -> 0x%08X never reached"
+                            " PUT; stream out of step?\n", get_va, put_va);
+    }
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
 
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    static int scan = -1;
-    if (scan < 0)
-        scan = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(scan || s_exec_enabled) || end_va <= start_va)
+    if (!pb_scan_enabled() || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;

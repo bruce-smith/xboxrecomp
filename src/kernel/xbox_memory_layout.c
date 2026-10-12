@@ -1016,7 +1016,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
+                    extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
@@ -1039,34 +1039,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * forward segments dropped everything written across
                      * the seam -- one whole submission each time round.
                      *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
-                        }
-                    }
+                     * So the walk follows the stream from the old PUT to
+                     * the new one through the title's own wrap JUMP, as the
+                     * GPU's fetch does. It used to guess the ring's end from
+                     * the highest PUT seen, which fell short whenever the
+                     * last submission before a wrap was never seen as a PUT
+                     * of its own; the commands between the guess and the
+                     * JUMP were skipped, and with them any fence a title
+                     * then waited on forever. */
+                    if (last_put && put != last_put)
+                        nv2a_pb_scan_ring(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                          XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
