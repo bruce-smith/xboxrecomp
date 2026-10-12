@@ -1491,10 +1491,13 @@ static void bridge_KeQueryPerformanceFrequency(void)
 }
 
 /* ── KeQuerySystemTime (ordinal 128) ─────────────────────── */
+static void dpc_note_clock_read(void);   /* with the DPC runner below */
+
 static void bridge_KeQuerySystemTime(void)
 {
     uint32_t time_ptr = STACK_ARG(0);
     xbox_KeQuerySystemTime(XBOX_TO_NATIVE(time_ptr));
+    dpc_note_clock_read();
     g_eax = 0;
 }
 
@@ -2053,6 +2056,41 @@ static volatile ULONGLONG g_dpc_running_since;
 static volatile DWORD g_dpc_running_tid;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 
+/* Clock reads by the DPC now running, counted on its own thread.
+ *
+ * The results-screen freeze made ~60k KeQuerySystemTime calls in one DPC
+ * that never returned. DirectSound's timer-list DPC (sub_003348A8 in Blinx 2)
+ * reads the clock once per pass, so the count is its iteration count; any
+ * other DPC that polls the clock for something that never comes shows up the
+ * same way. Warned at 1k/10k/100k, with the game's hook, and reported when
+ * the DPC finally returns. */
+static unsigned g_dpc_clock_reads;
+static xbox_dpc_spin_hook_t g_dpc_spin_hook;
+
+void xbox_SetDpcSpinHook(xbox_dpc_spin_hook_t hook)
+{
+    g_dpc_spin_hook = hook;
+}
+
+static void dpc_note_clock_read(void)
+{
+    unsigned n;
+    uint32_t va;
+
+    if (!g_dpc_running_routine || GetCurrentThreadId() != g_dpc_running_tid)
+        return;
+    n = ++g_dpc_clock_reads;
+    if (n != 1000 && n != 10000 && n != 100000)
+        return;
+    va = g_dpc_running_va;
+    fprintf(stderr, "  [DPCSPIN] DPC 0x%08X routine 0x%08X: %u clock reads in"
+            " one run, %llu ms\n", va, g_dpc_running_routine, n,
+            GetTickCount64() - g_dpc_running_since);
+    if (g_dpc_spin_hook)
+        g_dpc_spin_hook(va, g_dpc_running_routine, BRIDGE_MEM32(va + 16), n);
+    fflush(stderr);
+}
+
 void xbox_DpcDumpRunning(void)
 {
     uint32_t routine = g_dpc_running_routine, esp = g_dpc_entry_esp, i, shown = 0;
@@ -2146,9 +2184,16 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         g_dpc_entry_esp = g_esp;
         g_dpc_running_since = GetTickCount64();
         g_dpc_running_tid = GetCurrentThreadId();
+        g_dpc_clock_reads = 0;
         g_dpc_running_routine = routine;
         fn();
         g_dpc_running_routine = 0;
+        if (g_dpc_clock_reads >= 1000) {
+            fprintf(stderr, "  [DPCSPIN] DPC 0x%08X routine 0x%08X returned after"
+                    " %u clock reads, %llu ms\n", dpc_va, routine,
+                    g_dpc_clock_reads, GetTickCount64() - g_dpc_running_since);
+            fflush(stderr);
+        }
         xbox_IrqlLeaveInterrupt(_irql);
     }
     return 1;

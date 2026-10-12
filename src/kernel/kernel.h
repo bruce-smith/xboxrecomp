@@ -813,6 +813,13 @@ void    xbox_IrqlLeaveInterrupt(int saved);
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
 void    xbox_DpcDumpRunning(void);              /* the DPC running now, if any */
+/* Called on the DPC's own thread when one invocation of a DPC has made 1000,
+ * 10000 and 100000 KeQuerySystemTime calls -- a loop that reads the clock
+ * once per pass and never finds what it waits for. The game registers it to
+ * dump the structures that DPC walks. */
+typedef void (*xbox_dpc_spin_hook_t)(uint32_t dpc_va, uint32_t routine,
+                                     uint32_t context, unsigned clock_reads);
+void    xbox_SetDpcSpinHook(xbox_dpc_spin_hook_t hook);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
