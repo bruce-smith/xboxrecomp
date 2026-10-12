@@ -242,6 +242,14 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * 0x400B10 (bits 2-6), which D3D also compares before calling the GPU idle.
  * Returns 0 when a target is registered (release done), -1 otherwise. */
 void xbox_Nv2aSemaphoreAt(uint32_t device_ptr_va, uint32_t base_ptr_off);
+/* A PGRAPH register the pushbuffer sets, written as the executor reaches it
+ * (0x400B10: the position D3D reads the GPU's progress from). */
+void xbox_Nv2aPgraphWrite(uint32_t offset, uint32_t value);
+/* Clear D3D's kick bit (0x100410 bit 16) now, from inside a walk. */
+void xbox_Nv2aAckFlush(void);
+/* Raise PGRAPH NOTIFY for `method` with `param` and wait until the title's
+ * handler has serviced it. */
+void xbox_Nv2aNotify(uint32_t method, uint32_t param);
 int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value);
 
 void xbox_MemoryLayoutShutdown(void);

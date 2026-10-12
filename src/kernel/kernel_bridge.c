@@ -2651,6 +2651,20 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* A GPU interrupt the pushbuffer asked for (a NOP with a notify parameter,
+ * xbox_Nv2aNotify), raised from this thread like the vblank: it has the
+ * guest stack and TIB the ISR and its DPC need. The event cuts the thread's
+ * 10 ms sleep short, because the GPU -- and the executor -- waits on it. */
+static volatile LONG g_nv2a_irq_req;
+static HANDLE g_timer_wake;
+
+void xbox_Nv2aRequestInterrupt(void)
+{
+    InterlockedExchange(&g_nv2a_irq_req, 1);
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2678,12 +2692,18 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        if (g_timer_wake)
+            WaitForSingleObject(g_timer_wake, 10);
+        else
+            Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        if (InterlockedExchange(&g_nv2a_irq_req, 0))
+            kernel_raise_interrupt(NV2A_VECTOR);
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

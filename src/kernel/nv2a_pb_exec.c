@@ -4004,6 +4004,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         tex_stage_method(method, param);
         return;
     }
+    if (subch == 5 && method == 0x0310) {
+        /* D3D's InsertFence puts this before every fence's semaphore
+         * release: ((pushbuffer address << 3) | fence & 0x1F) << 2 | epoch.
+         * The GPU latches it into PGRAPH 0x400B10, and that -- not DMA GET
+         * -- is where D3D reads how far the GPU has consumed the pushbuffer
+         * (Blinx 2's sub_002E7E00: (reg >> 5) & 0x7FFFFFC | 0x80000000).
+         * Unexecuted, the register only ever held the fence bits the
+         * semaphore release wrote, so D3D's idea of the GPU's position was
+         * address 0. */
+        xbox_Nv2aPgraphWrite(0x400B10u, param);
+        return;
+    }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
@@ -4314,7 +4326,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * completion: NO_OPERATION, WAIT_FOR_IDLE, BREAK_VERTEX_BUFFER_CACHE.
      * Ranked as unhandled they were three of the top four entries in Blinx
      * 2's hub and pushed the methods that matter down the list. */
-    case 0x0100: case 0x0110: case 0x1710:
+    case 0x0100:                                  /* NO_OPERATION */
+        /* With a parameter it is a software notify: the GPU stops and
+         * interrupts, and D3D's handler acts on the parameter. Blinx 2's
+         * fence wait plants one (param 5) when the GPU is far behind and
+         * sleeps until the interrupt wakes it. */
+        if (param) {
+            rq_kick();               /* hand over what precedes it */
+            xbox_Nv2aNotify(method, param);
+        }
+        break;
+    case 0x0110: case 0x1710:
         break;
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */

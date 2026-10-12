@@ -48,7 +48,16 @@ static uint32_t s_tot_calls;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern void xbox_Nv2aAckFlush(void);
 static int s_exec_enabled = -1;
+
+/* RECOMP_EARLY_ACK=1: ack D3D's kick every 32 words of a walk instead of
+ * only between walks, so the title builds its next submission while this
+ * one executes. On hardware the bit clears as soon as the write-combine
+ * buffers flush, long before the GPU gets to the commands. Off by default
+ * until it has soaked: with D3D's GPU position (0x400B10) unemulated it
+ * deadlocked in the title's fence wait. */
+static int s_early_ack = -1;
 
 /* Slot of each (subchannel, method) in s_seen, plus one; 0 = not seen yet.
  * note runs for every word of the stream -- inline vertex data included --
@@ -214,6 +223,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
+        if (s_early_ack > 0 && !(words & 0x1Fu))
+            xbox_Nv2aAckFlush();
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
@@ -275,6 +286,10 @@ static int pb_scan_enabled(void)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (scan < 0)
         scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (s_early_ack < 0) {
+        const char *e = getenv("RECOMP_EARLY_ACK");
+        s_early_ack = e && *e == '1';
+    }
     return scan || s_exec_enabled;
 }
 

@@ -608,6 +608,84 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
+/* Ack D3D's kick (the PFB flush bit, 0x100410 bit 16) now. */
+void xbox_Nv2aAckFlush(void)
+{
+    volatile uint32_t *r;
+    if (!g_nv2a_memory)
+        return;
+    r = (volatile uint32_t *)((char *)g_nv2a_memory + 0x100410u);
+    if (*r & 0x00010000u)
+        *r &= ~0x00010000u;
+}
+
+/* The title's vblank acknowledgement, seen: see nv2a_ack_thread. */
+static void nv2a_vblank_ack(volatile uint8_t *regs)
+{
+    volatile uint32_t *pcrtc = (volatile uint32_t *)(regs + 0x600100);
+    volatile uint32_t *pmc   = (volatile uint32_t *)(regs + 0x000100);
+    uint32_t p = *pcrtc;
+    if ((p & 1u) && !(p & XBOX_NV2A_VBLANK_MARK))
+        *pcrtc = p = 0;                             /* acknowledged */
+    if (!(p & 1u) && (*pmc & (1u << 24)))
+        *pmc &= ~(1u << 24);
+}
+
+/* PGRAPH NOTIFY for a method the pushbuffer flagged (NO_OPERATION with a
+ * parameter): the registers D3D's handler (Blinx 2's sub_002EAA50) reads,
+ * then the interrupt. The handler clears 0x400720 on entry and sets it on
+ * exit; the GPU stalls at a notify until it is serviced, and so does this,
+ * so the executor's own ack loop cannot clear the bits first. */
+void xbox_Nv2aNotify(uint32_t method, uint32_t param)
+{
+    extern void xbox_Nv2aRequestInterrupt(void);
+    volatile uint8_t *r = (volatile uint8_t *)g_nv2a_memory;
+    DWORD t0;
+    static unsigned n, slow;
+
+    if (!r)
+        return;
+    *(volatile uint32_t *)(r + 0x400720) = 0;
+    *(volatile uint32_t *)(r + 0x400704) = method & 0x1FFCu;
+    *(volatile uint32_t *)(r + 0x400708) = param;
+    *(volatile uint32_t *)(r + 0x400108) = 1;           /* NSOURCE: notify */
+    *(volatile uint32_t *)(r + 0x400100) |= 1u;          /* INTR: NOTIFY */
+    *(volatile uint32_t *)(r + 0x000100) |= 1u << 12;    /* PMC: PGRAPH */
+    MemoryBarrier();
+    xbox_Nv2aRequestInterrupt();
+    t0 = GetTickCount();
+    while (!*(volatile uint32_t *)(r + 0x400720) && GetTickCount() - t0 < 100) {
+        /* This thread is also the one that sees the title's vblank
+         * acknowledgement, and D3D's DPC handles a pending vblank first,
+         * spinning until PMC bit 24 drops: keep doing that job meanwhile,
+         * or the DPC never reaches the notify. */
+        static int vblank = -1;
+        if (vblank < 0)
+            vblank = getenv("RECOMP_VBLANK") != NULL;
+        if (vblank)
+            nv2a_vblank_ack(r);
+        Sleep(0);
+    }
+    if (!*(volatile uint32_t *)(r + 0x400720) && slow++ < 8)
+        fprintf(stderr, "  [NV2A] notify 0x%X param 0x%X not serviced in 100 ms"
+                " (PMC %08X EN %08X PGRAPH_INTR %08X)\n", method, param,
+                *(volatile uint32_t *)(r + 0x000100),
+                *(volatile uint32_t *)(r + 0x000140),
+                *(volatile uint32_t *)(r + 0x400100));
+    *(volatile uint32_t *)(r + 0x400100) &= ~1u;
+    *(volatile uint32_t *)(r + 0x400108) = 0;
+    *(volatile uint32_t *)(r + 0x000100) &= ~(1u << 12);
+    if (n++ < 4)
+        fprintf(stderr, "  [NV2A] notify 0x%X param %u -> serviced=%u\n", method,
+                param, *(volatile uint32_t *)(r + 0x400720));
+}
+
+void xbox_Nv2aPgraphWrite(uint32_t offset, uint32_t value)
+{
+    if (g_nv2a_memory && offset < XBOX_NV2A_SIZE)
+        *(volatile uint32_t *)((char *)g_nv2a_memory + offset) = value;
+}
+
 static uint32_t g_sem_device_ptr_va, g_sem_base_ptr_off;
 
 void xbox_Nv2aSemaphoreAt(uint32_t device_ptr_va, uint32_t base_ptr_off)
@@ -638,9 +716,13 @@ int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
             fprintf(stderr, "  NV2A semaphore: releasing at 0x%08X\n", last_at);
         }
     }
-    if (g_nv2a_memory)
-        *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10u)
-            = (value << 2) & 0x7Cu;
+    if (g_nv2a_memory) {
+        /* Only the fence bits: the rest is the pushbuffer position the
+         * fence's 0x310 method stored (xbox_Nv2aPgraphWrite). */
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10u);
+        *r = (*r & ~0x7Cu) | ((value << 2) & 0x7Cu);
+    }
     MemoryBarrier();
     *(volatile uint32_t *)((uintptr_t)(base + offset) + g_memory_offset) = value;
     return 0;
@@ -946,15 +1028,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
      * what ends D3D's "ack, then spin while PMC_INTR_0 says PCRTC" loop. */
     int vblank = getenv("RECOMP_VBLANK") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        if (vblank) {
-            volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
-            volatile uint32_t *pmc   = (volatile uint32_t *)((char *)regs + 0x000100);
-            uint32_t p = *pcrtc;
-            if ((p & 1u) && !(p & XBOX_NV2A_VBLANK_MARK))
-                *pcrtc = p = 0;                     /* acknowledged */
-            if (!(p & 1u) && (*pmc & (1u << 24)))
-                *pmc &= ~(1u << 24);
-        }
+        if (vblank)
+            nv2a_vblank_ack((volatile uint8_t *)regs);
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
