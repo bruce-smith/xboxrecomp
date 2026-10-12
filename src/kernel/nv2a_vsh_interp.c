@@ -224,6 +224,34 @@ static void decode_src(const uint32_t *ins, int which, VshSrc *d)
     d->idx = (uint16_t)(d->mux == 2 ? field(ins, 1, 9, 4) : field(ins, 1, 13, 8));
 }
 
+/* RECOMP_VSH_DUMP: disassemble each distinct program once, when decoded. */
+static void maybe_dump(void)
+{
+    static int dump = -1;
+    static uint32_t dumped[16];
+    static int ndumped;
+
+    if (dump < 0)
+        dump = getenv("RECOMP_VSH_DUMP") != NULL;
+    if (dump && ndumped < 16) {
+        /* By content: titles reload different programs into the same slot. */
+        uint32_t h = 2166136261u, t;
+        int i, seen = 0;
+        for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+            for (i = 0; i < 4; i++)
+                h = (h ^ s_program[t][i]) * 16777619u;
+            if (field(s_program[t], 3, 0, 1))
+                break;
+        }
+        for (i = 0; i < ndumped; i++)
+            if (dumped[i] == h) seen = 1;
+        if (!seen) {
+            dumped[ndumped++] = h;
+            dump_program(s_start_slot);
+        }
+    }
+}
+
 static void decode_program(void)
 {
     uint32_t s;
@@ -262,6 +290,7 @@ static void decode_program(void)
             break;
     }
     s_dec_valid = 1;
+    maybe_dump();
 }
 
 static vec4 read_src(const VshSrc *d, const float in[NV2A_VSH_INPUTS][4],
@@ -386,33 +415,10 @@ static vec4 run_ilu(uint32_t op, vec4 c)
 
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
-    static int dump = -1;
-    static uint32_t dumped[16];
-    static int ndumped;
     vec4 temp[12], opos;
     float outregs[13][4];
     int a0 = 0;
     uint32_t s;
-
-    if (dump < 0)
-        dump = getenv("RECOMP_VSH_DUMP") != NULL;
-    if (dump && ndumped < 16) {
-        /* By content: titles reload different programs into the same slot. */
-        uint32_t h = 2166136261u, t;
-        int i, seen = 0;
-        for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
-            for (i = 0; i < 4; i++)
-                h = (h ^ s_program[t][i]) * 16777619u;
-            if (field(s_program[t], 3, 0, 1))
-                break;
-        }
-        for (i = 0; i < ndumped; i++)
-            if (dumped[i] == h) seen = 1;
-        if (!seen) {
-            dumped[ndumped++] = h;
-            dump_program(s_start_slot);
-        }
-    }
 
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
