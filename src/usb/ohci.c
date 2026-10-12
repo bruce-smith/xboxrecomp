@@ -1228,14 +1228,33 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * moves. */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
+            uint32_t old_fn = hc->reg[HcFmNumber / 4];
+            uint32_t new_fn = (old_fn + OHCI_TICK_MS) & 0xFFFFu;
 
-            hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+            hc->reg[HcFmNumber / 4] = new_fn;
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+                wr32(hcca + 0x80, new_fn);
             STATUS_SET(hc, INTR_SF);
+
+            /* FrameNumberOverflow: set whenever bit 15 of the frame number
+             * toggles, after HccaFrameNumber has been written (OHCI 1.0a
+             * 7.1.4). Drivers keep the high bits of a 32-bit frame count
+             * themselves and advance them on this interrupt -- XPP's handler
+             * (0x0036D528) adds 0x8000 to [hcd+0x418] per toggle. It was
+             * never raised, so XPP's extended frame number fell back by
+             * 65536 at every wrap of the 16-bit counter. It enables FNO, so
+             * it is owed it. */
+            if ((old_fn ^ new_fn) & 0x8000u) {
+                static unsigned n;
+                STATUS_SET(hc, INTR_FNO);
+                if (n++ < 4) {
+                    fprintf(stderr, "  [OHCI%d] frame number %04X -> %04X: "
+                            "FNO\n", hc->index, old_fn, new_fn);
+                    fflush(stderr);
+                }
+            }
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
