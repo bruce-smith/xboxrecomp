@@ -288,6 +288,9 @@ void xbox_WatchdogStart(void);
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
+/* Another host thread's native stack, named through the PDB; suspends it for
+ * the walk. Lifted guest calls are host calls, so this is the guest chain. */
+void xbox_DumpHostStack(void *thread, const char *name, int depth);
 void xbox_WatchInit(void);
 
 /* ================================================================

@@ -1789,6 +1789,16 @@ static void wd_host_stack(HANDLE th, const char *name, int depth)
     }
     ResumeThread(th);
 }
+
+void xbox_DumpHostStack(void *thread, const char *name, int depth)
+{
+    wd_host_stack((HANDLE)thread, name, depth);
+}
+#else
+void xbox_DumpHostStack(void *thread, const char *name, int depth)
+{
+    (void)thread; (void)name; (void)depth;
+}
 #endif
 
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)

@@ -2050,6 +2050,7 @@ static void bridge_HalReadSMCTrayState(void)
  * kernel_run_dpc's own. These name it. */
 static volatile uint32_t g_dpc_running_routine, g_dpc_running_va, g_dpc_entry_esp;
 static volatile ULONGLONG g_dpc_running_since;
+static volatile DWORD g_dpc_running_tid;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 
 void xbox_DpcDumpRunning(void)
@@ -2072,6 +2073,26 @@ void xbox_DpcDumpRunning(void)
         }
     }
     fprintf(stderr, "\n");
+    /* The words above are a hint; the host stack is the chain. Every lifted
+     * guest call is a host call, so the DPC thread's native frames name each
+     * guest function from the DPC routine down to the one that does not
+     * return. Several samples, so a spin shows its loop rather than whichever
+     * callee it happened to be in. */
+    {
+        DWORD tid = g_dpc_running_tid;
+        HANDLE th = (tid && tid != GetCurrentThreadId())
+            ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT
+                         | THREAD_QUERY_INFORMATION, FALSE, tid) : NULL;
+        if (th) {
+            int k;
+            for (k = 0; k < 4 && g_dpc_running_routine == routine; k++) {
+                if (k)
+                    Sleep(20);
+                xbox_DumpHostStack(th, "[DPC] host stack", 24);
+            }
+            CloseHandle(th);
+        }
+    }
     fflush(stderr);
 }
 
@@ -2124,6 +2145,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         g_dpc_running_va = dpc_va;
         g_dpc_entry_esp = g_esp;
         g_dpc_running_since = GetTickCount64();
+        g_dpc_running_tid = GetCurrentThreadId();
         g_dpc_running_routine = routine;
         fn();
         g_dpc_running_routine = 0;
