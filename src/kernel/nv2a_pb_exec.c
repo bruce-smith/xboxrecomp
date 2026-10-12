@@ -554,6 +554,21 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
+/* Vertex-program input `a` of vertex `index`. An attribute with no array
+ * (size 0, which is how D3D disables a slot) reads its inline register --
+ * whatever SET_VERTEX_DATA* last left there -- not (0,0,0,1): that is what
+ * the NV2A does (xemu pgraph uses the attribute's inline_value). D3D puts a
+ * constant diffuse, a material colour or a tint there for geometry whose
+ * vertices carry none, and reading zeros would draw those batches black. */
+static void fetch_input(uint32_t a, uint32_t index, float out[4])
+{
+    if (!s_gpu.attr[a].size) {
+        memcpy(out, s_gpu.imm_attr[a], 4 * sizeof(float));
+        return;
+    }
+    fetch_attr(&s_gpu.attr[a], index, out);
+}
+
 static uint32_t surface_bpp(void);
 
 static void note_drawn(void)
@@ -2938,7 +2953,7 @@ static void raster_batch_program(void)
         for (l = 0; l < 4; l++) {
             uint32_t j = i + l < n ? i + l : n - 1;
             for (a = 0; a < NV2A_VSH_INPUTS; a++)
-                fetch_attr(&s_gpu.attr[a], s_gpu.idx[j], in[l][a]);
+                fetch_input(a, s_gpu.idx[j], in[l][a]);
             ip[l] = (const float (*)[4])in[l];
             op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
         }
@@ -3400,6 +3415,9 @@ static void draw_inline_array(void)
         case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
         case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
         case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
+        case 1: case 5:                                     /* shorts     */
+                 bytes = 2 * s_gpu.attr[a].size;   break;
+        case 6:  bytes = 4;                        break;  /* 11:11:10   */
         default: bytes = 4 * s_gpu.attr[a].size;   break;
         }
         s_gpu.attr[a].offset = off;
