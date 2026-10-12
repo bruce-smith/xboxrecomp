@@ -2133,6 +2133,10 @@ typedef struct {
     const Nv2aVshOutput *va, *vb, *vc;
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+    /* Edge functions w0 (a->b), w1 (b->c), w2 (c->a) as planes
+     * ea*dx + (eb*dy + ec), dx/dy from the pixel (minx, miny); see
+     * geo_edges. */
+    float ea[3], eb[3], ec[3];
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
     const PixState *ps;                 /* the draw's state, for P */
@@ -2166,11 +2170,15 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
 
     P = T->ps;
     for (y = y0; y < y1; y += step) {
+        float dy = (float)(y - T->miny);
+        float r0 = T->eb[0] * dy + T->ec[0];
+        float r1 = T->eb[1] * dy + T->ec[1];
+        float r2 = T->eb[2] * dy + T->ec[2];
         for (x = T->minx; x < T->maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+            float dx = (float)(x - T->minx);
+            float w0 = T->ea[0] * dx + r0;
+            float w1 = T->ea[1] * dx + r1;
+            float w2 = T->ea[2] * dx + r2;
             float l0, l1, l2, z, col[4], pw;
             uint32_t argb;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
@@ -2286,23 +2294,22 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
     const __m128 zero = _mm_setzero_ps();
     const __m128 inv = _mm_set1_ps(T->inv_area);
-    const float ba0 = b[0] - a[0], ba1 = b[1] - a[1];
-    const float cb0 = c[0] - b[0], cb1 = c[1] - b[1];
-    const float ac0 = a[0] - c[0], ac1 = a[1] - c[1];
+    const __m128 ea0 = _mm_set1_ps(T->ea[0]), ea1 = _mm_set1_ps(T->ea[1]);
+    const __m128 ea2 = _mm_set1_ps(T->ea[2]);
     int x, y, k, l;
 
     P = T->ps;
     for (y = y0; y < y1; y++) {
-        float py = (float)y + 0.5f;
-        __m128 e0 = _mm_set1_ps(ba0 * (py - a[1]));
-        __m128 e1 = _mm_set1_ps(cb0 * (py - b[1]));
-        __m128 e2 = _mm_set1_ps(ac0 * (py - c[1]));
+        float dy = (float)(y - T->miny);
+        __m128 e0 = _mm_set1_ps(T->eb[0] * dy + T->ec[0]);
+        __m128 e1 = _mm_set1_ps(T->eb[1] * dy + T->ec[1]);
+        __m128 e2 = _mm_set1_ps(T->eb[2] * dy + T->ec[2]);
         for (x = T->minx; x < T->maxx; x += 4) {
-            __m128 px = _mm_add_ps(_mm_cvtepi32_ps(_mm_setr_epi32(x, x + 1, x + 2, x + 3)),
-                                   _mm_set1_ps(0.5f));
-            __m128 w0 = _mm_sub_ps(e0, _mm_mul_ps(_mm_set1_ps(ba1), _mm_sub_ps(px, _mm_set1_ps(a[0]))));
-            __m128 w1 = _mm_sub_ps(e1, _mm_mul_ps(_mm_set1_ps(cb1), _mm_sub_ps(px, _mm_set1_ps(b[0]))));
-            __m128 w2 = _mm_sub_ps(e2, _mm_mul_ps(_mm_set1_ps(ac1), _mm_sub_ps(px, _mm_set1_ps(c[0]))));
+            __m128 dx = _mm_cvtepi32_ps(_mm_setr_epi32(x - T->minx, x + 1 - T->minx,
+                                                       x + 2 - T->minx, x + 3 - T->minx));
+            __m128 w0 = _mm_add_ps(_mm_mul_ps(ea0, dx), e0);
+            __m128 w1 = _mm_add_ps(_mm_mul_ps(ea1, dx), e1);
+            __m128 w2 = _mm_add_ps(_mm_mul_ps(ea2, dx), e2);
             __m128 l0, l1, l2, z;
             float zl[4], zs[4];
             uint32_t argb[4] = {0, 0, 0, 0};
@@ -3756,6 +3763,45 @@ static int geo_cull(const GeoCtx *g, GeoStats *st, float area)
 /* Where a set-up triangle goes (GeoSink): the raster queue on the executor
  * (xfq_push), or a geometry job's slots in its batch on the pool. */
 
+/* The three edge functions as planes, set up in double and handed to the
+ * pixel loops relative to the triangle's first pixel.
+ *
+ * They were evaluated per pixel in float as (b0 - a0) * (py - a1) -
+ * (b1 - a1) * (px - a0). Near-plane clipping (NV_CLIP_W) puts vertices
+ * millions of pixels off screen -- Blinx 2's ground near the camera reaches
+ * x = -1.9e7 -- and there each product is ~1e14, so float rounding is wrong
+ * by many pixels: pixels along an edge two triangles share were inside
+ * neither. That was the stair-stepped black lines and the scattered short
+ * dashes across the ground in the first mission.
+ *
+ * Here each edge is A*px + B*py + C with C = a0*b1 - a1*b0, computed in
+ * double; the edge's other triangle computes exactly the negation. The
+ * plane is then evaluated once, at the centre of pixel (minx, miny), and the
+ * pixel loops only add A*dx + B*dy for on-screen dx, dy. Rounding now is
+ * relative to a few hundred pixels' worth of edge, ~1e-4 pixel. The area
+ * (for the barycentrics) is done in double for the same reason. */
+static void geo_edges(XfTri *T, const float *a, const float *b, const float *c)
+{
+    const float *p[3], *q[3];
+    double ox = (double)T->minx + 0.5, oy = (double)T->miny + 0.5, area;
+    int i;
+
+    p[0] = a; q[0] = b;                          /* w0: a -> b */
+    p[1] = b; q[1] = c;                          /* w1: b -> c */
+    p[2] = c; q[2] = a;                          /* w2: c -> a */
+    for (i = 0; i < 3; i++) {
+        double A = (double)p[i][1] - (double)q[i][1];
+        double B = (double)q[i][0] - (double)p[i][0];
+        double C = (double)p[i][0] * q[i][1] - (double)p[i][1] * q[i][0];
+        T->ea[i] = (float)A;
+        T->eb[i] = (float)B;
+        T->ec[i] = (float)(A * ox + B * oy + C);
+    }
+    area = ((double)b[0] - a[0]) * ((double)c[1] - a[1])
+         - ((double)b[1] - a[1]) * ((double)c[0] - a[0]);
+    T->inv_area = (float)(1.0 / area);
+}
+
 static void geo_triangle(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
                          const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                          const Nv2aVshOutput *vc)
@@ -3827,7 +3873,7 @@ static void geo_triangle(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
         st->offscreen++;
         return;
     }
-    T.inv_area = 1.0f / area;
+    geo_edges(&T, a, b, c);
     st->drawn++;
     put(sink, &T);
 }
