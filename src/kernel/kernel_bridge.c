@@ -2321,6 +2321,7 @@ static volatile LONG g_dpc_head, g_dpc_tail;
  * Running a driver's DPC twice for one interrupt makes it walk a done list it
  * has already consumed. */
 static CRITICAL_SECTION g_dpc_lock;
+static XBOX_THREAD_LOCAL uint32_t t_isr_queued_dpc;   /* xbox_IsrDpcRunNow */
 static INIT_ONCE g_dpc_lock_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK dpc_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
@@ -2348,6 +2349,8 @@ static void bridge_KeInsertQueueDpc(void)
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
         LeaveCriticalSection(&g_dpc_lock);
+        /* Still the DPC this ISR wants run before it returns to threads. */
+        t_isr_queued_dpc = dpc;
         g_eax = 0;
         return;
     }
@@ -2367,6 +2370,7 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
     g_eax = 1;
+    t_isr_queued_dpc = dpc;   /* see xbox_IsrDpcRunNow */
 }
 
 /* Cancel a queued DPC: take it out of the queue if it is still there. */
@@ -2527,6 +2531,56 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
+}
+
+/* Run the DPC an ISR queued, on the ISR's thread, as soon as the ISR returns.
+ *
+ * On the console a DPC queued by an ISR runs as soon as the ISR returns, before
+ * any thread-level code resumes (or, if the interrupted code was at
+ * DISPATCH_LEVEL, the moment it lowers). Here the timer thread drained it on
+ * its next tick, up to 10 ms later, and the threads ran on in between.
+ * DirectSound depends on that ordering. Its APU ISR parks an idle voice on the
+ * retire list (ctx+0x4A0, sub_00335C18) for its DPC (0x00334BDF) to finish off.
+ * In the gap the game thread restarted that voice, the APU reported it idle
+ * again, and the ISR parked it a second time while it was still listed.
+ * InsertTailList on an entry already in the list leaves it linked to itself,
+ * so the DPC's remove-first loop (sub_003346BE) never emptied the list, and
+ * stage 01-01 froze with the sound repeating (replayed with
+ * RECOMP_INPUT_REPLAY, 2026-10-12).
+ *
+ * Only the DPC that this ISR queued is taken out of the queue and run; other
+ * devices' DPCs stay with the timer thread. The caller already has the guest
+ * stack and TIB the ISR ran on. kernel_run_dpc takes the dispatch lock, so the
+ * DPC waits for a thread at DISPATCH_LEVEL to lower first, as on the console. */
+void xbox_IsrDpcBegin(void)
+{
+    t_isr_queued_dpc = 0;
+}
+
+void xbox_IsrDpcRunNow(void)
+{
+    uint32_t dpc = t_isr_queued_dpc, arg1 = 0, arg2 = 0;
+    LONG i;
+    int found = 0;
+
+    t_isr_queued_dpc = 0;
+    if (!dpc)
+        return;
+    dpc_lock();
+    if (BRIDGE_MEM8(dpc + 2)) {
+        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
+            if (g_dpc_queue[i].dpc == dpc) {
+                arg1 = g_dpc_queue[i].arg1;
+                arg2 = g_dpc_queue[i].arg2;
+                g_dpc_queue[i].dpc = 0;         /* drained as a no-op */
+                found = 1;
+                break;
+            }
+        BRIDGE_MEM8(dpc + 2) = 0;
+    }
+    LeaveCriticalSection(&g_dpc_lock);
+    if (found)
+        kernel_run_dpc(dpc, arg1, arg2);
 }
 
 /* ── KeInitializeDpc (ordinal 107) ────────────────────────

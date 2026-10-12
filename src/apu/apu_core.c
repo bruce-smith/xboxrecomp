@@ -137,6 +137,8 @@ extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 extern void xbox_InterruptLock(uint32_t kint);
 extern void xbox_InterruptUnlock(uint32_t kint);
+extern void xbox_IsrDpcBegin(void);
+extern void xbox_IsrDpcRunNow(void);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -192,8 +194,23 @@ static void apu_deliver_irq(MCPXAPUState *d)
     /* Held against KeSynchronizeExecution on this interrupt: the guest's
      * way of keeping its ISR out while it edits what the ISR walks. */
     xbox_InterruptLock(kint);
+    xbox_IsrDpcBegin();
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     xbox_InterruptUnlock(kint);
+    /* The DPC the ISR queued runs now, before this thread makes another frame
+     * or raises another interrupt -- the console's order. DirectSound's ISR
+     * hands idle voices to its DPC (0x00334BDF) and must not see one again
+     * before the DPC has retired it; see xbox_IsrDpcRunNow.
+     * RECOMP_APU_DPC_INLINE=0 leaves them to the timer thread's tick. */
+    {
+        static int inline_dpc = -1;
+        if (inline_dpc < 0) {
+            const char *e = getenv("RECOMP_APU_DPC_INLINE");
+            inline_dpc = !(e && *e == '0');
+        }
+        if (inline_dpc)
+            xbox_IsrDpcRunNow();
+    }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
