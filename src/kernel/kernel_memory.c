@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* XBOX_PHYS_RAM_TAG */
+#include <stdio.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -179,9 +181,21 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    int window = va >= XBOX_CONTIG_BASE &&
+                 (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    uint32_t pa = window ? va - XBOX_CONTIG_BASE : va;
+
+    /* An ordinary VA whose number the arena also owns: tag it, so no device
+     * model reads it out of the window. See XBOX_PHYS_RAM_TAG. */
+    if (!window && xbox_PhysNeedsRamTag(va)) {
+        static volatile LONG shown;
+        if (InterlockedIncrement(&shown) == 1)
+            fprintf(stderr, "  [MM] MmGetPhysicalAddress(0x%08X) -> 0x%08X: heap"
+                            " VA in the arena's physical range, tagged as RAM\n",
+                    va, va | XBOX_PHYS_RAM_TAG);
+        pa = va | XBOX_PHYS_RAM_TAG;
+    }
+    return (ULONG_PTR)pa;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

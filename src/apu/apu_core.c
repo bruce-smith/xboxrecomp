@@ -73,9 +73,15 @@ void mcpx_debug_end_frame(void) {}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern int xbox_ContiguousOwnsPhys(uint32_t phys);
 
+/* A title's sound buffers can also be ordinary heap memory, which
+ * MmGetPhysicalAddress tags when its number collides with the arena's (see
+ * XBOX_PHYS_RAM_TAG): Blinx 2's every movie, title-music and most effect
+ * voice read silence out of the window before. */
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if ((uint32_t)addr & XBOX_PHYS_RAM_TAG)
+        return g_apu_ram_ptr + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (xbox_ContiguousOwnsPhys(a))

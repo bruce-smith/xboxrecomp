@@ -3336,6 +3336,19 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
+/* See XBOX_PHYS_RAM_TAG in xbox_memory_layout.h. RECOMP_PHYS_RAM_TAG=0 turns
+ * the tag off (the old, ambiguous answer). */
+int xbox_PhysNeedsRamTag(uint32_t va)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PHYS_RAM_TAG");
+        on = !(e && *e == '0');
+    }
+    return on && g_contig_above_image && va >= g_contig_lo
+           && va < XBOX_CONTIG_SIZE;
+}
+
 int xbox_ContiguousOwnsPhys(uint32_t phys)
 {
     /* Physical page 0 as well. The kernel keeps it out of every allocator

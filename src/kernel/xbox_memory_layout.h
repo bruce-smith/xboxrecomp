@@ -98,6 +98,21 @@ void xbox_SetContigLayout(uint32_t bytes, int above_image);
  * address use this to decide it lives in the contiguous window. */
 int xbox_ContiguousOwnsPhys(uint32_t phys);
 
+/* A "physical" address that names ordinary RAM at (addr & ~XBOX_PHYS_RAM_TAG).
+ *
+ * With the arena above the image (xbox_SetContigLayout), the general heap's
+ * VAs and the arena's physical numbers are the same range, 0x03040000 up. A
+ * heap VA is its own physical address here, so MmGetPhysicalAddress on a heap
+ * buffer returned a number the arena also owns, and a device model resolving
+ * it (xbox_ContiguousOwnsPhys) read the contiguous window instead -- Blinx 2's
+ * DirectSound points its voices at heap buffers, and every one played
+ * silence. MmGetPhysicalAddress now tags exactly those addresses (non-window
+ * VAs inside the arena's physical range, above-image layout only) so they
+ * cannot be taken for arena memory. Device models that read title buffers
+ * strip the tag (mcpx_apu_phys). */
+#define XBOX_PHYS_RAM_TAG 0x40000000u
+int xbox_PhysNeedsRamTag(uint32_t va);
+
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */
