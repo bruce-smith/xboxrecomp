@@ -3018,13 +3018,21 @@ static void draw_primitive(void)
 
     {
         uint32_t t0 = s_gpu.tris_drawn, c0 = s_gpu.tris_culled;
-        uint64_t p0 = s_gpu.pixels;
+        uint32_t g0 = s_gpu.xf_degenerate, o0 = s_gpu.xf_offscreen;
+        uint32_t b0 = s_gpu.tris_behind, z0 = s_gpu.zpass_count;
+        uint64_t p0 = s_gpu.pixels, f0 = s_gpu.xf_depth_fail;
         raster_batch();
         if (s_ftrace == 2) {
+            fprintf(stderr, "[FTRACE] alpha %u %X ref %X | zpass %u %u zfail %llu"
+                    " | cmask %08X%c", s_gpu.alpha_test, s_gpu.alpha_func,
+                    s_gpu.alpha_ref, s_gpu.zpass_enable,
+                    s_gpu.zpass_count - z0,
+                    (unsigned long long)(s_gpu.xf_depth_fail - f0),
+                    s_gpu.color_mask, 10);
             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
                     " eq %X | z test %u func %X mask %u | tris %u px %llu"
-                    " | cull %u %X %X culled %u\n",
+                    " | cull %u %X %X culled %u | degen %u off %u behind %u\n",
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
@@ -3036,7 +3044,8 @@ static void draw_primitive(void)
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0),
                     s_gpu.cull_enable, s_gpu.cull_face, s_gpu.front_face,
-                    s_gpu.tris_culled - c0);
+                    s_gpu.tris_culled - c0, s_gpu.xf_degenerate - g0,
+                    s_gpu.xf_offscreen - o0, s_gpu.tris_behind - b0);
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
@@ -3485,7 +3494,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         static int all = -1;
         if (all < 0)
             all = getenv("RECOMP_FRAME_TRACE_METHODS") != NULL;
-        if (all && !(method >= 0x1800 && method < 0x1A00)
+        if (all && !(method >= 0x1828 && method < 0x1A00)
             && !(method >= 0x0B00 && method < 0x0C00))
             fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
                     param, 10);
@@ -3573,7 +3582,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         rq_sync();                         /* every queued pixel counted */
         stamp = (uint64_t)s_gpu.reports++ * 1000u;
         memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+        {
+            /* RECOMP_ZPASS_FORCE=1 reports every visibility test as visible.
+             * Diagnostic: in Blinx 2's attract stage it brings back the sky
+             * and the cliffs' shading, so some test the title gates them on
+             * comes out 0 here where the console counts pixels. Which one,
+             * and why, is open; forcing also draws whatever really was
+             * occluded (flares behind walls), so it is not the default. */
+            static int force = -1;
+            uint32_t zc = s_gpu.zpass_count;
+            if (force < 0)
+                force = getenv("RECOMP_ZPASS_FORCE") != NULL;
+            if (force)
+                zc = 100000;
+            memcpy(mem + at + 8, &zc, 4);
+        }
         memset(mem + at + 12, 0, 4);
         break;
     }
