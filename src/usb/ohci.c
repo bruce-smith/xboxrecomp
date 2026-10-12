@@ -215,6 +215,17 @@ static uint64_t ohci_read(void *dev, uint32_t off, int size)
     return v;
 }
 
+/* HcInterruptStatus is written by two threads: the controller thread sets
+ * bits, the guest driver clears them (write 1 to clear) from whichever thread
+ * it runs on. Both used to be plain read-modify-writes, so one could undo the
+ * other: a WritebackDoneHead set while the driver cleared StartOfFrame came
+ * back without WDH, its done queue was never read, and the next pass wrote a
+ * new queue over it. The lost descriptors leak the XPP bandwidth budget that
+ * completions return (0xF2E0E2 in Blinx 2), requests then wait in XPP's
+ * pending list long enough to be resubmitted while still queued, and that
+ * makes the list a cycle the main thread walks forever. */
+#define STATUS_SET(hc, bits)     InterlockedOr((volatile LONG *)&(hc)->reg[HcInterruptStatus / 4], (LONG)(bits))
+
 static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 {
     OhciController *hc = (OhciController *)dev;
@@ -246,7 +257,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         if (*r & CS_HCR) {
             *r &= ~CS_HCR;
             hc->reg[HcControl / 4] &= ~0xC0u;    /* back to UsbReset state  */
-            hc->reg[HcInterruptStatus / 4] = 0;
+            InterlockedExchange((volatile LONG *)&hc->reg[HcInterruptStatus / 4], 0);
             hc->reg[HcInterruptEnable / 4] = 0;
         }
         return;
@@ -267,7 +278,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
         }
-        *r &= ~v;                       /* write 1 to clear                 */
+        InterlockedAnd((volatile LONG *)r, (LONG)~v);   /* write 1 to clear */
         hc->ack_seq++;
         return;
 
@@ -338,7 +349,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             if (*ps & PORT_CCS)
                 *ps |= PORT_PES;
             *ps |= PORT_PRSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            STATUS_SET(hc, INTR_RHSC);
         }
         return;
     }
@@ -729,7 +740,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    STATUS_SET(hc, INTR_WDH);
 }
 
 /* Both runners add to the caller's done queue rather than publishing their
@@ -913,7 +924,9 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
-    hc->reg[HcInterruptStatus / 4] |= source;
+    /* `source` was read from HcInterruptStatus, so its bits are already set
+     * -- unless the driver cleared one since, and OR-ing it back in would
+     * re-raise an interrupt the driver has already handled. */
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1067,7 +1080,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            STATUS_SET(hc, INTR_RHSC);
             plugged = 1;
             s_plugged_pads = 1;
             first_port = port;
@@ -1086,7 +1099,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             if (++settle > 50) {                 /* ~1 s after the last */
                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                STATUS_SET(hc, INTR_RHSC);
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
                         s_plugged_pads + 1, port + 1, 10);
                 fflush(stderr);
@@ -1118,7 +1131,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+            STATUS_SET(hc, INTR_SF);
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
