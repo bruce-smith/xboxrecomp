@@ -2009,12 +2009,35 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
 
 /* The fixed-function fog unit, per vertex, from the program's oFog.x
  * (xemu vsh.c). Fog disabled reads as factor 1: no fog. */
-static float fog_factor(float d)
+/* What triangle set-up reads of the GPU state, captured once per draw so
+ * set-up can run on any thread (see the raster pool's geometry jobs). */
+typedef struct {
+    uint8_t *mem;
+    uint32_t bpp;
+    int ok;                             /* the surface can be drawn into */
+    int textured, use_rc;
+    float su, sv;                       /* stage 0 size, for T.uv */
+    float *zb;
+    int clip_x, clip_y, clip_w, clip_h;
+    int cull_enable, front_face, cull_face, no_cull;
+    float k[3], o[3];                   /* viewport: c[58] scale, c[59] offset */
+    uint32_t fog_enable, fog_mode;
+    float fog_param[2], fogc[4];
+} GeoCtx;
+
+/* Set-up's tallies, folded into s_gpu by whoever owns it. */
+typedef struct {
+    uint32_t behind, degenerate, culled, offscreen, drawn;
+    float xmin[3], xmax[3];
+    int seeded;
+} GeoStats;
+
+static float geo_fog(const GeoCtx *g, float d)
 {
-    float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
-    if (!s_gpu.fog_enable)
+    float f, px = g->fog_param[0], py = g->fog_param[1];
+    if (!g->fog_enable)
         return 1.0f;
-    switch (s_gpu.fog_mode) {
+    switch (g->fog_mode) {
     case 0x800: case 0x802:                       /* EXP, EXP_ABS */
         f = px + exp2f(d * py * 16.0f) - 1.5f;
         break;
@@ -2025,8 +2048,8 @@ static float fog_factor(float d)
         f = px + d * py - 1.0f;
         break;
     }
-    if (s_gpu.fog_mode == 0x802 || s_gpu.fog_mode == 0x803
-        || s_gpu.fog_mode == 0x804)
+    if (g->fog_mode == 0x802 || g->fog_mode == 0x803
+        || g->fog_mode == 0x804)
         f = fabsf(f);
     if (f != f)
         f = 1.0f;
@@ -2841,118 +2864,103 @@ static void xfq_end(void)
  * The title also switches CULL_FACE between FRONT and BACK per object (both
  * with FRONT_FACE CW), which is why neither fixed sense was right everywhere.
  * RECOMP_NO_CULL=1 turns culling off for A/B comparisons. */
-static int cull_triangle(float area)
+static int geo_cull(const GeoCtx *g, GeoStats *st, float area)
 {
-    static int no_cull = -1;
     int cw = area > 0.0f, front;
 
-    if (no_cull < 0)
-        no_cull = getenv("RECOMP_NO_CULL") != NULL;
-    if (!s_gpu.cull_enable || no_cull)
+    if (!g->cull_enable || g->no_cull)
         return 0;
-    if (nv2a_vsh_constant(58)[1] > 0.0f)
+    if (g->k[1] > 0.0f)
         cw = !cw;                               /* y-up viewport */
-    front = s_gpu.front_face == 0x901 ? !cw : cw;
-    switch (s_gpu.cull_face) {
+    front = g->front_face == 0x901 ? !cw : cw;
+    switch (g->cull_face) {
     case 0x404: if (!front) return 0; break;      /* FRONT */
     case 0x408: break;                            /* FRONT_AND_BACK */
     default:    if (front) return 0; break;       /* BACK */
     }
-    s_gpu.tris_culled++;
+    st->culled++;
     return 1;
 }
 
-static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
-                               const Nv2aVshOutput *vc)
+/* Where a set-up triangle goes: the raster queue on the executor
+ * (xfq_push), or a geometry job's slots in its batch on the pool. */
+typedef void (*GeoSink)(void *sink, XfTri *T);
+
+static void geo_triangle(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
+                         const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                         const Nv2aVshOutput *vc)
 {
     XfTri T;
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
-    float area, su = 1.0f, sv = 1.0f;
+    float area, su = g->su, sv = g->sv;
     int k;
-    static int no_rc = -1;
 
-    if (no_rc < 0)
-        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     memset(&T, 0, sizeof T);
-    T.mem = (uint8_t *)xbox_GetMemoryOffset();
-    T.bpp = surface_bpp();
-    T.textured = s_gpu.texs[0].valid;
-    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.mem = g->mem;
+    T.bpp = g->bpp;
+    T.textured = g->textured;
+    T.use_rc = g->use_rc;
     T.va = va; T.vb = vb; T.vc = vc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
     a = va->pos; b = vb->pos; c = vc->pos;
     T.a = a; T.b = b; T.c = c;
-    if (T.bpp != 4 && T.bpp != 2)
+    if (!g->ok)
         return;
     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
-        s_gpu.tris_behind++;
+        st->behind++;
         return;
     }
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f || area != area) {
-        s_gpu.xf_degenerate++;
+        st->degenerate++;
         return;
     }
-    if (cull_triangle(area))
+    if (geo_cull(g, st, area))
         return;
     for (k = 0; k < 3; k++) {
-        if (!s_gpu.xf_seeded)
-            s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
-        if (a[k] < s_gpu.xf_min[k]) s_gpu.xf_min[k] = a[k];
-        if (a[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = a[k];
+        if (!st->seeded)
+            st->xmin[k] = st->xmax[k] = a[k];
+        if (a[k] < st->xmin[k]) st->xmin[k] = a[k];
+        if (a[k] > st->xmax[k]) st->xmax[k] = a[k];
     }
-    s_gpu.xf_seeded = 1;
-    if (!surface_begin_batch(T.mem))
-        return;
-    if (s_gpu.depth_test || s_gpu.depth_mask)
-        T.zb = zbuf_current(1);
-    if (tex_size_from_format(s_gpu.texs[0].color)) {
-        su = (float)s_gpu.texs[0].width;
-        sv = (float)s_gpu.texs[0].height;
-    }
+    st->seeded = 1;
+    T.zb = g->zb;
     for (k = 0; k < 3; k++) {
         T.iw[k] = 1.0f / v[k]->pos[3];
         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
         T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
     if (T.use_rc) {
-        int st, j;
+        int sti, j;
         for (k = 0; k < 3; k++) {
-            for (st = 0; st < 4; st++)
+            for (sti = 0; sti < 4; sti++)
                 for (j = 0; j < 4; j++)
-                    T.stc[k][st][j] = v[k]->tex[st][j] * T.iw[k];
-            T.vfog[k] = fog_factor(v[k]->fog[0]);
+                    T.stc[k][sti][j] = v[k]->tex[sti][j] * T.iw[k];
+            T.vfog[k] = geo_fog(g, v[k]->fog[0]);
         }
-        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
-        nv2a_rc_unpack(s_gpu.fog_color, T.fogc);
-        { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
+        memcpy(T.fogc, g->fogc, sizeof T.fogc);
     }
 
     T.minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
     T.maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
     T.miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
     T.maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
-    if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
-    if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
-    if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (T.minx < g->clip_x) T.minx = g->clip_x;
+    if (T.miny < g->clip_y) T.miny = g->clip_y;
+    if (T.maxx > g->clip_x + g->clip_w) T.maxx = g->clip_x + g->clip_w;
+    if (T.maxy > g->clip_y + g->clip_h) T.maxy = g->clip_y + g->clip_h;
     if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
     if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
     if (T.minx >= T.maxx || T.miny >= T.maxy) {
-        s_gpu.tris_skipped_offscreen++;
-        s_gpu.xf_offscreen++;
+        st->offscreen++;
         return;
     }
-    s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
-
-    xfq_push(&T);
-    s_gpu.tris_drawn++;
-    note_drawn();
+    st->drawn++;
+    put(sink, &T);
 }
-
 
 /* Near-plane clipping.
  *
@@ -2991,8 +2999,9 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
-static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
-                              const Nv2aVshOutput *c)
+static void geo_clipped(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
+                        const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                        const Nv2aVshOutput *c)
 {
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput poly[4], va, vb;
@@ -3001,18 +3010,15 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     int n = 0, i, j;
 
     if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
-        raster_xf_triangle(a, b, c);
+        geo_triangle(g, st, put, sink, a, b, c);
         return;
     }
     if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
         && c->pos[3] <= NV_CLIP_W) {
-        s_gpu.tris_behind++;                  /* wholly behind: nothing */
+        st->behind++;                         /* wholly behind: nothing */
         return;
     }
-    {
-        const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
-        for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
-    }
+    for (i = 0; i < 3; i++) { k[i] = g->k[i]; o[i] = g->o[i]; }
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
         const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
@@ -3041,7 +3047,130 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
             for (j = 0; j < 3; j++)
                 poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
     for (i = 1; i + 1 < n; i++)
-        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+        geo_triangle(g, st, put, sink, &poly[0], &poly[i], &poly[i + 1]);
+}
+
+/* The live state, for a draw about to be set up. Run on the executor. */
+static void geo_capture(GeoCtx *g)
+{
+    static int no_rc = -1, no_cull = -1;
+    const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
+    int i;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    if (no_cull < 0)
+        no_cull = getenv("RECOMP_NO_CULL") != NULL;
+    memset(g, 0, sizeof *g);
+    g->mem = (uint8_t *)xbox_GetMemoryOffset();
+    g->bpp = surface_bpp();
+    g->textured = s_gpu.texs[0].valid;
+    g->use_rc = s_gpu.rc_seen && !no_rc;
+    g->ok = (g->bpp == 4 || g->bpp == 2) && surface_begin_batch(g->mem);
+    g->su = g->sv = 1.0f;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        g->su = (float)s_gpu.texs[0].width;
+        g->sv = (float)s_gpu.texs[0].height;
+    }
+    if (g->ok && (s_gpu.depth_test || s_gpu.depth_mask))
+        g->zb = zbuf_current(1);
+    g->clip_x = (int)s_gpu.clip_x; g->clip_y = (int)s_gpu.clip_y;
+    g->clip_w = (int)s_gpu.clip_w; g->clip_h = (int)s_gpu.clip_h;
+    g->cull_enable = s_gpu.cull_enable != 0;
+    g->front_face = (int)s_gpu.front_face;
+    g->cull_face = (int)s_gpu.cull_face;
+    g->no_cull = no_cull;
+    for (i = 0; i < 3; i++) { g->k[i] = sc[i]; g->o[i] = of[i]; }
+    g->fog_enable = s_gpu.fog_enable;
+    g->fog_mode = s_gpu.fog_mode;
+    g->fog_param[0] = s_gpu.fog_param[0];
+    g->fog_param[1] = s_gpu.fog_param[1];
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    nv2a_rc_unpack(s_gpu.fog_color, g->fogc);
+    { float r = g->fogc[2]; g->fogc[2] = g->fogc[0]; g->fogc[0] = r; }
+}
+
+/* Set-up's tallies into s_gpu. Run on the executor. */
+static void geo_fold(const GeoStats *st)
+{
+    int k;
+    s_gpu.tris_behind += st->behind;
+    s_gpu.xf_degenerate += st->degenerate;
+    s_gpu.tris_culled += st->culled;
+    s_gpu.tris_skipped_offscreen += st->offscreen;
+    s_gpu.xf_offscreen += st->offscreen;
+    s_gpu.xf_drawn += st->drawn;
+    s_gpu.tris_drawn += st->drawn;
+    if (st->seeded) {
+        for (k = 0; k < 3; k++) {
+            if (!s_gpu.xf_seeded)
+                s_gpu.xf_min[k] = s_gpu.xf_max[k] = st->xmin[k];
+            if (st->xmin[k] < s_gpu.xf_min[k]) s_gpu.xf_min[k] = st->xmin[k];
+            if (st->xmax[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = st->xmax[k];
+        }
+        s_gpu.xf_seeded = 1;
+    }
+}
+
+/* The triangles a primitive of n vertices makes, before clipping. */
+static uint32_t geo_count(uint32_t prim, uint32_t n)
+{
+    switch (prim) {
+    case NV_PRIM_TRIANGLES:      return n / 3;
+    case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        return n >= 3 ? n - 2 : 0;
+    case NV_PRIM_QUADS:          return n / 4 * 2;
+    case NV_PRIM_QUAD_STRIP:     return n >= 4 ? (n - 2) / 2 * 2 : 0;
+    default:                     return 0;
+    }
+}
+
+/* A transformed primitive into triangles, clipped and set up, in order. */
+static void geo_assemble(const GeoCtx *g, GeoStats *st, GeoSink put, void *sink,
+                         uint32_t prim, const Nv2aVshOutput *x, uint32_t n)
+{
+    uint32_t i;
+    switch (prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            geo_clipped(g, st, put, sink, &x[i], &x[i+1], &x[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        /* Every other strip triangle is listed in the opposite order; swap
+         * it back so all of them share the strip's winding (culling). */
+        for (i = 0; i + 2 < n; i++)
+            if (i & 1)
+                geo_clipped(g, st, put, sink, &x[i+1], &x[i], &x[i+2]);
+            else
+                geo_clipped(g, st, put, sink, &x[i], &x[i+1], &x[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            geo_clipped(g, st, put, sink, &x[0], &x[i], &x[i+1]);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            geo_clipped(g, st, put, sink, &x[i], &x[i+1], &x[i+2]);
+            geo_clipped(g, st, put, sink, &x[i], &x[i+2], &x[i+3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            geo_clipped(g, st, put, sink, &x[i], &x[i+1], &x[i+3]);
+            geo_clipped(g, st, put, sink, &x[i], &x[i+3], &x[i+2]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void xfq_sink(void *unused, XfTri *T)
+{
+    (void)unused;
+    xfq_push(T);
 }
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
@@ -3178,39 +3307,15 @@ static void raster_batch_program(void)
         note_texture_use();
 
     xfq_begin();
-    switch (s_gpu.prim) {
-    case NV_PRIM_TRIANGLES:
-        for (i = 0; i + 2 < n; i += 3)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        /* Every other strip triangle is listed in the opposite order; swap
-         * it back so all of them share the strip's winding (culling). */
-        for (i = 0; i + 2 < n; i++)
-            if (i & 1)
-                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
-            else
-                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        for (i = 1; i + 1 < n; i++)
-            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
-        break;
-    case NV_PRIM_QUADS:
-        for (i = 0; i + 3 < n; i += 4) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        for (i = 0; i + 3 < n; i += 2) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
-        }
-        break;
-    default:
-        break;
+    {
+        GeoCtx g;
+        GeoStats st;
+        memset(&st, 0, sizeof st);
+        geo_capture(&g);
+        geo_assemble(&g, &st, xfq_sink, NULL, s_gpu.prim, s_xf, n);
+        geo_fold(&st);
+        if (st.drawn)
+            note_drawn();
     }
     xfq_end();
 }
