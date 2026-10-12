@@ -130,6 +130,10 @@ static const char *nv097_name(uint32_t m)
     return "";
 }
 
+/* Ring jump targets, filled by note_jump below. */
+static struct { uint32_t target, count; } s_jmp[16];
+static uint32_t s_ring_lo = 0xFFFFFFFFu, s_ring_hi;
+
 void nv2a_pb_scan_report(void)
 {
     int i;
@@ -137,6 +141,14 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        {
+            int i;
+            fprintf(stderr, "[PB] ring jumps from 0x%08X..0x%08X to:",
+                    s_ring_lo, s_ring_hi);
+            for (i = 0; i < 16 && s_jmp[i].count; i++)
+                fprintf(stderr, " %08X x%u", s_jmp[i].target, s_jmp[i].count);
+            fputc(10, stderr);
+        }
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -163,6 +175,24 @@ void nv2a_pb_scan_report(void)
  * The NV2A has one level of subroutine, so a CALL inside a call is not
  * followed. Addresses are physical, like PUT's, and reach guest memory the
  * same way: through the contiguous window. */
+/* Where ring jumps go, for the report: a JUMP in the main ring is taken to
+ * be the wrap back to its start, and anything else it could be -- D3D
+ * running a precompiled pushbuffer by jumping out to it and back -- is
+ * skipped. Counting the targets says which. */
+
+static void note_jump(uint32_t from, uint32_t target)
+{
+    int i;
+    if (from < s_ring_lo) s_ring_lo = from;
+    if (from > s_ring_hi) s_ring_hi = from;
+    for (i = 0; i < 16 && s_jmp[i].count && s_jmp[i].target != target; i++)
+        ;
+    if (i < 16) {
+        s_jmp[i].target = target;
+        s_jmp[i].count++;
+    }
+}
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                         uint32_t *jumps, uint32_t *unknown)
 {
@@ -178,8 +208,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
-            if (!in_call)
+            if (!in_call) {
+                note_jump(va - 4, target);
                 break;                        /* the ring: a jump ends it */
+            }
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
             continue;
