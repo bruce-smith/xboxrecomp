@@ -178,6 +178,14 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+/* Per-voice resampler state (voice_resample): the two source frames being
+ * interpolated between and the position between them. Cleared by VOICE_ON. */
+static struct {
+    float s0[2], s1[2];
+    float frac;
+    bool primed;
+} g_rs[MCPX_HW_MAX_VOICES];
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -197,6 +205,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        if (selected_handle < MCPX_HW_MAX_VOICES)
+            g_rs[selected_handle].primed = false;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -945,18 +955,74 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (linear interpolation; xemu uses libsamplerate)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * `rate` is output frames per source frame: 1/2^(pitch/4096), so a 44.1 kHz
+ * buffer on the 48 kHz VP has rate 48000/44100. This used to ignore it and
+ * play every voice one source frame per output frame -- Blinx 2's title music
+ * came out bit-exact but 8.8% fast and sharp, and 22 kHz effects at double
+ * speed. Rate 1 keeps the direct, bit-exact path.
  * ============================================================ */
+
+static int voice_fetch(MCPXAPUState *d, uint16_t v, float samples[][2], int n)
+{
+    int got = 0;
+    while (got < n) {
+        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        if (!active) break;
+        int count = voice_get_samples(d, v, &samples[got], n - got);
+        if (count <= 0) break;
+        got += count;
+    }
+    return got;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
+    if (rate > 0.0f && fabsf(rate - 1.0f) > 1e-4f) {
+        float step = 1.0f / rate;
+        /* Source frames needed: the advances, plus priming. Bounded by the
+         * fastest pitch the VP allows (rate >= 1/4, i.e. step <= 4) plus a
+         * margin, so the buffer cannot overflow. */
+        float in[NUM_SAMPLES_PER_FRAME * 8 + 4][2];
+        int need, got, used = 0;
+
+        if (step > 8.0f) step = 8.0f;
+        if (!g_rs[v].primed) {
+            if (voice_fetch(d, v, in, 2) < 2) return -1;
+            g_rs[v].s0[0] = in[0][0]; g_rs[v].s0[1] = in[0][1];
+            g_rs[v].s1[0] = in[1][0]; g_rs[v].s1[1] = in[1][1];
+            g_rs[v].frac = 0.0f;
+            g_rs[v].primed = true;
+        }
+        need = (int)(g_rs[v].frac + requested_num * step);
+        if (need > NUM_SAMPLES_PER_FRAME * 8 + 4)
+            need = NUM_SAMPLES_PER_FRAME * 8 + 4;
+        got = need ? voice_fetch(d, v, in, need) : 0;
+
+        for (int i = 0; i < requested_num; i++) {
+            float f = g_rs[v].frac;
+            samples[i][0] = g_rs[v].s0[0] + (g_rs[v].s1[0] - g_rs[v].s0[0]) * f;
+            samples[i][1] = g_rs[v].s0[1] + (g_rs[v].s1[1] - g_rs[v].s0[1]) * f;
+            g_rs[v].frac += step;
+            while (g_rs[v].frac >= 1.0f) {
+                g_rs[v].frac -= 1.0f;
+                g_rs[v].s0[0] = g_rs[v].s1[0];
+                g_rs[v].s0[1] = g_rs[v].s1[1];
+                if (used < got) {
+                    g_rs[v].s1[0] = in[used][0];
+                    g_rs[v].s1[1] = in[used][1];
+                    used++;
+                } else {
+                    g_rs[v].s1[0] = g_rs[v].s1[1] = 0.0f;  /* voice ended */
+                }
+            }
+        }
+        return requested_num;
+    }
+
     int sample_count = 0;
     while (sample_count < requested_num) {
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
