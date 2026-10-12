@@ -61,4 +61,24 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* Re-entrant transform, for running vertex programs off the executor thread.
+ *
+ * nv2a_vsh_snapshot: the current program (program memory from the start
+ * slot), decoded, immutable and never freed -- a pointer stays valid however
+ * the program memory changes later. NULL if it cannot be kept (table full);
+ * use the global-state calls then.
+ * nv2a_vsh_constants: the live constant memory, for copying a snapshot.
+ * nv2a_vsh_cxt_write: CXT_WRITE is on, so programs may write constants and
+ * vertices depend on each other: run those serially (nv2a_vsh_run4).
+ * nv2a_vsh_transform: n vertices through `p` with constants `cst`. Touches no
+ * global state, so any thread may call it. Bit-identical to nv2a_vsh_run on
+ * each vertex. Returns 0 if the program has no final instruction. */
+typedef struct Nv2aVshProg Nv2aVshProg;
+const Nv2aVshProg *nv2a_vsh_snapshot(void);
+const float (*nv2a_vsh_constants(void))[4];
+int nv2a_vsh_cxt_write(void);
+int nv2a_vsh_transform(const Nv2aVshProg *p, const float (*cst)[4],
+                       const float (*in)[NV2A_VSH_INPUTS][4], uint32_t n,
+                       Nv2aVshOutput *out);
+
 #endif

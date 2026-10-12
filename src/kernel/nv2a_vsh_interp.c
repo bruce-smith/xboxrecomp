@@ -200,9 +200,24 @@ typedef struct {
     uint8_t reads;                          /* bit k: source k is used */
 } VshIns;
 
-static VshIns s_dec[NV2A_VSH_SLOTS];
-static uint32_t s_dec_n;
-static uint16_t s_dec_inputs;               /* v[i] some used source reads */
+/* A decoded program, immutable once made: deduplicated by content and
+ * never freed, so a pointer to one stays valid for a draw handed to another
+ * thread (nv2a_vsh_snapshot). Titles load few distinct programs. */
+struct Nv2aVshProg {
+    VshIns ins[NV2A_VSH_SLOTS];
+    uint32_t n, hash;
+    uint16_t inputs;                        /* v[i] some used source reads */
+    struct Nv2aVshProg *next;
+};
+#define VSH_PROG_BUCKETS 256
+#define VSH_PROG_MAX     4096
+static struct Nv2aVshProg *s_prog_tab[VSH_PROG_BUCKETS];
+static unsigned s_prog_count;
+static struct Nv2aVshProg s_prog_scratch;   /* when the table is full */
+static const struct Nv2aVshProg *s_cur = &s_prog_scratch;
+static int s_cur_shared;                    /* s_cur is a table entry */
+#define s_dec        (s_cur->ins)
+#define s_dec_n      (s_cur->n)
 
 static void decode_src(const uint32_t *ins, int which, VshSrc *d)
 {
@@ -254,12 +269,15 @@ static void maybe_dump(void)
 
 static void decode_program(void)
 {
-    uint32_t s;
-    s_dec_n = 0;
-    s_dec_inputs = 0;
+    static struct Nv2aVshProg t;
+    struct Nv2aVshProg *e;
+    uint32_t s, h = 2166136261u;
+    size_t i;
+
+    memset(&t, 0, sizeof t);
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const uint32_t *ins = s_program[s];
-        VshIns *d = &s_dec[s_dec_n++];
+        VshIns *d = &t.ins[t.n++];
         int k;
         for (k = 0; k < 3; k++)
             decode_src(ins, k, &d->src[k]);
@@ -285,9 +303,31 @@ static void decode_program(void)
             d->reads |= 4;
         for (k = 0; k < 3; k++)
             if ((d->reads >> k & 1) && d->src[k].mux == 2)
-                s_dec_inputs |= (uint16_t)(1u << d->src[k].idx);
+                t.inputs |= (uint16_t)(1u << d->src[k].idx);
         if (d->final)
             break;
+    }
+    for (i = 0; i < t.n * sizeof t.ins[0]; i++)          /* FNV-1a */
+        h = (h ^ ((const uint8_t *)t.ins)[i]) * 16777619u;
+    t.hash = h;
+    for (e = s_prog_tab[h % VSH_PROG_BUCKETS]; e; e = e->next)
+        if (e->hash == h && e->n == t.n
+            && !memcmp(e->ins, t.ins, t.n * sizeof t.ins[0]))
+            break;
+    if (!e && s_prog_count < VSH_PROG_MAX
+        && (e = (struct Nv2aVshProg *)malloc(sizeof *e)) != NULL) {
+        *e = t;
+        e->next = s_prog_tab[h % VSH_PROG_BUCKETS];
+        s_prog_tab[h % VSH_PROG_BUCKETS] = e;
+        s_prog_count++;
+    }
+    if (e) {
+        s_cur = e;
+        s_cur_shared = 1;
+    } else {
+        s_prog_scratch = t;
+        s_cur = &s_prog_scratch;
+        s_cur_shared = 0;
     }
     s_dec_valid = 1;
     maybe_dump();
@@ -504,7 +544,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 typedef struct { __m128 c[4]; } vec4x4;   /* component k, lanes 0..3 */
 
 static vec4x4 rd4(const VshSrc *d, const vec4x4 *vin,
-                  const vec4x4 *temp, const vec4x4 *opos, const int a0[4])
+                  const vec4x4 *temp, const vec4x4 *opos, const int a0[4],
+                  const float (*s_const)[4])
 {
     vec4x4 s, r;
     int k;
@@ -655,21 +696,16 @@ static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
     return r;
 }
 
-int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
+/* Four vertices through program `p` with constants `cst`; touches no state
+ * of its own, so any thread may run it. */
+static int run4_with(const struct Nv2aVshProg *p, const float (*cst)[4],
+                     const float (*const in[4])[4], Nv2aVshOutput *out[4])
 {
     vec4x4 temp[12], opos, outregs[13], vin[NV2A_VSH_INPUTS];
     int a0[4] = {0, 0, 0, 0};
     uint32_t s;
     int k, l;
 
-    if (!s_dec_valid)
-        decode_program();
-    if (s_cxt_write) {
-        for (l = 0; l < 4; l++)
-            if (!nv2a_vsh_run(in[l], out[l]))
-                return 0;
-        return 1;
-    }
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
@@ -679,7 +715,7 @@ int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
     /* Each input the program reads, as lanes, once -- not gathered from the
      * four vertices again at every read. */
     for (k = 0; k < NV2A_VSH_INPUTS; k++)
-        if (s_dec_inputs >> k & 1) {
+        if (p->inputs >> k & 1) {
             __m128 r0 = _mm_loadu_ps(in[0][k]), r1 = _mm_loadu_ps(in[1][k]);
             __m128 r2 = _mm_loadu_ps(in[2][k]), r3 = _mm_loadu_ps(in[3][k]);
             _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
@@ -687,13 +723,13 @@ int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
             vin[k].c[2] = r2; vin[k].c[3] = r3;
         }
 
-    for (s = 0; s < s_dec_n; s++) {
-        const VshIns *ins = &s_dec[s];
+    for (s = 0; s < p->n; s++) {
+        const VshIns *ins = &p->ins[s];
         vec4x4 a, b, c, mres, ires;
 
-        if (ins->reads & 1) a = rd4(&ins->src[0], vin, temp, &opos, a0);
-        if (ins->reads & 2) b = rd4(&ins->src[1], vin, temp, &opos, a0);
-        if (ins->reads & 4) c = rd4(&ins->src[2], vin, temp, &opos, a0);
+        if (ins->reads & 1) a = rd4(&ins->src[0], vin, temp, &opos, a0, cst);
+        if (ins->reads & 2) b = rd4(&ins->src[1], vin, temp, &opos, a0, cst);
+        if (ins->reads & 4) c = rd4(&ins->src[2], vin, temp, &opos, a0, cst);
         /* An idle unit's result is 0: an output may still name it. */
         if (ins->mac)
             mres = mac4(ins->mac, &a, &b, &c, a0);
@@ -742,4 +778,56 @@ int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
         }
     }
     return 0;
+}
+
+int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
+{
+    int l;
+
+    if (!s_dec_valid)
+        decode_program();
+    if (s_cxt_write) {
+        for (l = 0; l < 4; l++)
+            if (!nv2a_vsh_run(in[l], out[l]))
+                return 0;
+        return 1;
+    }
+    return run4_with(s_cur, (const float (*)[4])s_const, in, out);
+}
+
+const Nv2aVshProg *nv2a_vsh_snapshot(void)
+{
+    if (!s_dec_valid)
+        decode_program();
+    return s_cur_shared ? s_cur : NULL;
+}
+
+const float (*nv2a_vsh_constants(void))[4]
+{
+    return (const float (*)[4])s_const;
+}
+
+int nv2a_vsh_cxt_write(void)
+{
+    return s_cxt_write != 0;
+}
+
+int nv2a_vsh_transform(const Nv2aVshProg *p, const float (*cst)[4],
+                       const float (*in)[NV2A_VSH_INPUTS][4], uint32_t n,
+                       Nv2aVshOutput *out)
+{
+    uint32_t i, l;
+
+    for (i = 0; i < n; i += 4) {
+        const float (*ip[4])[4];
+        Nv2aVshOutput tail[4], *op[4];
+        for (l = 0; l < 4; l++) {
+            uint32_t j = i + l < n ? i + l : n - 1;
+            ip[l] = (const float (*)[4])in[j];
+            op[l] = i + l < n ? &out[i + l] : &tail[l];
+        }
+        if (!run4_with(p, cst, ip, op))
+            return 0;
+    }
+    return 1;
 }
