@@ -63,15 +63,15 @@ void xbox_SetMapSize(size_t bytes)
  * arena's first physical address is kept so xbox_ContiguousOwnsPhys can tell
  * arena memory from the image below it. */
 uint32_t g_xbox_contig_size = 64u * 1024u * 1024u;
-static int g_contig_above_image;
+static int g_contig_above_image;   /* tag_ram, see the header */
 static uint32_t g_contig_next;          /* defined with the allocator below */
 static uint32_t g_contig_lo = 0x1000u;  /* physical start of the arena */
 
-void xbox_SetContigLayout(uint32_t bytes, int above_image)
+void xbox_SetContigLayout(uint32_t bytes, int tag_ram)
 {
     if (bytes >= 64u * 1024u * 1024u && bytes <= XBOX_CONTIG_SIZE_MAX)
         g_xbox_contig_size = bytes;
-    g_contig_above_image = above_image;
+    g_contig_above_image = tag_ram;
 }
 
 /* File mapping handle for the Xbox memory region.
@@ -2390,19 +2390,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE
             );
-        /* Arena above the image (xbox_SetContigLayout). The image is loaded
-         * by now, so its top is known. */
-        if (g_contig_above_image && g_xbox_image_hi) {
-            uint32_t lo = (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu;
-            if ((uint64_t)lo + 16u * 1024u * 1024u <= XBOX_CONTIG_SIZE) {
-                g_contig_lo = lo;
-                g_contig_next = XBOX_CONTIG_BASE + lo;
-            } else {
-                fprintf(stderr, "  WARNING: image top 0x%08X leaves under 16 MB "
-                        "of the %u MB contiguous window; arena stays at 0x1000\n",
-                        g_xbox_image_hi, XBOX_CONTIG_SIZE / (1024 * 1024));
-            }
-        }
+        /* The arena keeps numbering from 0x1000, below 64 MB, even with the
+         * 128 MB window (xbox_SetContigLayout). It used to start above the
+         * image instead -- Blinx 2's image ends at 0x0303AC20 -- so that its
+         * physical numbers could not be mistaken for image or heap VAs. That
+         * left 16 MB below 64 MB for a title that needs ~26 MB, its actor
+         * models landed past 64 MB where no console puts anything, and every
+         * character stopped being drawn. Disjointness now comes from the
+         * other side: MmGetPhysicalAddress tags every non-window VA
+         * (XBOX_PHYS_RAM_TAG), so an untagged physical number below the
+         * window size is always arena memory, and device models strip the
+         * tag to reach RAM. */
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X, "
                     "arena from physical 0x%08X\n",
@@ -3183,6 +3181,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * port reset, walking a device whose parent pointer had been overwritten. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 
+/* The console has 64 MB, so no physical address it hands out is at or
+ * above 0x04000000, and titles depend on that: Blinx 2 stopped drawing every
+ * actor model -- the player, enemies -- once the 128 MB window put
+ * contiguous blocks past 64 MB (RECOMP_CONTIG_LEGACY=1, whose arena stays
+ * below 64 MB, brought them back). So the arena is two bump regions: the
+ * part of the window below 64 MB, used first, and the rest, used only when
+ * that is exhausted. Freed blocks below 64 MB are reused before either. */
+#define CONTIG_PHYS_LIMIT 0x04000000u
+static uint32_t g_contig_next_hi = XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT;
+
 /* Under RECOMP_HEAP_RECLAIM, blocks handed out in address order, so
  * MmFreeContiguousMemory can give them back. "Allocated once" holds for
  * framebuffers and pushbuffers but not for titles that keep textures and
@@ -3211,66 +3219,92 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
     g_contig_block_count++;
 }
 
+/* Carve an aligned piece from a freed block, keeping the rest free. Only
+ * blocks ending at or below `limit` (a window VA) are considered. */
+static uint32_t contig_reuse(uint32_t size, uint32_t alignment, uint32_t limit)
+{
+    int i;
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t a, end, front, back;
+        if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size)
+            continue;
+        a = (g_contig_blocks[i].addr + alignment - 1) & ~(alignment - 1);
+        end = g_contig_blocks[i].addr + g_contig_blocks[i].size;
+        if ((uint64_t)a + size > end || (uint64_t)a + size > limit)
+            continue;
+        front = a - g_contig_blocks[i].addr;
+        back = end - (a + size);
+        g_contig_blocks[i].addr = a;
+        g_contig_blocks[i].size = size;
+        g_contig_blocks[i].free = 0;
+        if (back)  contig_insert(i + 1, a + size, back, 1);
+        if (front) contig_insert(i, a - front, front, 1);
+        return a;
+    }
+    return 0;
+}
+
+/* Bump-allocate from [*next, limit); 0 when it does not fit. Under reclaim
+ * the piece (and any alignment gap) is recorded in address order. */
+static uint32_t contig_bump(uint32_t *next, uint32_t limit, uint32_t size,
+                            uint32_t alignment, int reclaim)
+{
+    uint32_t result = (*next + alignment - 1) & ~(alignment - 1);
+    if ((uint64_t)result + size > limit)
+        return 0;
+    if (reclaim) {
+        int at = 0;
+        while (at < g_contig_block_count && g_contig_blocks[at].addr < *next)
+            at++;
+        if (result > *next)               /* the alignment gap stays usable */
+            contig_insert(at++, *next, result - *next, 1);
+        contig_insert(at, result, size, 0);
+    }
+    *next = result + size;
+    return result;
+}
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result = 0;
     int reclaim = xbox_HeapReclaimEnabled();
-    int i;
+    uint32_t top = (uint32_t)((uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                              - XBOX_GPU_INSTANCE_DEFAULT);
+    uint32_t low_limit = XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT;
 
+    if (low_limit > top)
+        low_limit = top;
     if (alignment < 4096) alignment = 4096;
     if (reclaim) {
         AcquireSRWLockExclusive(&g_contig_lock);
         size = (size + 4095u) & ~4095u;
         if (size == 0) size = 4096;
-
-        /* A freed block first: carve the aligned piece, keep what is left free. */
-        for (i = 0; i < g_contig_block_count; i++) {
-            uint32_t a, end, front, back;
-            if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size)
-                continue;
-            a = (g_contig_blocks[i].addr + alignment - 1) & ~(alignment - 1);
-            end = g_contig_blocks[i].addr + g_contig_blocks[i].size;
-            if ((uint64_t)a + size > end)
-                continue;
-            front = a - g_contig_blocks[i].addr;
-            back = end - (a + size);
-            g_contig_blocks[i].addr = a;
-            g_contig_blocks[i].size = size;
-            g_contig_blocks[i].free = 0;
-            if (back)  contig_insert(i + 1, a + size, back, 1);
-            if (front) contig_insert(i, a - front, front, 1);
-            result = a;
-            break;
+        result = contig_reuse(size, alignment, low_limit);
+    }
+    if (!result)
+        result = contig_bump(&g_contig_next, low_limit, size, alignment, reclaim);
+    if (!result && reclaim)
+        result = contig_reuse(size, alignment, top);
+    if (!result && top > XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT) {
+        result = contig_bump(&g_contig_next_hi, top, size, alignment, reclaim);
+        if (result) {
+            static LONG warned;
+            if (InterlockedIncrement(&warned) <= 4)
+                fprintf(stderr, "  [CONTIG] below-64 MB arena full; %u bytes at "
+                        "physical 0x%08X (no console has that address)\n",
+                        size, result - XBOX_CONTIG_BASE);
         }
     }
-
     if (!result) {
-        result = (g_contig_next + alignment - 1) & ~(alignment - 1);
-
-        /* Leave the top of the window for GPU instance memory. */
-        if ((uint64_t)result + size >
-                (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                    - XBOX_GPU_INSTANCE_DEFAULT) {
-            fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                    size, g_contig_next - XBOX_CONTIG_BASE - g_contig_lo,
-                    (unsigned)(XBOX_CONTIG_SIZE - g_contig_lo));
-            fflush(stderr);
-            if (reclaim)
-                ReleaseSRWLockExclusive(&g_contig_lock);
-            return 0;
-        }
-        if (reclaim) {
-            if (result > g_contig_next)    /* the alignment gap stays usable */
-                contig_insert(g_contig_block_count, g_contig_next,
-                              result - g_contig_next, 1);
-            contig_insert(g_contig_block_count, result, size, 0);
-        }
-        g_contig_next = result + size;
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u + %u in use)\n",
+                size, g_contig_next - XBOX_CONTIG_BASE - g_contig_lo,
+                g_contig_next_hi - XBOX_CONTIG_BASE - CONTIG_PHYS_LIMIT);
+        fflush(stderr);
     }
     if (reclaim)
         ReleaseSRWLockExclusive(&g_contig_lock);
-
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    if (result)
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 
@@ -3333,7 +3367,8 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
  * a surface offset is physical, and only the window makes it addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return (g_contig_next_hi > XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT
+            ? g_contig_next_hi : g_contig_next) - XBOX_CONTIG_BASE;
 }
 
 /* See XBOX_PHYS_RAM_TAG in xbox_memory_layout.h. RECOMP_PHYS_RAM_TAG=0 turns
@@ -3345,7 +3380,7 @@ int xbox_PhysNeedsRamTag(uint32_t va)
         const char *e = getenv("RECOMP_PHYS_RAM_TAG");
         on = !(e && *e == '0');
     }
-    return on && g_contig_above_image && va >= g_contig_lo
+    return on && g_contig_above_image && va >= 0x1000u
            && va < XBOX_CONTIG_SIZE;
 }
 
@@ -3359,7 +3394,9 @@ int xbox_ContiguousOwnsPhys(uint32_t phys)
      * by accident; with the arena above the image it has to be said. */
     if (phys && phys < 0x1000u)
         return 1;
-    return phys >= g_contig_lo && phys < g_contig_next - XBOX_CONTIG_BASE;
+    return (phys >= g_contig_lo && phys < g_contig_next - XBOX_CONTIG_BASE)
+        || (phys >= CONTIG_PHYS_LIMIT
+            && phys < g_contig_next_hi - XBOX_CONTIG_BASE);
 }
 
 

@@ -98,6 +98,11 @@ static uint32_t dma_resolve(uint32_t offset)
 {
     extern int xbox_ContiguousOwnsPhys(uint32_t phys);
 
+    /* MmGetPhysicalAddress's answer for image or heap memory: the VA,
+     * tagged (XBOX_PHYS_RAM_TAG). */
+    if (offset & 0x40000000u)
+        return offset & ~0x40000000u;
+
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window, and that is not a guess: the arena is a bump
      * allocator from XBOX_CONTIG_BASE, so everything below its high-water

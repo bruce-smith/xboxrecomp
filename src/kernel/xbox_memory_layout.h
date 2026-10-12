@@ -85,12 +85,17 @@ void xbox_SetMapSize(size_t bytes);
  * that follow a physical pointer cannot tell which the title meant. Blinx 2
  * (image top 0x0303AC20) builds its USB descriptors at physical 0x0085C670.
  *
- * above_image starts the arena above the image top, as on hardware; bytes
- * sets the window size (64 MB or XBOX_CONTIG_SIZE_MAX). With a 48 MB image a
- * 64 MB window leaves no room above it, so the two go together. Defaults
- * (64 MB, arena from 0x1000) are the old behaviour. Set before
+ * tag_ram (the parameter once named above_image) makes the two disjoint
+ * from the RAM side instead: MmGetPhysicalAddress returns every non-window
+ * VA with XBOX_PHYS_RAM_TAG, so an untagged physical number is always arena
+ * memory and device models strip the tag to reach RAM. The arena keeps
+ * numbering from 0x1000, below 64 MB first (no console address is higher;
+ * Blinx 2 stops drawing its actors when the arena sits above the image and
+ * spills past 64 MB), and uses the rest of a larger window only when that
+ * is full. bytes sets the window size (64 MB or XBOX_CONTIG_SIZE_MAX).
+ * Defaults (64 MB, no tag) are the old behaviour. Set before
  * xbox_MemoryLayoutInit(). */
-void xbox_SetContigLayout(uint32_t bytes, int above_image);
+void xbox_SetContigLayout(uint32_t bytes, int tag_ram);
 
 /* Whether a physical address lies in the range the contiguous arena has
  * handed out: [arena start, high-water), plus physical page 0, which XAPI's
@@ -100,16 +105,16 @@ int xbox_ContiguousOwnsPhys(uint32_t phys);
 
 /* A "physical" address that names ordinary RAM at (addr & ~XBOX_PHYS_RAM_TAG).
  *
- * With the arena above the image (xbox_SetContigLayout), the general heap's
- * VAs and the arena's physical numbers are the same range, 0x03040000 up. A
- * heap VA is its own physical address here, so MmGetPhysicalAddress on a heap
- * buffer returned a number the arena also owns, and a device model resolving
- * it (xbox_ContiguousOwnsPhys) read the contiguous window instead -- Blinx 2's
- * DirectSound points its voices at heap buffers, and every one played
- * silence. MmGetPhysicalAddress now tags exactly those addresses (non-window
- * VAs inside the arena's physical range, above-image layout only) so they
+ * Image and heap VAs are their own physical numbers here, and the arena
+ * numbers from 0x1000 in the same range, so MmGetPhysicalAddress on a heap
+ * or image buffer would return a number the arena also owns, and a device
+ * model resolving it (xbox_ContiguousOwnsPhys) would read the contiguous
+ * window instead -- Blinx 2's DirectSound points its voices at heap buffers,
+ * and every one played silence. With xbox_SetContigLayout's tag_ram,
+ * MmGetPhysicalAddress tags every non-window VA in the window's range so it
  * cannot be taken for arena memory. Device models that read title buffers
- * strip the tag (mcpx_apu_phys). */
+ * strip the tag (mcpx_apu_phys, the NV2A executor's dma_resolve, OHCI's
+ * bus_resolve). */
 #define XBOX_PHYS_RAM_TAG 0x40000000u
 int xbox_PhysNeedsRamTag(uint32_t va);
 

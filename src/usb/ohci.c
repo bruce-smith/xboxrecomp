@@ -509,6 +509,14 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    /* With RAM tagging (xbox_SetContigLayout), MmGetPhysicalAddress marks
+     * image and heap addresses, so a tagged one is RAM and an untagged one
+     * the arena owns is window memory even inside the image's range -- the
+     * arena numbers from 0x1000. Without tagging, the image wins. */
+    if (addr & XBOX_PHYS_RAM_TAG)
+        return addr & ~XBOX_PHYS_RAM_TAG;
+    if (xbox_PhysNeedsRamTag(0x1000u) && xbox_ContiguousOwnsPhys(addr))
+        return OHCI_CONTIG_BASE + addr;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (xbox_ContiguousOwnsPhys(addr))
