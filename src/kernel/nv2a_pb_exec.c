@@ -3578,14 +3578,18 @@ static int draw_samples(int st, uint32_t *lo, uint32_t *hi)
     return 1;
 }
 
-/* RECOMP_ASYNC_SYNC=1: the per-frame sync points stop draining the queue
- * on the executor. Each one emptied the pipeline -- the executor waited,
+/* Asynchronous sync points, the default (RECOMP_ASYNC_SYNC=0 restores the
+ * drains). Blinx 2's first mission ran 28 against 25 fps median with them,
+ * alternating within one run; 15 soak runs (hub idle, stage 01-01) came
+ * through without a stall once 1d4f335/38db67f were in.
+ *
+ * The per-frame sync points no longer drain the queue on the executor.
+ * Each one emptied the pipeline -- the executor waited,
  * the title waited on the executor, and the workers then idled while the
  * executor walked on -- and removing any single one only moved the wait to
  * the next (P8's per-site timings). Render-to-texture hazards become
  * barrier batches, clears become ordered jobs, visibility reports are
- * written when their batches are done; the flip is the one drain left.
- * Changed only at a flip, where everything is drained. */
+ * written when their batches are done; the flip is the one drain left. */
 static int rq_ready(void);
 static int rq_queue_samples(uint32_t lo, uint32_t hi);
 static int s_async = -1;
@@ -3594,7 +3598,7 @@ static int rq_async(void)
 {
     if (s_async < 0) {
         const char *e = getenv("RECOMP_ASYNC_SYNC");
-        s_async = e && *e == '1' && raster_pool_size() > 1 && rq_ready();
+        s_async = !(e && *e == '0') && raster_pool_size() > 1 && rq_ready();
     }
     return s_async;
 }
