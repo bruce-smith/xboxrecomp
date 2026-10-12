@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +45,10 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  *   Z X A S       A B X Y           Backspace  BACK
  *   Q E           white black       1 3        triggers
  *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
+ *   Shift Ctrl    left/right thumb click
+ *
+ * The full table, pad and keyboard, is printed once at the first poll; see
+ * log_mapping_once().
  *
  * Keys come from the framebuffer window, which only receives them while it
  * has the focus, so typing in another window does not drive the game.
@@ -124,6 +129,29 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+/* The whole mapping, once, so "which button is Black" is answered by the log
+ * rather than by reading this file. Lazily at the first poll because nothing
+ * calls xbox_InputInit. */
+static void log_mapping_once(void)
+{
+    static LONG done;
+    if (InterlockedExchange(&done, 1))
+        return;
+    fprintf(stderr,
+        "  [INPUT] mapping (Xbox <- host pad | keyboard%s):\n"
+        "  [INPUT]   d-pad        <- d-pad          | arrows\n"
+        "  [INPUT]   Start / Back <- Start / Back   | Enter / Backspace\n"
+        "  [INPUT]   A B X Y      <- A B X Y        | Z X A S\n"
+        "  [INPUT]   White        <- LB             | Q\n"
+        "  [INPUT]   Black        <- RB             | E\n"
+        "  [INPUT]   L / R trigger<- LT / RT analog | 1 / 3\n"
+        "  [INPUT]   L / R thumb  <- LS / RS click  | Shift / Ctrl\n"
+        "  [INPUT]   left stick   <- left stick     | numpad 8/4/2/6\n"
+        "  [INPUT]   right stick  <- right stick    | I/J/K/L\n",
+        keyboard_enabled() ? "" : " off");
+    fflush(stderr);
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -141,6 +169,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    log_mapping_once();
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
@@ -166,9 +195,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
+    /* LB is White and RB is Black: on the Controller S White sits left of
+     * Black, and xemu maps them the same way. This had them crossed. The
+     * shoulders are digital on a host pad, so they read fully pressed. */
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
         (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
@@ -315,9 +347,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
+    /* LB White, RB Black, as in the XInput backend above. */
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 255 : 0;
 
     /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
