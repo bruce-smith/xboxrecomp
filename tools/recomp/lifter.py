@@ -1825,7 +1825,11 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too, as movzx has them. Without them `movsx eax, bp`
+            # became a zero extension: Blinx 2's pad poll (0x0021C457) keeps
+            # the right stick's Y in bp, so a stick pushed down read as +1..+2
+            # instead of -1..0 and the first-person camera could not pitch.
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
