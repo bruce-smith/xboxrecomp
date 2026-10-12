@@ -49,6 +49,9 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* Four vertices through the same program at once; bit-identical to four
+ * nv2a_vsh_run calls. in[l] points at vertex l's 16 inputs. */
+int  nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4]);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

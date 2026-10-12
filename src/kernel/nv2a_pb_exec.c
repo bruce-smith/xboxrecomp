@@ -2759,9 +2759,25 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+    /* Four at a time (nv2a_vsh_run4, bit-identical to one at a time): the
+     * vertex program was a third of the executor in Blinx 2's hub. A short
+     * tail repeats its last vertex to fill the lanes. */
+    for (i = 0; i < n; i += 4) {
+        static float in[4][NV2A_VSH_INPUTS][4];
+        static Nv2aVshOutput tail[4];
+        const float (*ip[4])[4];
+        Nv2aVshOutput *op[4];
+        uint32_t l, a;
+        for (l = 0; l < 4; l++) {
+            uint32_t j = i + l < n ? i + l : n - 1;
+            for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                fetch_attr(&s_gpu.attr[a], s_gpu.idx[j], in[l][a]);
+            ip[l] = (const float (*)[4])in[l];
+            op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
+        }
+        if (!nv2a_vsh_run4(ip, op))
             return;                                    /* no program loaded */
+    }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {

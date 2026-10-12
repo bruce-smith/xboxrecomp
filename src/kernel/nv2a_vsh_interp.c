@@ -461,3 +461,231 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     }
     return 0;
 }
+
+/* ---- four vertices at once ------------------------------------------------
+ *
+ * The same decoded program run over four vertices in lockstep, each register
+ * held as four lanes per component in SSE registers. Decoding, dispatch and
+ * operand routing are paid once per instruction instead of once per vertex,
+ * and the arithmetic is one SSE op for four. Results are bit-identical to
+ * nv2a_vsh_run: the same operations in the same order (dot products summed
+ * left to right, correctly rounded divide and square root), compares written
+ * as the scalar code's ?: rather than minps/maxps, and RCC/EXP/LOG/LIT done
+ * per lane by the scalar code. A program that writes constants (CXT_WRITE)
+ * runs per vertex instead, since a later vertex reads what an earlier one
+ * wrote. */
+#include <emmintrin.h>
+
+typedef struct { __m128 c[4]; } vec4x4;   /* component k, lanes 0..3 */
+
+static vec4x4 rd4(const VshSrc *d, const float (*const in[4])[4],
+                  const vec4x4 *temp, const vec4x4 *opos, const int a0[4])
+{
+    vec4x4 s, r;
+    int k;
+
+    if (d->mux == 1) {
+        s = (d->reg == 12) ? *opos : temp[d->reg < 12 ? d->reg : 0];
+    } else if (d->mux == 2) {
+        for (k = 0; k < 4; k++)
+            s.c[k] = _mm_set_ps(in[3][d->idx][k], in[2][d->idx][k],
+                                in[1][d->idx][k], in[0][d->idx][k]);
+    } else if (!d->rel) {
+        int ci = d->idx < NV2A_VSH_CONSTANTS ? d->idx : 0;
+        for (k = 0; k < 4; k++)
+            s.c[k] = _mm_set1_ps(s_const[ci][k]);
+    } else {
+        int ci[4], l;
+        for (l = 0; l < 4; l++) {
+            ci[l] = d->idx + a0[l];
+            if (ci[l] < 0 || ci[l] >= NV2A_VSH_CONSTANTS)
+                ci[l] = 0;
+        }
+        for (k = 0; k < 4; k++)
+            s.c[k] = _mm_set_ps(s_const[ci[3]][k], s_const[ci[2]][k],
+                                s_const[ci[1]][k], s_const[ci[0]][k]);
+    }
+    for (k = 0; k < 4; k++)
+        r.c[k] = s.c[d->sw[k]];
+    if (d->neg) {
+        const __m128 sign = _mm_set1_ps(-0.0f);
+        for (k = 0; k < 4; k++)
+            r.c[k] = _mm_xor_ps(r.c[k], sign);
+    }
+    return r;
+}
+
+static void wr4(vec4x4 *dst, const vec4x4 *src, uint32_t mask)
+{
+    if (mask & 8) dst->c[0] = src->c[0];
+    if (mask & 4) dst->c[1] = src->c[1];
+    if (mask & 2) dst->c[2] = src->c[2];
+    if (mask & 1) dst->c[3] = src->c[3];
+}
+
+static __m128 sel4(__m128 m, __m128 a, __m128 b)
+{
+    return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
+}
+
+static vec4x4 mac4(uint32_t op, const vec4x4 *a, const vec4x4 *b,
+                   const vec4x4 *c, int a0[4])
+{
+    vec4x4 r = *a;
+    __m128 t, one = _mm_set1_ps(1.0f), zero = _mm_setzero_ps();
+    int k;
+
+    switch (op) {
+    case 1: break;
+    case 2: for (k = 0; k < 4; k++) r.c[k] = _mm_mul_ps(a->c[k], b->c[k]); break;
+    case 3: for (k = 0; k < 4; k++) r.c[k] = _mm_add_ps(a->c[k], c->c[k]); break;
+    case 4: for (k = 0; k < 4; k++)
+                r.c[k] = _mm_add_ps(_mm_mul_ps(a->c[k], b->c[k]), c->c[k]);
+            break;
+    case 5: case 6: case 7:
+        t = _mm_add_ps(_mm_add_ps(_mm_mul_ps(a->c[0], b->c[0]),
+                                  _mm_mul_ps(a->c[1], b->c[1])),
+                       _mm_mul_ps(a->c[2], b->c[2]));
+        if (op == 6) t = _mm_add_ps(t, b->c[3]);
+        if (op == 7) t = _mm_add_ps(t, _mm_mul_ps(a->c[3], b->c[3]));
+        r.c[0] = r.c[1] = r.c[2] = r.c[3] = t;
+        break;
+    case 8:
+        r.c[0] = one;
+        r.c[1] = _mm_mul_ps(a->c[1], b->c[1]);
+        r.c[2] = a->c[2];
+        r.c[3] = b->c[3];
+        break;
+    case 9:  for (k = 0; k < 4; k++)
+                 r.c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), a->c[k], b->c[k]);
+             break;
+    case 10: for (k = 0; k < 4; k++)
+                 r.c[k] = sel4(_mm_cmpge_ps(a->c[k], b->c[k]), a->c[k], b->c[k]);
+             break;
+    case 11: for (k = 0; k < 4; k++)
+                 r.c[k] = sel4(_mm_cmplt_ps(a->c[k], b->c[k]), one, zero);
+             break;
+    case 12: for (k = 0; k < 4; k++)
+                 r.c[k] = sel4(_mm_cmpge_ps(a->c[k], b->c[k]), one, zero);
+             break;
+    case 13: {
+        float x[4];
+        int l;
+        _mm_storeu_ps(x, a->c[0]);
+        for (l = 0; l < 4; l++)
+            a0[l] = (int)floorf(x[l] + 0.001f);
+        break;
+    }
+    default: break;
+    }
+    return r;
+}
+
+static vec4x4 ilu4(uint32_t op, const vec4x4 *c)
+{
+    vec4x4 r = *c;
+    int k, l;
+
+    switch (op) {
+    case 1: break;
+    case 4: {                                       /* rsq: 1/sqrt(|x|) */
+        __m128 x = _mm_andnot_ps(_mm_set1_ps(-0.0f), c->c[0]);
+        __m128 v = _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(x));
+        r.c[0] = r.c[1] = r.c[2] = r.c[3] = v;
+        break;
+    }
+    default: {                                      /* per lane, scalar */
+        float cs[4][4], rs[4][4];
+        for (k = 0; k < 4; k++)
+            _mm_storeu_ps(cs[k], c->c[k]);
+        for (l = 0; l < 4; l++) {
+            vec4 cv, rv;
+            for (k = 0; k < 4; k++)
+                cv.v[k] = cs[k][l];
+            rv = run_ilu(op, cv);
+            for (k = 0; k < 4; k++)
+                rs[k][l] = rv.v[k];
+        }
+        for (k = 0; k < 4; k++)
+            r.c[k] = _mm_loadu_ps(rs[k]);
+        break;
+    }
+    }
+    return r;
+}
+
+int nv2a_vsh_run4(const float (*const in[4])[4], Nv2aVshOutput *out[4])
+{
+    vec4x4 temp[12], opos, outregs[13];
+    int a0[4] = {0, 0, 0, 0};
+    uint32_t s;
+    int k, l;
+
+    if (!s_dec_valid)
+        decode_program();
+    if (s_cxt_write) {
+        for (l = 0; l < 4; l++)
+            if (!nv2a_vsh_run(in[l], out[l]))
+                return 0;
+        return 1;
+    }
+    memset(temp, 0, sizeof temp);
+    memset(&opos, 0, sizeof opos);
+    memset(outregs, 0, sizeof outregs);
+    outregs[3].c[3] = outregs[4].c[3] = _mm_set1_ps(1.0f);
+    outregs[9].c[3] = outregs[10].c[3] = outregs[11].c[3]
+                    = outregs[12].c[3] = _mm_set1_ps(1.0f);
+
+    for (s = 0; s < s_dec_n; s++) {
+        const VshIns *ins = &s_dec[s];
+        vec4x4 a = rd4(&ins->src[0], in, temp, &opos, a0);
+        vec4x4 b = rd4(&ins->src[1], in, temp, &opos, a0);
+        vec4x4 c = rd4(&ins->src[2], in, temp, &opos, a0);
+        vec4x4 mres, ires;
+
+        memset(&mres, 0, sizeof mres);
+        memset(&ires, 0, sizeof ires);
+        if (ins->mac)
+            mres = mac4(ins->mac, &a, &b, &c, a0);
+        if (ins->ilu)
+            ires = ilu4(ins->ilu, &c);
+        if (ins->mac && ins->mac != 13 && ins->mac_mask) {
+            vec4x4 *d = ins->tdst == 12 ? &opos
+                      : (ins->tdst < 12 ? &temp[ins->tdst] : NULL);
+            if (d) wr4(d, &mres, ins->mac_mask);
+        }
+        if (ins->ilu && ins->ilu_mask) {
+            uint32_t it = ins->mac ? 1u : ins->tdst;   /* see nv2a_vsh_run */
+            vec4x4 *d = it == 12 ? &opos : (it < 12 ? &temp[it] : NULL);
+            if (d) wr4(d, &ires, ins->ilu_mask);
+        }
+        if (ins->omask && ins->out_o) {               /* c[] writes: s_cxt_write */
+            const vec4x4 *src = ins->out_ilu ? &ires : &mres;
+            if (ins->oaddr == 0)
+                wr4(&opos, src, ins->omask);
+            else if (ins->oaddr < 13)
+                wr4(&outregs[ins->oaddr], src, ins->omask);
+        }
+        if (ins->final) {
+            static const int reg_of[8] = {0, 3, 4, 5, 9, 10, 11, 12};
+            for (l = 0; l < 4; l++) {
+                float *dst[8];
+                int j;
+                dst[0] = out[l]->pos;  dst[1] = out[l]->d0;
+                dst[2] = out[l]->d1;   dst[3] = out[l]->fog;
+                dst[4] = out[l]->tex[0]; dst[5] = out[l]->tex[1];
+                dst[6] = out[l]->tex[2]; dst[7] = out[l]->tex[3];
+                for (j = 0; j < 8; j++) {
+                    const vec4x4 *rg = reg_of[j] ? &outregs[reg_of[j]] : &opos;
+                    for (k = 0; k < 4; k++) {
+                        float lane[4];
+                        _mm_storeu_ps(lane, rg->c[k]);
+                        dst[j][k] = lane[l];
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
