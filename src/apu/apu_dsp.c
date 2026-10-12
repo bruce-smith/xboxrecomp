@@ -79,19 +79,32 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+/* How the 32 mixbins become stereo, standing in for the GP/EP.
  *
- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
- * because this changes audible output for every title and an escape hatch
- * costs one branch. */
-static int mcpx_apu_mixdown_all(void)
+ * DirectSound's bins (DSMIXBIN_*): 0/1 front L/R, 2 centre, 3 LFE, 4/5 back
+ * L/R, 6-9 the crosstalk-cancelled front/back L/R that 3D voices use, 10 the
+ * I3DL2 reverb send, 11-30 the FXSEND_n effect sends. The default is a
+ * standard fold-down of the speaker bins: front + 0.707 centre + 0.707 back
+ * per side, the XTLK pairs likewise, LFE dropped. The sends are not speaker
+ * feeds: on hardware the GP's effects consume them and mix their *output*
+ * into the speaker bins. With the GP stubbed, adding them raw doubled every
+ * reverb-sent voice as dry signal.
+ *
+ * RECOMP_APU_MIXDOWN_ALL=1 restores the previous sum of every bin (even
+ * left, odd right; it is what made Jet Set Radio Future's 3D effects
+ * audible, and the fold-down keeps those, bins 6-9); =0 reads bins 0/1
+ * only. */
+enum { MIXDOWN_FOLD, MIXDOWN_ALL, MIXDOWN_FRONT };
+
+static int mcpx_apu_mixdown_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    static int mode = -1;
+    if (mode < 0) {
         const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+        mode = !(e && *e) ? MIXDOWN_FOLD
+             : atoi(e) != 0 ? MIXDOWN_ALL : MIXDOWN_FRONT;
     }
-    return on;
+    return mode;
 }
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -182,12 +195,20 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Gating the HRTF submix override was tried first and did not fix
              * it, so the defect is the width of this mixdown and nothing else.
              *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
+             * That first fix summed every bin, even left and odd right. The
+             * default is now a fold-down of the speaker bins, which keeps
+             * those effects (6-9 are the XTLK speaker pairs) without adding
+             * the reverb/FX sends as dry signal: see mcpx_apu_mixdown_mode. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            int mode = mcpx_apu_mixdown_mode();
+            if (mode == MIXDOWN_FOLD) {
+                const float k = 0.70710678f;
+                float c = k * mixbins[2][i];
+                left  = mixbins[0][i] + c + k * mixbins[4][i]
+                      + mixbins[6][i] + k * mixbins[8][i];
+                right = mixbins[1][i] + c + k * mixbins[5][i]
+                      + mixbins[7][i] + k * mixbins[9][i];
+            } else if (mode == MIXDOWN_ALL) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
