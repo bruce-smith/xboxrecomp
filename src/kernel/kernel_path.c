@@ -168,6 +168,38 @@ const wchar_t *xbox_LastHostPath(void)
     return s_last_host_path_shared;
 }
 
+/* The last asset archive, movie or music file the title opened: a scene
+ * marker for performance logs ("where was it slow"). Only these kinds, so
+ * saves and caches don't overwrite it. Racy by design: a torn read gives a
+ * garbled name in a log line, nothing more. */
+static char s_last_asset[64];
+
+static int ext_is(const char *dot, const char *ext)
+{
+    return match_prefix(dot, ext) && dot[strlen(ext)] == '\0';
+}
+
+static void xbox_path_note_asset(const char *xbox_path)
+{
+    const char *name = strrchr(xbox_path, '\\'), *dot;
+    size_t n;
+    name = name ? name + 1 : xbox_path;
+    dot = strrchr(name, '.');
+    if (!dot || !(ext_is(dot, ".ipk") || ext_is(dot, ".sfd")
+                  || ext_is(dot, ".adx")))
+        return;
+    n = strlen(name);
+    if (n >= sizeof s_last_asset)
+        n = sizeof s_last_asset - 1;
+    memcpy(s_last_asset, name, n);
+    s_last_asset[n] = 0;
+}
+
+const char *xbox_LastAsset(void)
+{
+    return s_last_asset;
+}
+
 #if defined(_WIN32)
 /* ======================================================================== */
 
@@ -461,6 +493,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
+    xbox_path_note_asset(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
     fflush(stderr);
     {

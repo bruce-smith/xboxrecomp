@@ -3040,22 +3040,23 @@ static int band_has_work(int b)
     return s_pool.band_next[b] < s_pool.head && !s_pool.band_busy[b];
 }
 
-/* RECOMP_RQ_STATS=1: where the raster pool's time goes, per frame, every
- * 60 flips -- workers asleep because every band with work waits (on a
- * batch's geometry, or a barrier) or because there is none, the executor
- * waiting for a ring slot or a drain, and the batches it kicked. */
+/* Where the raster pool's time goes: workers asleep because every band
+ * with work waits (on a batch's geometry, or a barrier) or because there is
+ * none, the executor waiting for a ring slot or a drain, and the batches it
+ * kicked. Always counted -- a QueryPerformanceCounter around each sleep,
+ * which is noise next to the sleep -- for the once-a-second [PERF] line
+ * (nv2a_pb_exec_perf). RECOMP_RQ_STATS=1 also prints the per-frame detail
+ * every 60 flips. */
 static struct {
     volatile LONG64 blk_geo_us, blk_bar_us, idle_us, wait_us;
     volatile LONG64 kicks, barriers, tris;
 } s_rqst;
-static int s_rqst_on = -1;
+static int s_rqst_print = -1;
 static __declspec(thread) int t_blk_why;    /* 1 geometry, 2 barrier */
 
 static int rqst_on(void)
 {
-    if (s_rqst_on < 0)
-        s_rqst_on = getenv("RECOMP_RQ_STATS") != NULL;
-    return s_rqst_on;
+    return 1;
 }
 
 static LONG64 rqst_us(void)
@@ -3400,6 +3401,25 @@ static int rq_in_flight(void)
     return s_pool.head != s_pool.tail;
 }
 
+/* For the [PERF] line: since the last call, the share of the workers' time
+ * spent asleep with nothing to do (idle) and blocked on barriers or
+ * geometry (blocked), and of the wall time the executor spent waiting for
+ * the pool (ring slots, drains). Shares in [0,1]; one caller. */
+void nv2a_pb_exec_perf(double *wk_idle, double *wk_blocked, double *exec_wait)
+{
+    static LONG64 t0, idle0, blk0, wait0;
+    LONG64 t = rqst_us(), idle = s_rqst.idle_us;
+    LONG64 blk = s_rqst.blk_geo_us + s_rqst.blk_bar_us, wait = s_rqst.wait_us;
+    double span = (double)(t - t0), wk = span * (s_pool.n > 1 ? s_pool.n : 1);
+    *wk_idle = *wk_blocked = *exec_wait = 0;
+    if (t0 && span > 0) {
+        *wk_idle = (idle - idle0) / wk;
+        *wk_blocked = (blk - blk0) / wk;
+        *exec_wait = (wait - wait0) / span;
+    }
+    t0 = t; idle0 = idle; blk0 = blk; wait0 = wait;
+}
+
 /* For the stall watchdog: the pool's bookkeeping, read racily -- a stuck
  * pool does not move, so a torn read is not the question. */
 void nv2a_pb_exec_dump_state(void)
@@ -3435,6 +3455,10 @@ void nv2a_pb_exec_dump_state(void)
             owed, s_pool.nbands, busy);
 }
 #else
+void nv2a_pb_exec_perf(double *wk_idle, double *wk_blocked, double *exec_wait)
+{
+    *wk_idle = *wk_blocked = *exec_wait = 0;
+}
 void nv2a_pb_exec_dump_state(void) { }
 void *nv2a_pb_exec_raster_thread(int k) { (void)k; return NULL; }
 static int raster_pool_size(void) { return 1; }
@@ -5807,17 +5831,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_FLIP_INCREMENT_WRITE:
         rq_sync();                       /* the frame is finished */
 #if defined(_WIN32)
-        if (rqst_on() && s_gpu.flips % 60 == 59) {
+        if (s_rqst_print < 0)
+            s_rqst_print = getenv("RECOMP_RQ_STATS") != NULL;
+        if (s_rqst_print && s_gpu.flips % 60 == 59) {
+            /* The time counters run on for nv2a_pb_exec_perf: deltas. */
+            static LONG64 g0, b0, i0, w0;
             double f = 60.0;
             fprintf(stderr, "[RQSTATS] per frame: workers asleep %.1f ms blocked"
                     " on geometry, %.1f ms on barriers, %.1f ms idle (summed over"
                     " %d); executor waited %.1f ms; %.1f batches (%.1f barrier),"
                     " %.0f tris each%c",
-                    s_rqst.blk_geo_us / 1e3 / f, s_rqst.blk_bar_us / 1e3 / f,
-                    s_rqst.idle_us / 1e3 / f, s_pool.n, s_rqst.wait_us / 1e3 / f,
+                    (s_rqst.blk_geo_us - g0) / 1e3 / f,
+                    (s_rqst.blk_bar_us - b0) / 1e3 / f,
+                    (s_rqst.idle_us - i0) / 1e3 / f, s_pool.n,
+                    (s_rqst.wait_us - w0) / 1e3 / f,
                     s_rqst.kicks / f, s_rqst.barriers / f,
                     s_rqst.kicks ? (double)s_rqst.tris / s_rqst.kicks : 0.0, 10);
-            memset((void *)&s_rqst, 0, sizeof s_rqst);
+            g0 = s_rqst.blk_geo_us; b0 = s_rqst.blk_bar_us;
+            i0 = s_rqst.idle_us; w0 = s_rqst.wait_us;
+            s_rqst.kicks = s_rqst.barriers = s_rqst.tris = 0;
         }
 #endif
         s_gpu.flip_write = s_gpu.flip_modulo
