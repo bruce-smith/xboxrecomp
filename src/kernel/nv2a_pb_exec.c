@@ -3515,6 +3515,14 @@ static void rq_wait(void) { }
 static int rq_in_flight(void) { return 0; }
 #endif
 
+/* For the [PERF] line: draw calls and pixels written so far (pixels are
+ * folded in at drains, so per second they lag by at most a frame). */
+void nv2a_pb_exec_counts(uint32_t *draws, uint64_t *pixels)
+{
+    *draws = s_gpu.draws;
+    *pixels = s_gpu.xf_pixels;
+}
+
 /* Hand the batch being filled to the workers (or draw it here, with no
  * pool) and start filling the next one. */
 static void rq_kick(void)
