@@ -319,7 +319,10 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));
-                fprintf(stderr, "  [SCHED] recording the guest schedule to %s\n", r);
+                /* record_blinx2.ps1 looks for this text in the exe to tell
+                 * a build that records a replayable schedule. */
+                fprintf(stderr, "  [SCHED] recording the guest schedule "
+                        "(format %u) to %s\n", ver, r);
             } else
                 fprintf(stderr, "  [SCHED] cannot write %s; recording off\n", r);
         }
