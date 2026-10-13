@@ -14,6 +14,7 @@ extern const Nv2aBackend *xbox_vk_backend(void);
 
 /* The backend's links into the executor, unused here. */
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+int xbox_SchedMode(void) { return 0; }
 int nv2a_exec_texel(const Nv2aTexState *t, uint32_t f, uint32_t u, uint32_t v, uint32_t *c)
 {
     (void)t; (void)f; (void)u; (void)v;

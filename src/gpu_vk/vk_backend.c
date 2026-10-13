@@ -34,6 +34,7 @@
 #include "vk_vsh.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern int xbox_SchedMode(void);          /* kernel: 0 off, 1 record, 2 replay */
 
 #define VKB_SLOTS     2
 #define VKB_RING      (64u << 20)        /* upload bytes per slot */
@@ -1720,6 +1721,25 @@ static void vk_report(uint32_t at, uint64_t stamp, int force)
     B.nrep++;
     vk_mutex_unlock(B.mtx);
     vk_event_set(B.rep_event);
+    /* Answered before GET_REPORT returns under a guest-CPU schedule (an
+     * exact recording or replay: the write must land in the NV2A agent's
+     * turn, as the software path's drain makes its own) and with
+     * RECOMP_REPORT_SYNC=1, the software path's diagnostic. */
+    {
+        static int sync = -1;
+        if (sync < 0)
+            sync = xbox_SchedMode() || getenv("RECOMP_REPORT_SYNC") != NULL;
+        while (sync) {
+            int left;
+            vk_mutex_lock(B.mtx);
+            left = B.nrep;
+            vk_mutex_unlock(B.mtx);
+            if (!left)
+                break;
+            vk_event_set(B.rep_event);
+            vk_yield();
+        }
+    }
 }
 
 /* The colour surface at `addr` read back into B.rbmap (rows of w * bpp

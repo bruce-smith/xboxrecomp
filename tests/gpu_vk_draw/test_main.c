@@ -13,6 +13,7 @@ extern const Nv2aBackend *xbox_vk_backend(void);
 #define MEM_BYTES (8u << 20)
 static uint8_t *g_mem;
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)g_mem; }
+int xbox_SchedMode(void) { return 0; }
 
 /* Texture contents: a 4x4 checker (green on even squares, blue on odd) at
  * TEXA; random 16x16 textures at RTEX + stage * 0x10000 (combiner test). */
