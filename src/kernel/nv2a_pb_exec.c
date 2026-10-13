@@ -5173,7 +5173,7 @@ static void backend_draw(void)
         raw = s_backend->raw_vertices && !cpu_vsh && !nv2a_vsh_cxt_write()
            && (pn = nv2a_vsh_program_words(&w)) != 0;
         for (k = 0; raw && k < pn; k++)
-            if (((w[k][3] >> 12) & 0xF) && !((w[k][3] >> 11) & 1))
+            if (nv2a_vsh_ins_writes_constant(w[k]))
                 raw = 0;                   /* writes c[] */
         if (raw) {
             memset(&g, 0, sizeof g);

@@ -77,3 +77,4 @@ void *vk_mutex_new(void)
 void vk_mutex_lock(void *m)   { AcquireSRWLockExclusive((SRWLOCK *)m); }
 void vk_mutex_unlock(void *m) { ReleaseSRWLockExclusive((SRWLOCK *)m); }
 void vk_yield(void)           { Sleep(0); }
+void vk_store_fence(void)     { MemoryBarrier(); }

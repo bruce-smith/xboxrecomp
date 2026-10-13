@@ -84,5 +84,8 @@ void *vk_mutex_new(void);
 void  vk_mutex_lock(void *m);
 void  vk_mutex_unlock(void *m);
 void  vk_yield(void);
+/* A full memory barrier: stores before it are visible to other CPUs before
+ * stores after it. */
+void  vk_store_fence(void);
 
 #endif

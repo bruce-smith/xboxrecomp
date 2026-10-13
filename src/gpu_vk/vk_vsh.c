@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vk_vsh.h"
+#include "nv2a_vsh_interp.h"     /* nv2a_vsh_ins_writes_constant */
 
 typedef struct {
     char *p;
@@ -230,7 +231,7 @@ int vk_vsh_supported(const uint32_t (*w)[4], uint32_t n)
 {
     uint32_t i;
     for (i = 0; i < n; i++)
-        if (field(w[i], 3, 12, 4) && !field(w[i], 3, 11, 1))
+        if (nv2a_vsh_ins_writes_constant(w[i]))
             return 0;                    /* writes c[]: CXT_WRITE, per vertex */
     return n > 0 && field(w[n - 1], 3, 0, 1);
 }

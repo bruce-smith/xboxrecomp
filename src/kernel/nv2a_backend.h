@@ -88,7 +88,10 @@ typedef struct {
  *  - v == NULL: the raw draw, for a backend that runs the program itself:
  *    the program's words, the constants, the attribute arrays with each
  *    attribute's inline value (what an attribute with no array reads), and
- *    the n indices into the arrays. */
+ *    the n indices into the arrays.
+ * Not only guest memory goes stale: prog, constants, imm, idx and
+ * inline_data point into the executor's own buffers, which the next method
+ * may overwrite. Copy what you need before draw() returns. */
 typedef struct {
     uint32_t prim;
     const Nv2aVshOutput *v;

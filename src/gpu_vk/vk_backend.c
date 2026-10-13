@@ -1649,11 +1649,9 @@ static void report_write(uint32_t at, uint64_t stamp, uint32_t count)
     uint32_t zero = 0;
     memcpy(mem + at, &stamp, 8);
     memcpy(mem + at + 8, &count, 4);
-#if defined(_MSC_VER)
-    _ReadWriteBarrier();                  /* x86 keeps stores in order */
-#else
-    __sync_synchronize();
-#endif
+    /* The title polls the last word from another CPU: everything before it
+     * must be visible first (rq_report_write does the same). */
+    vk_store_fence();
     memcpy(mem + at + 12, &zero, 4);
 }
 

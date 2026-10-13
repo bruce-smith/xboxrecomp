@@ -91,4 +91,13 @@ uint32_t nv2a_vsh_prog_inputs(const Nv2aVshProg *p);
  * the next upload. Returns the count, 0 when no FINAL is in reach. */
 uint32_t nv2a_vsh_program_words(const uint32_t (**words)[4]);
 
+/* Does instruction `ins` write c[] (an output with a mask, routed to the
+ * constants rather than o[])? The one definition of it: nv2a_vsh_run's
+ * write-out (omask && !out_o) and every caller that has to know whether a
+ * program can run anywhere but here, in order (CXT_WRITE). */
+static inline int nv2a_vsh_ins_writes_constant(const uint32_t ins[4])
+{
+    return ((ins[3] >> 12) & 0xF) != 0 && ((ins[3] >> 11) & 1) == 0;
+}
+
 #endif
