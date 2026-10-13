@@ -71,6 +71,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define SCHED_KINDS      16
 
 static int s_mode = -1;                 /* 0 off, 1 record, 2 replay */
+/* 2: every wait's outcome is recorded, not only a finite one's. */
+#define SCHED_FILE_VER 2
+static uint32_t s_file_ver = SCHED_FILE_VER;
 static RECOMP_TLS int t_agent;          /* this host thread's agent, 0 = none */
 static RECOMP_TLS int t_held;           /* holds the guest CPU */
 static volatile LONG s_next_guest = XBOX_SCHED_AGENT_MAIN + 1;
@@ -218,6 +221,7 @@ static int sched_load(const char *path)
     }
     fclose(f);
     memcpy(&ver, buf + 8, 4);
+    s_file_ver = ver;
     p = buf + 12;
     end = buf + size;
     s_runs = (SchedRun *)malloc(cap * sizeof(SchedRun));
@@ -308,7 +312,7 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
         } else if (r && *r) {
             s_out = fopen(r, "wb");
             if (s_out) {
-                uint32_t ver = 1;
+                uint32_t ver = SCHED_FILE_VER;
                 setvbuf(s_out, NULL, _IOFBF, 1 << 20);
                 fwrite("BX2SCHED", 1, 8, s_out);
                 fwrite(&ver, 4, 1, s_out);
@@ -387,6 +391,12 @@ static void sched_stuck(DWORD waited_ms)
                 "holds it (spinning without a yield point?)\n", t_agent,
                 (unsigned long)waited_ms, s_holder);
     fflush(stderr);
+}
+
+/* Whether the replay has handed this agent its turn (it has not taken it). */
+static int sched_my_turn(void)
+{
+    return s_mode == 2 && s_turn == t_agent && !s_busy;
 }
 
 static void sched_acquire(void)
@@ -638,36 +648,97 @@ DWORD xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
         return r;
     b = xbox_SchedBlockBegin();
     if (s_mode == 2) {
-        if (ms != INFINITE) {
-            DWORD rec = (DWORD)sched_value(XBOX_SCHED_WAIT, timeout_code, 1);
-            if (rec == timeout_code) {
-                xbox_SchedBlockEnd(b);
-                return rec;
+        /* The object is taken by the host wait, as in the recording: taking
+         * it at the agent's next turn instead counted two signals that
+         * arrived in between as one (an auto-reset event), and replays went
+         * another way from the first frame. */
+        DWORD rec = timeout_code;
+        if (ms != INFINITE || s_file_ver >= 2)
+            rec = (DWORD)sched_value(XBOX_SCHED_WAIT, timeout_code, 1);
+        if (rec == timeout_code && ms != INFINITE) {
+            xbox_SchedBlockEnd(b);
+            return rec;
+        }
+        if (s_file_ver < 2) {
+            r = try_wait(ctx, INFINITE);
+            xbox_SchedBlockEnd(b);
+            return r;
+        }
+        /* The agent's next turn means the recording's wait was satisfied. A
+         * notification event set and reset again in the setter's turn did
+         * satisfy it (the host waiter woke in between), but a replay's host
+         * waiter can miss that window and block for ever on its own turn:
+         * once the turn has come, the recorded outcome stands. */
+        for (;;) {
+            r = try_wait(ctx, 1);
+            if (r != timeout_code)
+                break;
+            if (sched_my_turn()) {
+                r = try_wait(ctx, 0);
+                if (r == timeout_code)
+                    r = rec;
+                break;
             }
         }
-        r = try_wait(ctx, INFINITE);
         xbox_SchedBlockEnd(b);
         return r;
     }
     r = try_wait(ctx, ms);
     xbox_SchedBlockEnd(b);
-    if (ms != INFINITE)
-        xbox_SchedValue(XBOX_SCHED_WAIT, r);
+    xbox_SchedValue(XBOX_SCHED_WAIT, r);
     return r;
+}
+
+/* A lock another agent may hold, taken only while holding the CPU.
+ *
+ * Blocking on the host primitive took it outside the schedule: a thread
+ * that released the lock and took it straight back before the waiter woke
+ * (a critical section is not fair) left the waiter blocked at a turn the
+ * recording gave it -- a replay deadlocked on CRI's ADX lock that way. So
+ * the agent lets go of the CPU, waits until the lock is free without taking
+ * it (recording) or not at all (replay: its next turn comes when the
+ * recording's did), takes the CPU back and tries again. Each try is a turn,
+ * the same number in both. */
+int xbox_SchedTakeLock(int (*try_take)(void *ctx), void (*wait_free)(void *ctx),
+                       void *ctx)
+{
+    if (try_take(ctx))
+        return 1;
+    if (!t_held) {
+        do
+            wait_free(ctx);
+        while (!try_take(ctx));
+        return 1;
+    }
+    for (;;) {
+        int b = xbox_SchedBlockBegin();
+        if (s_mode == 1)
+            wait_free(ctx);
+        xbox_SchedBlockEnd(b);
+        if (try_take(ctx))
+            return 1;
+    }
+}
+
+static int cs_try(void *cs)
+{
+    return TryEnterCriticalSection((CRITICAL_SECTION *)cs) != 0;
+}
+
+static void cs_wait_free(void *cs)
+{
+    EnterCriticalSection((CRITICAL_SECTION *)cs);
+    LeaveCriticalSection((CRITICAL_SECTION *)cs);
 }
 
 /* A host critical section that another agent may hold. */
 void xbox_SchedEnterCS(CRITICAL_SECTION *cs)
 {
-    int b;
-    if (!t_held || TryEnterCriticalSection(cs)) {
-        if (!t_held)
-            EnterCriticalSection(cs);
+    if (!t_held) {
+        EnterCriticalSection(cs);
         return;
     }
-    b = xbox_SchedBlockBegin();
-    EnterCriticalSection(cs);
-    xbox_SchedBlockEnd(b);
+    xbox_SchedTakeLock(cs_try, cs_wait_free, cs);
 }
 
 /* A guest sleep: let go of the CPU for its length. A replay does not sleep

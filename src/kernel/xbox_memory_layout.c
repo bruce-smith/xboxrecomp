@@ -669,6 +669,11 @@ void xbox_Nv2aNotify(uint32_t method, uint32_t param)
      * and the timer agent raises the interrupt: let go of it while waiting,
      * through the schedule, which records whether it was serviced in time. */
     if (xbox_SchedMode() && xbox_SchedHeld()) {
+        /* The raster workers' writes (render targets, visibility reports)
+         * finish first: after the let-go they would land in another agent's
+         * turn, at a host-timed moment. */
+        extern void nv2a_pb_exec_drain(void);
+        nv2a_pb_exec_drain();
         InterlockedExchange(&s_notify_pending, 1);
         xbox_SchedWaitUntil(notify_serviced, (void *)r, 100);
         InterlockedExchange(&s_notify_pending, 0);

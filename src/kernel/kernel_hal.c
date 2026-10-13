@@ -128,10 +128,19 @@ static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
-static DWORD dispatch_wait(void *ctx, DWORD ms)
+static int dispatch_try(void *ctx)
+{
+    DWORD r;
+    (void)ctx;
+    r = WaitForSingleObject(s_dispatch_mutex, 0);
+    return r == WAIT_OBJECT_0 || r == WAIT_ABANDONED;
+}
+
+static void dispatch_wait_free(void *ctx)
 {
     (void)ctx;
-    return WaitForSingleObject(s_dispatch_mutex, ms);
+    if (WaitForSingleObject(s_dispatch_mutex, INFINITE) == WAIT_OBJECT_0)
+        ReleaseMutex(s_dispatch_mutex);
 }
 
 static void dispatch_lock(DWORD timeout_ms, const char *who)
@@ -141,9 +150,15 @@ static void dispatch_lock(DWORD timeout_ms, const char *who)
     InitOnceExecuteOnce(&s_dispatch_once, dispatch_lock_init, NULL, NULL);
     if (!s_dispatch_mutex)
         return;
-    /* Through the guest-CPU schedule: the holder may be an agent waiting for
-     * the CPU, so a contended wait lets go of it (sched.c). */
-    r = xbox_SchedWaitFn(dispatch_wait, NULL, timeout_ms, WAIT_TIMEOUT);
+    /* Under a guest-CPU schedule the holder may be an agent waiting for the
+     * CPU, and the mutex must change hands only at recorded turns: it is
+     * taken holding the CPU, with no time limit (sched.c). */
+    if (xbox_SchedHeld()) {
+        xbox_SchedTakeLock(dispatch_try, dispatch_wait_free, NULL);
+        t_dispatch_held = 1;
+        return;
+    }
+    r = WaitForSingleObject(s_dispatch_mutex, timeout_ms);
     if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
         t_dispatch_held = 1;
         return;

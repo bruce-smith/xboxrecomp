@@ -853,6 +853,8 @@ void     xbox_SchedClose(void);                 /* last run + flush, at exit */
 DWORD    xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
                           DWORD ms, DWORD timeout_code);
 void     xbox_SchedEnterCS(CRITICAL_SECTION *cs);
+int      xbox_SchedTakeLock(int (*try_take)(void *ctx), void (*wait_free)(void *ctx),
+                            void *ctx);
 DWORD    xbox_SchedSleep(DWORD ms, BOOL alertable);
 DWORD    xbox_SchedSuspendSelf(HANDLE self);
 DWORD    xbox_SchedResume(HANDLE h);
