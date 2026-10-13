@@ -2237,12 +2237,12 @@ static int rc_stage_fetch(int st, const float c[4], const float prev[4][4],
         float ds = prev[in][2], dt = prev[in][1], du, dv, u, v;
         if (!(ti->filter >> 31 & 1)) ds = ds * 2.0f - 1.0f;
         if (!(ti->filter >> 30 & 1)) dt = dt * 2.0f - 1.0f;
+        /* Added in the coordinates' own units, as xemu does (texScale *
+         * (pT + dsdt)): texels for a linear texture, whose coordinates are
+         * texels. Scaling the offset by the texture size for those turned a
+         * few texels of ripple into hundreds. */
         du = t->bump_mat[0] * ds + t->bump_mat[2] * dt;
         dv = t->bump_mat[1] * ds + t->bump_mat[3] * dt;
-        if (!tex_size_from_format(t->color)) {     /* linear: texel units */
-            du *= (float)t->width;
-            dv *= (float)t->height;
-        }
         u = c[0] + du;
         v = c[1] + dv;
         rc_texel(t, 0, u, v, out);
