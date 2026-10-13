@@ -1984,23 +1984,9 @@ static void zbuf_clear(uint32_t what)
     float *z, v;
     uint8_t sv = (uint8_t)(s_gpu.zstencil_clear & 0xFF);
     size_t k;
-    /* Under RECOMP_ASYNC_SYNC the depth clear drains, as it does without:
-     * as an ordered job (RECOMP_ZCLEAR_JOB=1) Blinx 2's sea flashed dark
-     * blocks on 20-45% of frames. The reflection targets are cleared (colour
-     * and depth) and redrawn twice a frame, and on those frames the water
-     * read a darker reflection. A drain at these clears -- at the depth clear
-     * or the colour clear before it -- removes it (0 of ~50 frames, against
-     * 17-25 of ~50), with no fps cost measured; barriers at the clears did
-     * not, and no batch-ordering violation showed in a checker of every
-     * band against the batches before it. Cause not found yet. */
     if (rq_async()) {
-        static int job = -1;
-        if (job < 0) {
-            const char *e = getenv("RECOMP_ZCLEAR_JOB");
-            job = e && *e == '1';
-        }
         z = zbuf_current(1);
-        if (job && z && rq_zclear_job(z, zclear_value(), what, sv))
+        if (z && rq_zclear_job(z, zclear_value(), what, sv))
             return;
     }
     rq_sync();
@@ -3869,6 +3855,16 @@ static int rq_clear_job(uint8_t *mem, uint32_t bpp)
     J.miny = (int)s_gpu.clip_y; J.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
     rq_push_job(&J);
     rq_note_surface(s_rq[s_rq_fill], lo, hi);     /* a later sample orders after */
+    /* What comes next waits for the whole clear. The job clears its rows
+     * band by band, which keeps it in order with draws that use the same
+     * layout. D3D clears a swizzled render target with the surface set to
+     * pitch, then draws into it swizzled (Blinx 2's reflection targets:
+     * format 0x08080128 for the clear, 0x08080228 for the draws). A
+     * swizzled texel's bytes lie in the pitch rows of other bands, so one
+     * band could still be clearing rows another had already drawn into.
+     * The cleared holes showed as one-frame dark blocks in stage 01-01's
+     * sea under RECOMP_ASYNC_SYNC. */
+    (void)rq_barrier(2);
     return 1;
 }
 
