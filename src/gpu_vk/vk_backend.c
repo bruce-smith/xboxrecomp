@@ -1841,7 +1841,8 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
  * differing pixels, and a summary every 300 flips; with
  * RECOMP_VK_COMPARE_DUMP=<prefix>, the worst frames and a sample of the rest
  * (up to 60) are written as
- * <prefix>NNNNN_{vk,sw,diff}.bmp. */
+ * <prefix>NNNNN_{vk,sw,diff}.bmp; with RECOMP_VK_COMPARE_DUMP_MIN=<percent>,
+ * only frames with at least that share of differing pixels, the first 60. */
 static void write_bmp32(const char *path, const uint32_t *px, uint32_t w, uint32_t h)
 {
     FILE *f = fopen(path, "wb");
@@ -1870,7 +1871,7 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
     static int tol = -1, dumps;
     static const char *dump;
     static uint64_t frames, bad_frames, px_total, px_bad;
-    static double worst = 0.0;
+    static double worst = 0.0, dump_min = -1.0;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t x, y, maxd = 0, nbad = 0;
     uint64_t sumd = 0;
@@ -1881,6 +1882,8 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
         const char *t = getenv("RECOMP_VK_COMPARE_TOL");
         tol = t ? atoi(t) : 8;
         dump = getenv("RECOMP_VK_COMPARE_DUMP");
+        t = getenv("RECOMP_VK_COMPARE_DUMP_MIN");
+        dump_min = t ? atof(t) / 100.0 : -1.0;
     }
     B.frame++;
     if (bpp != 4 || !pitch || !readback(addr, bpp, &w, &h)) {
@@ -1914,7 +1917,9 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
                 flip, nbad, 100.0 * frac, tol, maxd, (double)sumd / ((double)w * h));
         /* The worst frames so far, and every 150th differing frame so the
          * ordinary ones are seen too. */
-        if (dump && dumps < 60 && (frac > worst * 0.5 || bad_frames % 150 == 0)) {
+        if (dump && dumps < 60
+            && (dump_min >= 0.0 ? frac >= dump_min
+                                : frac > worst * 0.5 || bad_frames % 150 == 0)) {
             char path[512];
             uint32_t *vkp = (uint32_t *)malloc((size_t)w * h * 4);
             uint32_t *swp = (uint32_t *)malloc((size_t)w * h * 4);
