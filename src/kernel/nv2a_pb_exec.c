@@ -1984,9 +1984,23 @@ static void zbuf_clear(uint32_t what)
     float *z, v;
     uint8_t sv = (uint8_t)(s_gpu.zstencil_clear & 0xFF);
     size_t k;
+    /* Under RECOMP_ASYNC_SYNC the depth clear drains, as it does without:
+     * as an ordered job (RECOMP_ZCLEAR_JOB=1) Blinx 2's sea flashed dark
+     * blocks on 20-45% of frames. The reflection targets are cleared (colour
+     * and depth) and redrawn twice a frame, and on those frames the water
+     * read a darker reflection. A drain at these clears -- at the depth clear
+     * or the colour clear before it -- removes it (0 of ~50 frames, against
+     * 17-25 of ~50), with no fps cost measured; barriers at the clears did
+     * not, and no batch-ordering violation showed in a checker of every
+     * band against the batches before it. Cause not found yet. */
     if (rq_async()) {
+        static int job = -1;
+        if (job < 0) {
+            const char *e = getenv("RECOMP_ZCLEAR_JOB");
+            job = e && *e == '1';
+        }
         z = zbuf_current(1);
-        if (z && rq_zclear_job(z, zclear_value(), what, sv))
+        if (job && z && rq_zclear_job(z, zclear_value(), what, sv))
             return;
     }
     rq_sync();
