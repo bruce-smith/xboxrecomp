@@ -3652,6 +3652,19 @@ static void rq_fence(uint32_t off, uint32_t val)
     xbox_Nv2aSemaphoreRelease(off, val);
 }
 
+/* The physical address of a guest one, for render-to-texture tracking.
+ * Blinx 2 draws its water reflections into surfaces at 0x01364000 and
+ * 0x012E4000 and samples them as textures at 0x81364000 and 0x812E4000:
+ * the same memory through the contiguous window. Compared raw, the
+ * ranges never overlapped, so the water sampled a reflection still being
+ * drawn without a barrier: dark one-frame flashes in stage 01-01's sea
+ * under async sync (P7), hidden before by the drains at the clears. Every
+ * range noted or asked about goes through here. */
+static uint32_t rq_phys(uint32_t va)
+{
+    return va & 0x0FFFFFFFu;
+}
+
 static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 {
     int i;
@@ -3666,6 +3679,8 @@ static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
 {
     int i;
+    hi = rq_phys(lo) + (hi - lo);
+    lo = rq_phys(lo);
     if (b->nsurf < 0)
         return;
     for (i = 0; i < b->nsurf; i++)
@@ -3695,6 +3710,8 @@ static LONG rq_unordered_from(void)
 /* Does anything queued -- filling or still being drawn -- write [lo, hi)? */
 static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
 {
+    hi = rq_phys(lo) + (hi - lo);
+    lo = rq_phys(lo);
     if (s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
         return 2;
 #if defined(_WIN32)
@@ -3725,7 +3742,7 @@ static int draw_samples(int st, uint32_t *lo, uint32_t *hi)
     if (s_gpu.rc_seen ? !((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
                       : st != 0)
         return 0;
-    *lo = t->offset;
+    *lo = rq_phys(t->offset);
     *hi = *lo + tex_face_stride(t) * (t->cube ? 6u : 1u);
     return 1;
 }
@@ -3880,6 +3897,8 @@ static int s_rt_next;
 static void rt_seen_note(uint32_t lo, uint32_t hi)
 {
     int i;
+    hi = rq_phys(lo) + (hi - lo);
+    lo = rq_phys(lo);
     for (i = 0; i < NV_RT_SEEN; i++)
         if (s_rt_seen[i].lo == lo && s_rt_seen[i].hi == hi)
             return;
@@ -3913,6 +3932,8 @@ static int rq_tex_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 /* Does anything queued -- filling or still being drawn -- sample [lo, hi)? */
 static int rq_queue_samples(uint32_t lo, uint32_t hi)
 {
+    hi = rq_phys(lo) + (hi - lo);
+    lo = rq_phys(lo);
     if (s_rq[s_rq_fill] && rq_tex_overlaps(s_rq[s_rq_fill], lo, hi))
         return 2;
 #if defined(_WIN32)
