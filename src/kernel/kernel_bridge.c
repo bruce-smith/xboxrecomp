@@ -2429,6 +2429,18 @@ static int kernel_raise_interrupt(uint32_t vector)
     return (int)(g_eax & 1u);
 }
 
+/* A title-side gate on the vblank (xbox_SetVblankGate). Called on the timer
+ * thread each time it could raise one, with due = 1 when the 60 Hz cadence
+ * says it is time; it returns nonzero to raise now. Without a gate the
+ * cadence alone decides. A replay uses it to give the title exactly the
+ * vblanks a recording saw, however fast this run is going. */
+static int (*volatile g_vblank_gate)(int due);
+
+void xbox_SetVblankGate(int (*gate)(int due))
+{
+    g_vblank_gate = gate;
+}
+
 /* The GPU's vertical blank, delivered rather than merely enabled.
  *
  * The D3D8 library linked into a title installs an ISR for this and then waits
@@ -2468,6 +2480,8 @@ static void kernel_vblank_tick(void)
     static LARGE_INTEGER freq;
     static long long next, period;
     LARGE_INTEGER now;
+    int (*gate)(int) = g_vblank_gate;
+    int due;
 
     if (enabled < 0) {
         enabled = getenv("RECOMP_VBLANK") != NULL;
@@ -2486,14 +2500,26 @@ static void kernel_vblank_tick(void)
      * the average at 60 even though each wake is a little late; a long stall
      * resynchronises instead of firing a burst. */
     QueryPerformanceCounter(&now);
-    if (now.QuadPart < next)
+    due = now.QuadPart >= next;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
+        if (due)
+            next = now.QuadPart + period;
         return;
-    next += period;
-    if (now.QuadPart - next > 4 * period)
-        next = now.QuadPart + period;
-
-    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+    }
+    /* Each nonzero answer from the gate is exactly one vblank raised. One it
+     * holds back restarts the cadence, so the next arrives a period after the
+     * gate lets it, not in a burst the moment it does: a vblank that lands
+     * before the title's frame loop resets its counter is lost to the loop. */
+    if (gate ? !gate(due) : !due) {
+        if (due)
+            next = now.QuadPart + period;
         return;
+    }
+    if (due) {
+        next += period;
+        if (now.QuadPart - next > 4 * period)
+            next = now.QuadPart + period;
+    }
 
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
         NV2A_PCRTC_INTR_VBLANK | XBOX_NV2A_VBLANK_MARK;
@@ -2821,6 +2847,15 @@ static int g_timer_started;
  * 10 ms sleep short, because the GPU -- and the executor -- waits on it. */
 static volatile LONG g_nv2a_irq_req;
 static HANDLE g_timer_wake;
+
+/* Cut the timer thread's sleep short: a vblank gate that has one to give
+ * out now (xbox_SetVblankGate) asks for it to be raised without waiting up
+ * to 10 ms for the next wake. */
+void xbox_VblankKick(void)
+{
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
 
 void xbox_Nv2aRequestInterrupt(void)
 {

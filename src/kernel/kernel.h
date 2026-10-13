@@ -813,6 +813,8 @@ void    xbox_IrqlLeaveInterrupt(int saved);
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
 void    xbox_DpcDumpRunning(void);              /* the DPC running now, if any */
+void    xbox_SetVblankGate(int (*gate)(int due)); /* title decides each vblank */
+void    xbox_VblankKick(void);                  /* wake the timer thread now */
 /* Called on the DPC's own thread when one invocation of a DPC has made 1000,
  * 10000 and 100000 KeQuerySystemTime calls -- a loop that reads the clock
  * once per pass and never finds what it waits for. The game registers it to
