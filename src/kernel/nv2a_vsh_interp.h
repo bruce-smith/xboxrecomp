@@ -80,5 +80,9 @@ int nv2a_vsh_cxt_write(void);
 int nv2a_vsh_transform(const Nv2aVshProg *p, const float (*cst)[4],
                        const float (*in)[NV2A_VSH_INPUTS][4], uint32_t n,
                        Nv2aVshOutput *out);
+/* The inputs v[i] the program reads (bit i), so a caller filling `in` for
+ * nv2a_vsh_transform can skip the rest: an input outside the mask is never
+ * read. */
+uint32_t nv2a_vsh_prog_inputs(const Nv2aVshProg *p);
 
 #endif

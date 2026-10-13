@@ -855,6 +855,11 @@ int nv2a_vsh_cxt_write(void)
     return s_cxt_write != 0;
 }
 
+uint32_t nv2a_vsh_prog_inputs(const Nv2aVshProg *p)
+{
+    return p ? p->inputs : 0xFFFFu;
+}
+
 int nv2a_vsh_transform(const Nv2aVshProg *p, const float (*cst)[4],
                        const float (*in)[NV2A_VSH_INPUTS][4], uint32_t n,
                        Nv2aVshOutput *out)

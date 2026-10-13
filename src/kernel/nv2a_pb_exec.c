@@ -4114,9 +4114,17 @@ static int geo_queue(const Nv2aVshProg *prog, uint32_t n)
         b = s_rq[s_rq_fill];
     }
     b = rq_draw_state(b, g.bpp);
-    for (i = 0; i < n; i++)
-        for (a = 0; a < NV2A_VSH_INPUTS; a++)
-            fetch_input(a, s_gpu.idx[i], b->in[b->nin + i][a]);
+    {
+        /* Only the inputs the program reads: a typical one reads three to
+         * five of the sixteen, and fetching all of them for every vertex
+         * was the executor's largest single cost per draw (fetch_attr).
+         * The rest are never read (nv2a_vsh_prog_inputs). */
+        uint32_t used = nv2a_vsh_prog_inputs(prog);
+        for (i = 0; i < n; i++)
+            for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                if (used >> a & 1)
+                    fetch_input(a, s_gpu.idx[i], b->in[b->nin + i][a]);
+    }
     memcpy(b->cst[b->ngeo], nv2a_vsh_constants(), sizeof b->cst[0]);
     J = &b->geo[b->ngeo];
     J->prog = prog;
