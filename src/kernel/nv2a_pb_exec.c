@@ -2622,6 +2622,10 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
             uint32_t argb[4] = {0, 0, 0, 0};
             int mask, n = T->maxx - x < 4 ? T->maxx - x : 4;
             int shade = (P->color_mask & 0x01010101u) || P->alpha_test;
+            uint8_t *sr = P->st_test && T->zb
+                        ? zbuf_stencil(T->zb) + (size_t)y * NV_ZBUF_W + x : NULL;
+            uint32_t pend[4] = {0, 0, 0, 0};
+            int rejm = 0;                       /* stencil op pending the alpha test */
 
             mask = (_mm_movemask_ps(_mm_and_ps(_mm_and_ps(_mm_cmpge_ps(w0, zero),
                                                           _mm_cmpge_ps(w1, zero)),
@@ -2636,15 +2640,41 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
             l0 = _mm_mul_ps(w1, inv); l1 = _mm_mul_ps(w2, inv); l2 = _mm_mul_ps(w0, inv);
             z = bary3(l0, l1, l2, a[2], b[2], c[2]);
             _mm_storeu_ps(zl, z);
-            if (T->zb && P->depth_test) {
+            /* Stencil, as xf_rows_span_scalar, per lane: each lane is its
+             * own pixel, so the order within a pixel is all that matters. */
+            if (sr) {
+                for (l = 0; l < 4; l++) {
+                    if (!(mask >> l & 1) || stencil_pass(sr[l]))
+                        continue;
+                    if (P->st_fail == 0x1E00 || !P->alpha_test) {
+                        stencil_op(&sr[l], P->st_fail);
+                        mask &= ~(1 << l);
+                    } else {
+                        pend[l] = P->st_fail;
+                        rejm |= 1 << l;
+                    }
+                }
+                if (!mask)
+                    continue;
+            }
+            if (T->zb && P->depth_test && (mask & ~rejm)) {
                 int pass;
                 for (l = 0; l < 4; l++)
                     zs[l] = (mask >> l & 1) ? T->zb[(size_t)y * NV_ZBUF_W + x + l] : 0.0f;
                 pass = depth4_mask(P->depth_func, z, _mm_loadu_ps(zs));
-                for (l = 0; l < 4; l++)
-                    if ((mask >> l & 1) && !(pass >> l & 1))
+                for (l = 0; l < 4; l++) {
+                    if (!(mask >> l & 1) || (rejm >> l & 1) || (pass >> l & 1))
+                        continue;
+                    if (sr && P->st_zfail != 0x1E00 && P->alpha_test) {
+                        pend[l] = P->st_zfail;
+                        rejm |= 1 << l;
+                    } else {
+                        if (sr)
+                            stencil_op(&sr[l], P->st_zfail);
                         cnt->depth_fail++;
-                mask &= pass;
+                        mask &= ~(1 << l);
+                    }
+                }
                 if (!mask)
                     continue;
             }
@@ -2713,6 +2743,12 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
             for (l = 0; l < 4; l++) {
                 if (!(mask >> l & 1))
                     continue;
+                if (rejm >> l & 1) {           /* rejected; alpha test passed */
+                    stencil_op(&sr[l], pend[l]);
+                    continue;
+                }
+                if (sr)
+                    stencil_op(&sr[l], P->st_zpass);
                 if (T->zb && P->depth_mask)
                     T->zb[(size_t)y * NV_ZBUF_W + x + l] = zl[l];
                 if (P->zpass_enable)
@@ -2753,10 +2789,10 @@ static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
     orig = (uint32_t *)malloc(npx * 4);
     r4 = (uint32_t *)malloc(npx * 4);
     r1 = (uint32_t *)malloc(npx * 4);
-    if (T->zb) {
-        zorig = (float *)malloc(npx * 4);
-        z4 = (float *)malloc(npx * 4);
-        z1 = (float *)malloc(npx * 4);
+    if (T->zb) {                        /* depths, then the stencil bytes */
+        zorig = (float *)malloc(npx * 5);
+        z4 = (float *)malloc(npx * 5);
+        z1 = (float *)malloc(npx * 5);
     }
     if (!orig || !r4 || !r1 || (T->zb && (!zorig || !z4 || !z1))) {
         free(orig); free(r4); free(r1); free(zorig); free(z4); free(z1);
@@ -2771,8 +2807,11 @@ static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
                 dst[i] = !q ? 0 : T->bpp == 4 ? *(uint32_t *)q : *(uint16_t *)q; \
             } \
         if (T->zb) \
-            for (y = y0, i = 0; y < y1; y++, i += w) \
+            for (y = y0, i = 0; y < y1; y++, i += w) { \
                 memcpy((zdst) + i, T->zb + (size_t)y * NV_ZBUF_W + T->minx, (size_t)w * 4); \
+                memcpy((uint8_t *)((zdst) + npx) + i, \
+                       zbuf_stencil(T->zb) + (size_t)y * NV_ZBUF_W + T->minx, (size_t)w); \
+            } \
     } while (0)
 #define CK_PUT(src, zsrc) do { \
         for (y = y0, i = 0; y < y1; y++) \
@@ -2783,11 +2822,14 @@ static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
                 else *(uint16_t *)q = (uint16_t)src[i]; \
             } \
         if (T->zb) \
-            for (y = y0, i = 0; y < y1; y++, i += w) \
+            for (y = y0, i = 0; y < y1; y++, i += w) { \
                 memcpy(T->zb + (size_t)y * NV_ZBUF_W + T->minx, (zsrc) + i, (size_t)w * 4); \
+                memcpy(zbuf_stencil(T->zb) + (size_t)y * NV_ZBUF_W + T->minx, \
+                       (const uint8_t *)((zsrc) + npx) + i, (size_t)w); \
+            } \
     } while (0)
 #define CK_DIFF(a, za, b, zb_) \
-    (memcmp((a), (b), npx * 4) || (T->zb && memcmp((za), (zb_), npx * 4)))
+    (memcmp((a), (b), npx * 4) || (T->zb && memcmp((za), (zb_), npx * 5)))
 
     CK_GET(orig, zorig);
     xf_rows_span4(T, y0, y1, &c4);
@@ -2802,8 +2844,8 @@ static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
         /* Both again from the same start. A real difference repeats: each
          * path agrees with itself and they still disagree. */
         uint32_t *r4b = (uint32_t *)malloc(npx * 4), *r1b = (uint32_t *)malloc(npx * 4);
-        float *z4b = T->zb ? (float *)malloc(npx * 4) : NULL;
-        float *z1b = T->zb ? (float *)malloc(npx * 4) : NULL;
+        float *z4b = T->zb ? (float *)malloc(npx * 5) : NULL;
+        float *z1b = T->zb ? (float *)malloc(npx * 5) : NULL;
         XfCount c4b = {0, 0, 0, 0, 0, 0}, c1b = {0, 0, 0, 0, 0, 0};
         if (r4b && r1b && (!T->zb || (z4b && z1b))) {
             CK_PUT(orig, zorig);
@@ -2887,7 +2929,7 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
     }
     if (mode == 3) {
         if (s_pxchk_on) {
-            if (step == 1 && T->use_rc && !T->ps->self_sample && !T->ps->st_test) {
+            if (step == 1 && T->use_rc && !T->ps->self_sample) {
                 xf_rows_check(T, y0, y1, cnt);
                 return;
             }
@@ -2908,8 +2950,7 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
     if (self_scalar < 0)
         self_scalar = getenv("RECOMP_SELF_SAMPLE_SCALAR") != NULL;
     if (mode && step == 1 && T->use_rc
-        && (!T->ps->self_sample || ((mode == 1 || mode == 3) && !self_scalar))
-        && !T->ps->st_test) {                   /* stencil: scalar only */
+        && (!T->ps->self_sample || ((mode == 1 || mode == 3) && !self_scalar))) {
         if (mode == 2)
             xf_rows_check(T, y0, y1, cnt);
         else
