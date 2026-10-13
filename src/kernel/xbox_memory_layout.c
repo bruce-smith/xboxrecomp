@@ -1220,11 +1220,44 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* The vblank acknowledgement on a thread of its own (RECOMP_VBLANK).
+ *
+ * D3D's DPC (Blinx 2's sub_002EA4E0, under the routine sub_002EAC90) acks
+ * PCRTC with "= 1" and then spins at DISPATCH until PMC_INTR bit 24 drops,
+ * and only nv2a_vblank_ack drops it. That used to run once per pass of
+ * nv2a_ack_thread -- the thread that also executes the pushbuffer -- so the
+ * DPC spun for as long as one pass took. Normally that is milliseconds, but
+ * anything slow on the executor (a frame dump stuck in WriteFile, a large
+ * draw set up inline) left the guest's timer thread spinning with DISPATCH
+ * held. Then no vblank and no flip: P7's boot run hit 15 s and the stall
+ * watchdog. Here the ack takes microseconds whatever the executor does.
+ * It spins while the interrupt is pending (the DPC is about to ack it, and
+ * every microsecond counts as DPC time) and sleeps 1 ms otherwise. */
+static DWORD WINAPI nv2a_vblank_ack_thread(LPVOID param)
+{
+    volatile uint8_t *regs = (volatile uint8_t *)param;
+    volatile uint32_t *pmc = (volatile uint32_t *)(regs + 0x000100);
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        nv2a_vblank_ack(regs);
+        if (*pmc & (1u << 24))
+            SwitchToThread();
+        else
+            Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    if (getenv("RECOMP_VBLANK")) {
+        HANDLE h = CreateThread(NULL, 0, nv2a_vblank_ack_thread,
+                                g_nv2a_memory, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
