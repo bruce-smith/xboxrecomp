@@ -355,6 +355,80 @@ int xbox_SchedNewGuestAgent(void)
 
 /* --- the CPU itself -------------------------------------------------- */
 
+/* --- a replay that cannot go on ------------------------------------------
+ *
+ * Once the run takes another path than the recording, the schedule's turns
+ * and values no longer fit it, and sooner or later an agent waits for a turn
+ * that never comes: a frozen game, with nothing on screen to say why. So the
+ * first mismatch -- or a stall -- ends the replay: a line in the log, a
+ * message box unless headless, exit code 4. The game sets xbox_sched_poll
+ * (its input poll count) so the message can say where. */
+volatile uint32_t xbox_sched_poll;
+static volatile DWORD s_free_since;     /* when the CPU was last let go */
+
+static DWORD sched_stall_ms(void)
+{
+    static DWORD ms;
+    if (!ms) {
+        const char *e = getenv("RECOMP_REPLAY_STALL_SECS");
+        ms = (e && atoi(e) > 0 ? (DWORD)atoi(e) : 30) * 1000;
+    }
+    return ms;
+}
+
+static void sched_replay_fail(int agent, const char *why)
+{
+    static volatile LONG once;
+    char msg[640];
+    if (InterlockedExchange(&once, 1))
+        return;                         /* another thread is ending it */
+    snprintf(msg, sizeof msg,
+             "The replay diverged from the recording at input poll %u "
+             "(agent %d, schedule run %zu of %zu): %s.\n\n"
+             "From here the game would no longer do what the recording did, "
+             "so the replay has stopped. The log has the details.",
+             xbox_sched_poll, agent, s_cur, s_nruns, why);
+    fprintf(stderr, "[REPLAY] diverged at poll %u (agent %d, run %zu of %zu) "
+            "- replay stopped: %s\n", xbox_sched_poll, agent, s_cur, s_nruns, why);
+    fflush(stderr);
+    if (!getenv("RECOMP_HEADLESS"))
+        MessageBoxA(NULL, msg, "Blinx 2 replay",
+                    MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 4);
+}
+
+/* Where the asking agent is, by name: the lifted guest functions are host
+ * functions (sub_XXXXXXXX), so the first divergence names the guest code that
+ * took another path. */
+static void sched_backtrace(void)
+{
+    static int sym = -1;
+    void *fr[24];
+    USHORT n, i;
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)buf;
+    if (sym < 0) {
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+        sym = 1;
+    }
+    n = CaptureStackBackTrace(1, 24, fr, NULL);
+    for (i = 0; i < n; i++) {
+        DWORD64 off = 0;
+        memset(buf, 0, sizeof buf);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        fprintf(stderr, "      #%u %s+0x%llx\n", i,
+                SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)fr[i], &off, si)
+                    ? si->Name : "?", (unsigned long long)off);
+    }
+    fprintf(stderr, "      guest esp 0x%08X:", g_esp);
+    if (g_esp && g_esp < 0x08000000u)
+        for (i = 0; i < 8; i++)
+            fprintf(stderr, " %08X", *(uint32_t *)(g_xbox_mem_offset + g_esp + 4 * i));
+    fprintf(stderr, "\n");
+}
+
 static void sched_stuck(DWORD waited_ms)
 {
     if (InterlockedIncrement(&s_desync_reports) > 20)
@@ -452,6 +526,19 @@ static void sched_acquire(void)
                 warned = 1;
                 sched_stuck(GetTickCount() - t0);
             }
+            /* Nobody holds the CPU and the agent whose turn it is has not
+             * taken it: it is waiting for something this replay will not
+             * produce. A busy holder (a long load) is not a stall. */
+            if (!s_busy && s_turn != -1
+                && GetTickCount() - s_free_since > sched_stall_ms()) {
+                char why[128];
+                int turn = s_turn;
+                ReleaseSRWLockExclusive(&s_rlock);
+                snprintf(why, sizeof why, "no progress for %lu s: agent %d's "
+                         "turn never came", sched_stall_ms() / 1000, turn);
+                sched_replay_fail(turn, why);
+                AcquireSRWLockExclusive(&s_rlock);
+            }
         }
         s_busy = 1;
         s_holder = t_agent;
@@ -473,6 +560,7 @@ static void sched_release(void)
     AcquireSRWLockExclusive(&s_rlock);
     s_busy = 0;
     s_holder = 0;
+    s_free_since = GetTickCount();
     if (s_turn == -1)
         WakeAllConditionVariable(&s_rcv);
     else if (s_left == 0) {
@@ -584,6 +672,8 @@ void xbox_SchedRunTicks(void)
  * for the waits and sleeps below, which take their recorded outcome in a
  * replay before they have the CPU back.) */
 static uint64_t sched_value(int kind, uint64_t live, int released);
+static int s_sites = -1;
+static volatile LONG s_site_reports;
 
 uint64_t xbox_SchedValue(int kind, uint64_t live)
 {
@@ -593,10 +683,46 @@ uint64_t xbox_SchedValue(int kind, uint64_t live)
 static uint64_t sched_value(int kind, uint64_t live, int released)
 {
     int a = t_agent;
-    if (!xbox_SchedMode() || !a || a >= SCHED_AGENTS || kind >= SCHED_KINDS)
+    if (!xbox_SchedMode())
         return live;
-    if (!t_held && !released)
+    if (!a || a >= SCHED_AGENTS || kind >= SCHED_KINDS || (!t_held && !released)) {
+        /* A host value nobody records: if guest code asked for it, a replay
+         * sees another one. Named, a few times, so the gap can be found. */
+        static volatile LONG gaps;
+        if (InterlockedIncrement(&gaps) <= 6) {
+            fprintf(stderr, "  [SCHED] unrecorded value: kind %d asked by %s %d "
+                    "(%s)\n", kind, a ? "agent" : "an unscheduled thread", a,
+                    a && !t_held ? "not holding the CPU" : "no agent");
+            sched_backtrace();
+            fflush(stderr);
+        }
         return live;
+    }
+    /* RECOMP_SCHED_SITES=1 (a debugging aid, in the recording and the replay
+     * alike): each value is preceded by kind 0, the guest return address it
+     * was asked from, so the first divergence names both sites. */
+    if (s_sites < 0)
+        s_sites = getenv("RECOMP_SCHED_SITES") != NULL;
+    if (s_sites && kind != 0 && kind != XBOX_SCHED_PREEMPT) {
+        uint32_t site = g_esp && g_esp < 0x08000000u
+            ? *(uint32_t *)(g_xbox_mem_offset + g_esp) : 0;
+        if (s_mode == 1)
+            sched_value(0, site, released);
+        else {
+            SchedQueue *q = &s_q[a];
+            if (q->i < q->n && q->kind[q->i] == 0) {
+                uint32_t rec = (uint32_t)q->val[q->i++];
+                if (rec != site && InterlockedIncrement(&s_site_reports) <= 6) {
+                    fprintf(stderr, "  [SCHED] agent %d value #%u (kind %d): "
+                            "recorded at guest 0x%08X, replay at 0x%08X\n",
+                            a, q->i, kind, rec, site);
+                    if (s_site_reports <= 2)
+                        sched_backtrace();
+                    fflush(stderr);
+                }
+            }
+        }
+    }
     if (s_mode == 1) {
         int64_t d;
         uint64_t z;
@@ -618,7 +744,15 @@ static uint64_t sched_value(int kind, uint64_t live, int released)
                 fprintf(stderr, "  [SCHED] agent %d value #%u: recorded kind %d, "
                         "asked for kind %d -- replay has diverged\n", a, q->i,
                         q->kind[q->i], kind);
+                if (s_desync_reports <= 2)
+                    sched_backtrace();
                 fflush(stderr);
+                if (!getenv("RECOMP_REPLAY_KEEP_GOING")) {
+                    char why[96];
+                    snprintf(why, sizeof why, "value #%u was recorded as kind %d, "
+                             "the run asked for kind %d", q->i, q->kind[q->i], kind);
+                    sched_replay_fail(a, why);
+                }
             }
             return q->val[q->i++];
         }
@@ -797,8 +931,8 @@ DWORD xbox_SchedSuspendSelf(HANDLE self)
 DWORD xbox_SchedResume(HANDLE h)
 {
     LONG tid = (LONG)GetThreadId(h);
-    DWORD prev = ResumeThread(h);
-    int i, tries = 0;
+    DWORD prev = ResumeThread(h), t0;
+    int i;
 
     if (prev != 0 || !tid)
         return prev;
@@ -807,12 +941,24 @@ DWORD xbox_SchedResume(HANDLE h)
             break;
     if (i == SCHED_SUSPENDERS)
         return prev;
-    /* Not suspended yet, but about to be: resume it once it is. */
-    while (s_suspending[i] == tid && tries++ < 2000) {
+    /* Not suspended yet, but about to be: resume it once it is. This used to
+     * give up after 2000 Sleep(0)s, which a loaded machine can spend before
+     * the thread gets to SuspendThread: it then stayed suspended for good,
+     * the guest got 0 for its previous suspend count instead of 1, and a
+     * replay stuck on that thread's next turn. Its slot clears only once it
+     * has been resumed, so wait for as long as that takes. */
+    t0 = GetTickCount();
+    while (s_suspending[i] == tid) {
         prev = ResumeThread(h);
         if (prev != 0)
             return prev;
-        Sleep(0);
+        if (GetTickCount() - t0 > 10000) {
+            fprintf(stderr, "  [SCHED] thread %ld has not suspended itself in "
+                    "10 s; resume dropped\n", (long)tid);
+            fflush(stderr);
+            return prev;
+        }
+        SwitchToThread();
     }
     return prev;
 }
