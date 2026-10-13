@@ -726,6 +726,8 @@ static void head_written(uint32_t ed, uint32_t head)
     if (free_slot >= 0) { s_written[free_slot].ed = ed; s_written[free_slot].head = head; }
 }
 
+static void hist_dump(OhciController *hc);
+
 /* Called on every ED visit: notes a HeadP the driver changed, and dumps the
  * history the first time a head is not a descriptor. */
 static void head_check(OhciController *hc, uint32_t ed, uint32_t ed0,
@@ -746,8 +748,17 @@ static void head_check(OhciController *hc, uint32_t ed, uint32_t ed0,
             || guest_ok(head & ED_PTR_MASK, 16))
         return;
     dumped = 1;
-    fprintf(stderr, "  [OHCI%d] BAD HeadP: ED %08X info=%08X head=%08X tail=%08X"
-            " -- last %u events, oldest first:\n", hc->index, ed, ed0, head, tail,
+    fprintf(stderr, "  [OHCI%d] BAD HeadP: ED %08X info=%08X head=%08X tail=%08X\n",
+            hc->index, ed, ed0, head, tail);
+    hist_dump(hc);
+}
+
+/* The last HIST_N events, oldest first. */
+static void hist_dump(OhciController *hc)
+{
+    int i;
+
+    fprintf(stderr, "  [OHCI%d] last %u events, oldest first:\n", hc->index,
             s_hist_seq < HIST_N ? s_hist_seq : HIST_N);
     for (i = 0; i < HIST_N; i++) {
         const HistEntry *h = &s_hist[(s_hist_seq + i) % HIST_N];
@@ -840,6 +851,26 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
 static void ohci_publish_done(OhciController *hc, uint32_t done_head)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
+
+    /* Check the chain the driver is about to walk: every link a descriptor,
+     * ending in 0. XPP's DPC (sub_0036DBCB) reverses it through NextTD and
+     * faulted once on a garbage link (P7, stage 01-01 load). A bad link here
+     * is this model's; a clean chain here and a fault later means the TDs
+     * were rewritten after publication. Dumps the history once. */
+    {
+        static int dumped;
+        uint32_t td = done_head, n = 0;
+        while (td && n < 64 && guest_ok(bus_resolve(td & ED_PTR_MASK), 16)) {
+            td = rd32(td + 8) & ED_PTR_MASK;
+            n++;
+        }
+        if ((td || n >= 64) && !dumped) {
+            dumped = 1;
+            fprintf(stderr, "  [OHCI%d] BAD done queue: head %08X, link %u is %08X\n",
+                    hc->index, done_head, n, td);
+            hist_dump(hc);
+        }
+    }
 
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
