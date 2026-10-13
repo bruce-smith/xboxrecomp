@@ -1,5 +1,58 @@
 # xboxrecomp
 
+> ## About this fork
+>
+> This is a fork of [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)
+> (MIT). It was made for
+> **[Blinx2-Recompiled](https://github.com/bruce-smith/Blinx2-Recompiled)**, a
+> static recompilation of *Blinx 2: Masters of Time and Space*. The working
+> branch is `blinx2-fixes`. For a full, pinned checkout of both projects see
+> [blinx-2-recompile-full](https://github.com/bruce-smith/blinx-2-recompile-full).
+> Upstream remains [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp);
+> the upstream README follows below, unchanged.
+>
+> Main changes in this fork (on top of upstream as of October 2026):
+>
+> - **NV2A pushbuffer executor** (`src/kernel/nv2a_pb_exec.c`): the game's
+>   pushbuffer is executed and rasterised in software.
+>   - Rasterisation is deferred onto a pool of worker threads, in bands of
+>     rows, with four-pixel SSE shading and vertex programs run four
+>     vertices at a time.
+>   - Register combiners, stencil, bump-environment mapping (BUMPENVMAP,
+>     signed and G8B8 textures), near-plane clipping, and render-to-texture
+>     into swizzled and pitch surfaces.
+>   - D3D fences, visibility reports and the vblank are emulated.
+>   - Asynchronous sync points: the executor keeps going while workers draw,
+>     with barriers for render-to-texture and layout hazards.
+>   - Diagnostics: per-frame and per-draw traces, `RECOMP_PIXEL_CHECK` (SIMD
+>     path against the scalar reference), pixel and texture watches.
+> - **APU/audio:** the voice processor's mix is played through XAudio2, with
+>   pitch resampling and mixbin fold-down. Fixes for DirectSound's ISR/DPC
+>   ordering and the front-end FIFO.
+> - **USB/OHCI input:** transfer descriptors are retired in hardware order,
+>   and frame-number overflow is raised. Host pad and keyboard mapping, with
+>   deadzones.
+> - **Kernel and memory:**
+>   - DISPATCH_LEVEL acts as a process-wide lock;
+>   - `CreateSuspended` threads; readable thread objects; file renames;
+>   - a 128 MB contiguous window with tagged physical addresses;
+>   - the runtime region is moved above large images;
+>   - every XBE section is loaded.
+> - **Exact record and replay:** the guest thread schedule (one guest CPU,
+>   including the APU and NV2A threads) is recorded and replayed
+>   (`src/kernel/sched.c`). Together with the pad input and host-time reads,
+>   which the game project records, a run reproduces exactly on any machine.
+> - **Recompiler/lifter:**
+>   - `movsx` from `bp`/`sp` sign-extends;
+>   - `--coalesce-functions` also merges false splits at internal back-edges;
+>   - `--loop-heads`/`--yield-points` (loop heads and device waits become
+>     schedule points for the replay);
+>   - the data-pointer scan covers only conventional data sections;
+>   - unresolved-call stubs log their first call.
+>
+> How to build and run Blinx 2 with it is in the
+> [Blinx2-Recompiled README](https://github.com/bruce-smith/Blinx2-Recompiled#readme).
+
 ```
  #   #  ####    ###   #   #         #####   ###    ###   #       ###
  #   #  #   #  #   #  #   #           #    #   #  #   #  #      #
