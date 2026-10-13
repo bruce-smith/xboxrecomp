@@ -5743,7 +5743,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp;
-        if (rq_async()) {
+        static int rep_sync = -1;
+        if (rep_sync < 0)
+            rep_sync = getenv("RECOMP_REPORT_SYNC") != NULL;
+        /* RECOMP_REPORT_SYNC=1: answer visibility tests at once, after a
+         * drain, even under async sync points -- a diagnostic: a title that
+         * polls a result once and takes "not ready" for "not visible" reads
+         * differently when the answer comes late. */
+        if (rq_async() && !rep_sync) {
             /* Answered when the batches before it are done, by whichever
              * thread finishes them (rq_advance_prefix). The title polls the
              * slot until its last word reads 0, as it would for the GPU. */
