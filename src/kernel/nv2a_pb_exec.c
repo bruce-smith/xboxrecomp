@@ -1195,6 +1195,35 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+/* A DXT block's 16 texels, decoded.
+ *
+ * Decoded blocks, direct-mapped by address. Every texel of a DXT texture
+ * decodes its whole 4x4 block, and bilinear reads four neighbours that
+ * nearly always share one -- this was a tenth of the executor's time. Keyed
+ * on the block's bytes as well as its address, so a texture rewritten in
+ * place (a render target reused, a streamed mip) never returns stale texels.
+ * Per thread. */
+static const uint32_t *dxt_block_px(const uint8_t *blk, uint32_t fmt, uint32_t bb)
+{
+    static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                    uint32_t px[16]; } cache[4096];
+    uintptr_t key = (uintptr_t)blk;
+    size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
+    uint64_t raw[2] = {0, 0};
+    memcpy(raw, blk, bb);
+    if (cache[slot].key != key || cache[slot].fmt != fmt
+        || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+        /* The whole block in one pass: decoding it texel by texel
+         * re-derived the palette sixteen times (bit-identical). */
+        d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
+        cache[slot].key = key;
+        cache[slot].fmt = fmt;
+        cache[slot].raw[0] = raw[0];
+        cache[slot].raw[1] = raw[1];
+    }
+    return cache[slot].px;
+}
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -1220,33 +1249,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         k_fmt = fmt;
     }
     if (k_dxt) {
-        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
-         * texture decodes its whole 4x4 block, and bilinear reads four
-         * neighbours that nearly always share one -- this was a tenth of
-         * the executor's time. Keyed on the block's bytes as well as its
-         * address, so a texture rewritten in place (a render target reused,
-         * a streamed mip) never returns stale texels.
-         * ponytail: single-threaded executor, so a plain static table. */
-        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
-                        uint32_t px[16]; } cache[4096];
-        uint32_t bb = k_dxt;
-        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
-        uintptr_t key = (uintptr_t)blk;
-        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
-        uint64_t raw[2] = {0, 0};
-        memcpy(raw, blk, bb);
-        if (cache[slot].key != key || cache[slot].fmt != fmt
-            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
-            /* The whole block in one pass: decoding it texel by texel
-             * re-derived the palette sixteen times (bit-identical). */
-            d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
-            cache[slot].key = key;
-            cache[slot].fmt = fmt;
-            cache[slot].raw[0] = raw[0];
-            cache[slot].raw[1] = raw[1];
-        }
-        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
+        uint32_t bw = (t->width + 3) >> 2;
+        const uint8_t *blk = mem + base + ((size_t)(v >> 2) * bw + (u >> 2)) * k_dxt;
+        *argb = dxt_block_px(blk, fmt, k_dxt)[(v & 3) * 4 + (u & 3)];
         return 1;
     }
     if (k_swz) {
@@ -2107,6 +2112,58 @@ static uint32_t tex_face_stride(const Texture *t)
  * any filtering, so a bilinear blend of -1/255 and +1/255 is about 0 and
  * not about one half. D3D sets them for bump maps (V8U8 is G8B8 with G and
  * B signed). */
+/* The 2x2 texels (iu, iv) .. (iu+1, iv+1) of a bilinear tap: bit k of the
+ * result says out[k] is set, k = (dy << 1) | dx, exactly as four
+ * sample_tex calls would give. The common cases skip three of the four
+ * format checks, half the wraps and three DXT cache lookups: 32-bit ARGB
+ * swizzled through the texture's table, and DXT when the four share a
+ * block. Everything else is four sample_tex calls on the wrapped
+ * coordinates (wrapping twice changes nothing). */
+static int sample_tex_quad(const Texture *t, uint32_t face_offset,
+                           uint32_t iu, uint32_t iv, uint32_t out[4])
+{
+    extern ptrdiff_t g_xbox_mem_offset;
+    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t u[2], v[2], fmt = t->color, bb;
+    int k, m = 0;
+
+    if (!t->valid)
+        return 0;
+    u[0] = wrap_coord(iu, t->width, t->addr_u);
+    u[1] = wrap_coord(iu + 1, t->width, t->addr_u);
+    v[0] = wrap_coord(iv, t->height, t->addr_v);
+    v[1] = wrap_coord(iv + 1, t->height, t->addr_v);
+    if ((fmt == 0x06 || fmt == 0x07) && t->swz) {   /* A8R8G8B8 / X8R8G8B8 */
+        const uint32_t *p = (const uint32_t *)(mem + t->offset + face_offset);
+        const uint32_t *sx = t->swz, *sy = t->swz + t->width;
+        uint32_t a = fmt == 0x07 ? 0xFF000000u : 0u;
+        for (k = 0; k < 4; k++)
+            out[k] = p[sx[u[k & 1]] + sy[v[k >> 1]]] | a;
+        return 15;
+    }
+    if (fmt == 0x12 || fmt == 0x1E) {               /* LIN_A8R8G8B8 / X8R8G8B8 */
+        const uint8_t *b0 = mem + t->offset + face_offset;
+        uint32_t a = fmt == 0x1E ? 0xFF000000u : 0u;
+        for (k = 0; k < 4; k++)
+            out[k] = ((const uint32_t *)(b0 + (size_t)v[k >> 1] * t->pitch))[u[k & 1]] | a;
+        return 15;
+    }
+    bb = d3d8_format_dxt_block_bytes(fmt);
+    if (bb && (u[0] >> 2) == (u[1] >> 2) && (v[0] >> 2) == (v[1] >> 2)) {
+        uint32_t bw = (t->width + 3) >> 2;
+        const uint8_t *blk = mem + t->offset + face_offset
+                           + ((size_t)(v[0] >> 2) * bw + (u[0] >> 2)) * bb;
+        const uint32_t *px = dxt_block_px(blk, fmt, bb);
+        for (k = 0; k < 4; k++)
+            out[k] = px[(v[k >> 1] & 3) * 4 + (u[k & 1] & 3)];
+        return 15;
+    }
+    for (k = 0; k < 4; k++)
+        if (sample_tex(t, face_offset, u[k & 1], v[k >> 1], &out[k]))
+            m |= 1 << k;
+    return m;
+}
+
 static void texel_unpack(const Texture *t, uint32_t texel, float o[4])
 {
     nv2a_rc_unpack(texel, o);
@@ -2141,16 +2198,30 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
         wu = fu - (float)iu;
         wv = fv - (float)iv;
-        for (k = 0; k < 4; k++) {
-            if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
-                           (uint32_t)(iv + (k >> 1)), &texel))
-                texel_unpack(t, texel, c[k]);
-            else
-                c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+        {
+            uint32_t tx[4];
+            int got = sample_tex_quad(t, face, (uint32_t)iu, (uint32_t)iv, tx);
+            for (k = 0; k < 4; k++) {
+                if (got >> k & 1)
+                    texel_unpack(t, tx[k], c[k]);
+                else
+                    c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+            }
         }
-        for (j = 0; j < 4; j++)
-            out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
-                   + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+        {
+            /* The four channels at once, the same products and sums in the
+             * same order as per channel -- bit-identical without FMA. A
+             * glow pass in stage 01-03 runs four of these per pixel over
+             * the whole screen, four times a frame. */
+            __m128 a = _mm_set1_ps(1.0f - wu), b = _mm_set1_ps(wu);
+            __m128 cv = _mm_set1_ps(1.0f - wv), dv = _mm_set1_ps(wv);
+            __m128 top = _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(c[0]), a),
+                                    _mm_mul_ps(_mm_loadu_ps(c[1]), b));
+            __m128 bot = _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(c[2]), a),
+                                    _mm_mul_ps(_mm_loadu_ps(c[3]), b));
+            _mm_storeu_ps(out, _mm_add_ps(_mm_mul_ps(top, cv), _mm_mul_ps(bot, dv)));
+        }
+        (void)j;
         return;
     }
     if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
