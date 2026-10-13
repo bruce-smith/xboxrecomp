@@ -2803,7 +2803,20 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
             fprintf(stderr, "[GPU] pixel shading: %s%c", m == 0 ? "scalar"
                     : m == 2 ? "four-lane, checked against scalar" : "four-lane", 10);
     }
-    if (mode && step == 1 && T->use_rc && !T->ps->self_sample
+    /* A draw sampling its own target goes four-lane too, unless checking
+     * (RECOMP_SELF_SAMPLE_SCALAR=1 keeps it scalar). Four lanes read before
+     * they write, the scalar loop writes each pixel before the next reads,
+     * so the two differ only where a pixel samples one written earlier in
+     * its own group of four -- a read-after-write within a draw that the
+     * hardware leaves undefined, and where it too returns the old texel.
+     * Blinx 2's two full-screen colour passes over its main surface are
+     * such draws, ~600K pixels a frame: 29 vs 27 fps median in stage
+     * 01-01 gameplay, in-run A/B. */
+    static int self_scalar = -1;
+    if (self_scalar < 0)
+        self_scalar = getenv("RECOMP_SELF_SAMPLE_SCALAR") != NULL;
+    if (mode && step == 1 && T->use_rc
+        && (!T->ps->self_sample || (mode == 1 && !self_scalar))
         && !T->ps->st_test) {                   /* stencil: scalar only */
         if (mode == 2)
             xf_rows_check(T, y0, y1, cnt);
