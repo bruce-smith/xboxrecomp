@@ -2775,19 +2775,54 @@ static void xf_rows_check(const XfTri *T, int y0, int y1, XfCount *cnt)
     cnt->pixels += c1.pixels;
     cnt->zpass += c1.zpass;
     cnt->csum += c1.csum;
+    /* The visibility-report counts too: left out, every checked draw read as
+     * hidden, and Blinx 2, which tests its player against a report, stopped
+     * drawing him under RECOMP_PIXEL_CHECK. */
+    for (i = 0; i < NV_ZEPOCHS; i++)
+        cnt->zpe[i] += c1.zpe[i];
     free(orig); free(r4); free(r1); free(zorig); free(z4); free(z1);
 }
 
 /* Rows y0, y0+step, ... < y1 of triangle T. */
+/* RECOMP_PIXEL_CHECK=<file> (not "1"): check only while the file exists,
+ * looked at once a flip -- the check is far too slow to reach a scene with,
+ * so a run gets there at speed and turns it on there (pixel_check_flip). */
+static const char *s_pxchk_file;
+static volatile LONG s_pxchk_on;
+
+static void pixel_check_flip(void)
+{
+    FILE *f;
+    if (!s_pxchk_file)
+        return;
+    f = fopen(s_pxchk_file, "rb");
+    if (f)
+        fclose(f);
+    InterlockedExchange(&s_pxchk_on, f != NULL);
+}
+
 static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
 {
-    static volatile LONG mode = -1;     /* 0 scalar, 1 four-lane, 2 check */
+    static volatile LONG mode = -1;     /* 0 scalar, 1 four-lane, 2 check, 3 check on a flag */
     if (mode < 0) {
+        const char *pc = getenv("RECOMP_PIXEL_CHECK");
         LONG m = getenv("RECOMP_SCALAR_PIXELS") ? 0
-               : getenv("RECOMP_PIXEL_CHECK") ? 2 : 1;
+               : pc ? (strcmp(pc, "1") ? 3 : 2) : 1;
         if (InterlockedCompareExchange(&mode, m, -1) == -1)
             fprintf(stderr, "[GPU] pixel shading: %s%c", m == 0 ? "scalar"
-                    : m == 2 ? "four-lane, checked against scalar" : "four-lane", 10);
+                    : m == 2 ? "four-lane, checked against scalar"
+                    : m == 3 ? "four-lane, checked while the RECOMP_PIXEL_CHECK file exists"
+                    : "four-lane", 10);
+    }
+    if (mode == 3) {
+        if (s_pxchk_on) {
+            if (step == 1 && T->use_rc && !T->ps->self_sample && !T->ps->st_test) {
+                xf_rows_check(T, y0, y1, cnt);
+                return;
+            }
+            xf_rows_span_scalar(T, y0, y1, step, cnt);
+            return;
+        }
     }
     /* A draw sampling its own target goes four-lane too, unless checking
      * (RECOMP_SELF_SAMPLE_SCALAR=1 keeps it scalar). Four lanes read before
@@ -2802,7 +2837,7 @@ static void xf_rows_span(const XfTri *T, int y0, int y1, int step, XfCount *cnt)
     if (self_scalar < 0)
         self_scalar = getenv("RECOMP_SELF_SAMPLE_SCALAR") != NULL;
     if (mode && step == 1 && T->use_rc
-        && (!T->ps->self_sample || (mode == 1 && !self_scalar))
+        && (!T->ps->self_sample || ((mode == 1 || mode == 3) && !self_scalar))
         && !T->ps->st_test) {                   /* stencil: scalar only */
         if (mode == 2)
             xf_rows_check(T, y0, y1, cnt);
@@ -6005,6 +6040,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 if (on)
                     dump_surface_bmp();
             }
+        }
+        {
+            static int init;
+            if (!init) {
+                const char *pc = getenv("RECOMP_PIXEL_CHECK");
+                init = 1;
+                if (pc && strcmp(pc, "1"))
+                    s_pxchk_file = pc;
+            }
+            pixel_check_flip();
         }
         fsum_flip();
         g_watch_flip = s_gpu.flips;
