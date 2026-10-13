@@ -160,6 +160,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     uint32_t kint, routine, context;
     apu_guest_fn fn;
     int slot;
+    LARGE_INTEGER t0;
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
@@ -193,6 +194,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
     /* Held against KeSynchronizeExecution on this interrupt: the guest's
      * way of keeping its ISR out while it edits what the ISR walks. */
+    QueryPerformanceCounter(&t0);
     xbox_InterruptLock(kint);
     xbox_IsrDpcBegin();
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
@@ -210,6 +212,20 @@ static void apu_deliver_irq(MCPXAPUState *d)
         }
         if (inline_dpc)
             xbox_IsrDpcRunNow();
+    }
+    /* The ISR and its DPC run on the frame thread, and the DPC first waits
+     * for DISPATCH_LEVEL. Long enough, and XAudio2's queue (3 x 1024
+     * samples, 64 ms) runs dry: an audible dropout. */
+    {
+        static unsigned slow;
+        LARGE_INTEGER t1, f;
+        double ms;
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+        if (ms >= 20.0 && (++slow <= 50 || slow % 100 == 0))
+            fprintf(stderr, "[APU] interrupt + DPC held the frame thread %.1f ms"
+                    " (#%u)\n", ms, slow);
     }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
@@ -478,6 +494,19 @@ static const char *hexhead(uint32_t phys)
     return buf;
 }
 
+/* RECOMP_APU_LOOP_TRACE: per-iteration time in the frame's sub-phases. */
+static double g_lt_vp, g_lt_dsp, g_lt_wav, g_lt_submit, g_lt_relock;
+static unsigned g_lt_waits;
+static double lt_now_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return t.QuadPart * 1000.0 / f.QuadPart;
+}
+
 static void monitor_submit_xa2(MCPXAPUState *d, int samples)
 {
     int waited = 0;
@@ -495,9 +524,34 @@ static void monitor_submit_xa2(MCPXAPUState *d, int samples)
         }
         qemu_mutex_unlock(&d->lock);
         Sleep(1);
-        qemu_mutex_lock(&d->lock);
+        {
+            double r0 = lt_now_ms();
+            qemu_mutex_lock(&d->lock);
+            g_lt_relock += lt_now_ms() - r0;
+        }
+        g_lt_waits++;
     }
     g_mon_xa2_paced = true;
+    /* An empty queue at submit time is an underrun: the device played out
+     * everything it had and went silent until now -- a dropout. Logged
+     * (rate-limited) with the gap since the previous submit, which says
+     * how long the frame thread was away. */
+    {
+        static LARGE_INTEGER last, freq;
+        static unsigned underruns;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        if (last.QuadPart && xa2_queued_buffers() == 0) {
+            underruns++;
+            if (underruns <= 50 || underruns % 100 == 0)
+                fprintf(stderr, "[XA2] underrun #%u: queue ran dry, %.1f ms"
+                        " since the previous buffer\n", underruns,
+                        (now.QuadPart - last.QuadPart) * 1000.0 / freq.QuadPart);
+        }
+        last = now;
+    }
     xa2_submit_samples((const int16_t *)g_mon_stage, samples);
 }
 
@@ -612,11 +666,15 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         memcpy(g_mon_stage[g_mon_fill], fb, MIXER_FRAME_SAMPLES * sizeof(fb[0]));
         g_mon_fill += MIXER_FRAME_SAMPLES;
         if (g_mon_fill >= target) {
+            double w0 = lt_now_ms(), w1;
             monitor_wav_write(target);
+            w1 = lt_now_ms();
+            g_lt_wav += w1 - w0;
             if (xa2_is_active())
                 monitor_submit_xa2(d, target);
             else
                 monitor_submit_waveout(d);
+            g_lt_submit += lt_now_ms() - w1;
             g_mon_fill = 0;
         }
     }
@@ -688,8 +746,14 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
+    {
+        double v0 = lt_now_ms(), v1;
+        mcpx_apu_vp_frame(d, mixbins);
+        v1 = lt_now_ms();
+        mcpx_apu_dsp_frame(d, mixbins);
+        g_lt_vp += v1 - v0;
+        g_lt_dsp += lt_now_ms() - v1;
+    }
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -701,12 +765,31 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* RECOMP_APU_LOOP_TRACE: frame-loop iterations over 50 ms, by phase. The
+ * thread feeds a 64 ms XAudio2 queue; an iteration that long is a dropout,
+ * and the phase says whether it waited on the lock, the frame or the ISR. */
+static int g_loop_trace = -1;
+static double loop_ms(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static LARGE_INTEGER f;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
+        LARGE_INTEGER lt[6];
+        QueryPerformanceCounter(&lt[0]);
+        g_lt_vp = g_lt_dsp = g_lt_wav = g_lt_submit = g_lt_relock = 0;
+        g_lt_waits = 0;
+        if (g_loop_trace < 0)
+            g_loop_trace = getenv("RECOMP_APU_LOOP_TRACE") != NULL;
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
@@ -726,6 +809,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * forever to post its next command: Burnout 3 stalls in
          * sub_002F805E polling the same doorbell it was acked on at init. */
         mcpx_apu_dsp_ack_poll(d);
+        QueryPerformanceCounter(&lt[1]);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
@@ -734,6 +818,100 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        /* A stopped front end stalls the pipeline; it does not play silence.
+         *
+         * SE2FE_IDLE_VOICE traps the FE (FECTL 0x1FEF) until DirectSound's
+         * ISR services it, which on the console is microseconds. Here the
+         * frame thread kept making frames meanwhile -- in bursts, as fast as
+         * XAudio2 had room -- and every one went out as a silent monitor
+         * frame: the whole mix, music and effects, dropped to digital zero
+         * for 20-33 ms at a time, hundreds of times in a play session
+         * ("the music sometimes cuts out"; [APUGAP] counted 339 in 7 min).
+         * xemu makes no frame at all while the FE is not free-running. Now
+         * neither does this: the thread only keeps delivering the interrupt,
+         * and XAudio2's queue (64 ms) covers the wait. Past TRAP_HOLD_MS it
+         * falls back to silent frames, logged. RECOMP_APU_TRAP_HOLD=0
+         * restores the old silent frames. */
+        {
+            static int hold_on = -1;
+            static LARGE_INTEGER trap_t0, qpf;
+            static unsigned long_traps;
+            static bool gave_up;
+            /* FEMETHMODE is a value, not flags: TRAPPED (0xE0) has the
+             * HALTED bit (0x80) in it. Hold in either stopped mode -- xemu
+             * makes no frame at all then. */
+            uint32_t femode = fectl & NV_PAPU_FECTL_FEMETHMODE;
+            bool trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                           femode != NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING &&
+                           !g_test_tone.active;
+            if (hold_on < 0) {
+                const char *e = getenv("RECOMP_APU_TRAP_HOLD");
+                hold_on = !(e && *e == '0');
+                QueryPerformanceFrequency(&qpf);
+            }
+            if (!trapped) {
+                trap_t0.QuadPart = 0;
+                gave_up = false;
+            } else if (hold_on && !gave_up) {
+#define TRAP_HOLD_MS 40.0
+                LARGE_INTEGER now;
+                double held;
+                QueryPerformanceCounter(&now);
+                if (!trap_t0.QuadPart)
+                    trap_t0 = now;
+                held = (now.QuadPart - trap_t0.QuadPart) * 1000.0 / qpf.QuadPart;
+                if (held < TRAP_HOLD_MS) {
+                    if (d->set_irq) {
+                        update_irq(d);
+                        d->set_irq = false;
+                    }
+                    apu_deliver_irq(d);
+                    qemu_mutex_unlock(&d->lock);
+                    Sleep(1);
+                    qemu_mutex_lock(&d->lock);
+                    continue;
+                }
+                if (++long_traps <= 20 || long_traps % 100 == 0)
+                    fprintf(stderr, "[APU] FE trap not serviced in %.0f ms;"
+                            " output silent until it is (#%u)\n", held,
+                            long_traps);
+                gave_up = true;
+            }
+        }
+
+        /* RECOMP_APU_GAP_TRACE: each run of frames made without the VP while
+         * the SE is on -- silence in the output -- with where it starts in
+         * the output (seconds, as in a RECOMP_APU_WAV capture), its length
+         * and why (FECTL trapped / halted). */
+        {
+            static int gap_trace = -1;
+            static unsigned long long out_frames, run_start;
+            static unsigned run_len;
+            static uint32_t run_fectl;
+            bool silent = !(apu_active && !g_test_tone.active) &&
+                          xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;
+            if (gap_trace < 0)
+                gap_trace = getenv("RECOMP_APU_GAP_TRACE") != NULL;
+            if (gap_trace) {
+                if (silent) {
+                    if (!run_len) { run_start = out_frames; run_fectl = fectl; }
+                    run_len++;
+                } else if (run_len) {
+                    if (run_len >= 8)
+                        fprintf(stderr, "[APUGAP] %.3f s: %u silent frames"
+                                " (%.1f ms), FECTL %08X (%s)\n",
+                                run_start * 32 / 48000.0, run_len,
+                                run_len * 32 / 48.0, run_fectl,
+                                (run_fectl & NV_PAPU_FECTL_FEMETHMODE)
+                                    == NV_PAPU_FECTL_FEMETHMODE_TRAPPED
+                                    ? "trapped" : "halted");
+                    run_len = 0;
+                }
+                out_frames++;
+            }
+        }
+
+        QueryPerformanceCounter(&lt[2]);
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
@@ -751,7 +929,9 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
+        QueryPerformanceCounter(&lt[3]);
         apu_deliver_irq(d);
+        QueryPerformanceCounter(&lt[4]);
 
         /* Let the guest in once per frame.
          *
@@ -766,6 +946,19 @@ static void *mcpx_apu_frame_thread(void *arg)
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
+        QueryPerformanceCounter(&lt[5]);
+        if (g_loop_trace && loop_ms(lt[0], lt[5]) > 50.0) {
+            static unsigned n;
+            if (++n <= 200)
+                fprintf(stderr, "[APULOOP] %.1f ms: throttle+ack %.1f, hold/trace"
+                        " %.1f, frame %.1f (vp %.1f dsp %.1f wav %.1f submit %.1f:"
+                        " %u waits, relock %.1f), irq %.1f, relock %.1f\n",
+                        loop_ms(lt[0], lt[5]), loop_ms(lt[0], lt[1]),
+                        loop_ms(lt[1], lt[2]), loop_ms(lt[2], lt[3]),
+                        g_lt_vp, g_lt_dsp, g_lt_wav, g_lt_submit, g_lt_waits,
+                        g_lt_relock,
+                        loop_ms(lt[3], lt[4]), loop_ms(lt[4], lt[5]));
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
