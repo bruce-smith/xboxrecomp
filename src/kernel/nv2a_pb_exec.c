@@ -2886,7 +2886,12 @@ typedef struct {
     int barrier;                       /* waits for every earlier batch */
 } RasterBatch;
 
-#define NV_RQ_DEPTH  4                   /* batches: one filling, the rest drawing */
+/* Batches: one filling, the rest drawing. A frame alternates stretches the
+ * executor sets up (many small draws) with stretches the raster workers
+ * chew on, so the ring is the buffer between them: 16 against 4 gave
+ * stage 01-01 26-27 vs 25 fps median in two in-run A/Bs (async sync,
+ * all-band barriers). ~12 MB a slot. */
+#define NV_RQ_DEPTH  16
 
 static RasterBatch *s_rq[NV_RQ_DEPTH];
 static int s_rq_fill;                   /* the batch being filled */
