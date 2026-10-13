@@ -41,6 +41,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VKB_SETS      8192               /* descriptor sets per slot */
 #define VKB_SURFS     64
 #define VKB_TEXS      1024
+#define VKB_TEXMAP    4096               /* texture lookup hash slots */
 #define VKB_PIPES     4096               /* hash table slots */
 #define VKB_FSH       2048               /* fragment shaders by combiner key */
 #define VKB_VSH       1024               /* vertex programs */
@@ -122,6 +123,10 @@ static struct {
     VkSampler samplers[2][8][8];         /* [linear][addr_u][addr_v] */
     Surf surf[VKB_SURFS];
     Tex tex[VKB_TEXS];
+    /* Index into tex[] (+1, 0 empty) by a hash of the texture's key: most
+     * lookups hit here instead of scanning every slot. A stale entry fails
+     * the key comparison and falls back to the scan. */
+    uint16_t texmap[VKB_TEXMAP];
     Tex white, white_cube;               /* stage with nothing bound */
     VkFormat zfmt;
     /* Rendering state. */
@@ -745,7 +750,7 @@ static int tex_upload(Tex *x, const Nv2aTexState *t)
 static VkImageView tex_view(const Nv2aTexState *t, int cube, uint32_t *iw, uint32_t *ih)
 {
     Tex *x, *free_x = NULL, *lru = NULL;
-    uint32_t sgn = (t->filter >> 28) & 0xF;
+    uint32_t sgn = (t->filter >> 28) & 0xF, mslot;
     int i;
 
     *iw = *ih = 1;
@@ -763,31 +768,48 @@ static VkImageView tex_view(const Nv2aTexState *t, int cube, uint32_t *iw, uint3
             }
         }
     }
-    for (i = 0; i < VKB_TEXS; i++) {
-        x = &B.tex[i];
-        if (!x->img) {
-            if (!free_x)
-                free_x = x;
-            continue;
-        }
-        if (x->addr == t->offset && x->w == t->width && x->h == t->height
-            && x->color == t->color && x->palette == t->palette
-            && x->pitch == t->pitch && x->cube == (uint32_t)cube && x->sgn == sgn) {
-            if (x->checked != B.frame) {
-                uint64_t h = tex_hash(t);
-                x->checked = B.frame;
-                if (h != x->hash) {
-                    x->hash = h;
-                    tex_upload(x, t);
-                }
+#define TEX_MATCH(x) ((x)->img && (x)->addr == t->offset && (x)->w == t->width \
+        && (x)->h == t->height && (x)->color == t->color && (x)->palette == t->palette \
+        && (x)->pitch == t->pitch && (x)->cube == (uint32_t)cube && (x)->sgn == sgn)
+    {
+        uint32_t k = t->offset * 0x9E3779B1u ^ (t->width * 0x85EBCA77u + t->height)
+                   ^ (t->color * 0xC2B2AE3Du) ^ t->palette ^ (t->pitch << 7)
+                   ^ ((uint32_t)cube << 31) ^ (sgn << 27);
+        mslot = (k ^ (k >> 15)) % VKB_TEXMAP;
+    }
+    x = B.texmap[mslot] ? &B.tex[B.texmap[mslot] - 1] : NULL;
+    if (!x || !TEX_MATCH(x)) {
+        x = NULL;
+        for (i = 0; i < VKB_TEXS; i++) {
+            Tex *y = &B.tex[i];
+            if (!y->img) {
+                if (!free_x)
+                    free_x = y;
+                continue;
             }
-            x->used = B.frame;
-            *iw = x->w;
-            *ih = x->h;
-            return x->view;
+            if (TEX_MATCH(y)) {
+                x = y;
+                B.texmap[mslot] = (uint16_t)(i + 1);
+                break;
+            }
+            if (!lru || y->used < lru->used)
+                lru = y;
         }
-        if (!lru || x->used < lru->used)
-            lru = x;
+    }
+#undef TEX_MATCH
+    if (x) {
+        if (x->checked != B.frame) {
+            uint64_t h = tex_hash(t);
+            x->checked = B.frame;
+            if (h != x->hash) {
+                x->hash = h;
+                tex_upload(x, t);
+            }
+        }
+        x->used = B.frame;
+        *iw = x->w;
+        *ih = x->h;
+        return x->view;
     }
     x = free_x;
     if (!x) {
@@ -810,6 +832,7 @@ static VkImageView tex_view(const Nv2aTexState *t, int cube, uint32_t *iw, uint3
         tex_destroy(x);
         return cube ? B.white_cube.view : B.white.view;
     }
+    B.texmap[mslot] = (uint16_t)(x - B.tex + 1);
     *iw = x->w;
     *ih = x->h;
     return x->view;
