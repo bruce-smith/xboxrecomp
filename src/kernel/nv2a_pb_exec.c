@@ -1155,8 +1155,15 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
+    if (mode == 1) {                       /* wrap */
+        /* Texture sizes are powers of two, where the floored modulo is the
+         * low bits, negative coordinates included (two's complement): the
+         * same result without the two divisions per coordinate -- per tap,
+         * up to sixteen a bilinear pixel. */
+        if (!(size & (size - 1)))
+            return c & (size - 1);
         return (uint32_t)(((sc % n) + n) % n);
+    }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
@@ -1192,7 +1199,12 @@ static uint32_t linear_twin(uint32_t fmt)
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    /* The format's class, remembered per thread: the predicates are calls
+     * into the d3d8 library, and every texel of a draw asks them about the
+     * same format. */
+    static NV_TLS uint32_t k_fmt = 0xFFFFFFFFu, k_dxt, k_swz;
+    extern ptrdiff_t g_xbox_mem_offset;
+    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
     const uint8_t *p;
     uint32_t fmt, base = t->offset + face_offset;
 
@@ -1202,7 +1214,12 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     v = wrap_coord(v, t->height, t->addr_v);
 
     fmt = t->color;
-    if (d3d8_format_dxt_block_bytes(fmt)) {
+    if (fmt != k_fmt) {
+        k_dxt = d3d8_format_dxt_block_bytes(fmt);
+        k_swz = d3d8_format_is_swizzled(fmt) != 0;
+        k_fmt = fmt;
+    }
+    if (k_dxt) {
         /* Decoded blocks, direct-mapped by address. Every texel of a DXT
          * texture decodes its whole 4x4 block, and bilinear reads four
          * neighbours that nearly always share one -- this was a tenth of
@@ -1212,7 +1229,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * ponytail: single-threaded executor, so a plain static table. */
         static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
                         uint32_t px[16]; } cache[4096];
-        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+        uint32_t bb = k_dxt;
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
         const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
         uintptr_t key = (uintptr_t)blk;
@@ -1232,7 +1249,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
         return 1;
     }
-    if (d3d8_format_is_swizzled(fmt)) {
+    if (k_swz) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
