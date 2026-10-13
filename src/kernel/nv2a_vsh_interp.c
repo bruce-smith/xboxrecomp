@@ -860,6 +860,16 @@ uint32_t nv2a_vsh_prog_inputs(const Nv2aVshProg *p)
     return p ? p->inputs : 0xFFFFu;
 }
 
+uint32_t nv2a_vsh_program_words(const uint32_t (**words)[4])
+{
+    uint32_t s;
+    *words = (const uint32_t (*)[4])s_program[s_start_slot < NV2A_VSH_SLOTS ? s_start_slot : 0];
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++)
+        if (field(s_program[s], 3, 0, 1))
+            return s - s_start_slot + 1;
+    return 0;
+}
+
 int nv2a_vsh_transform(const Nv2aVshProg *p, const float (*cst)[4],
                        const float (*in)[NV2A_VSH_INPUTS][4], uint32_t n,
                        Nv2aVshOutput *out)

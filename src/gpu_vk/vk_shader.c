@@ -95,8 +95,28 @@ VkShaderModule vk_shader_module(int fragment, const char *src)
         if (s_mods[i].h == h && !strcmp(s_mods[i].src, src))
             return s_mods[i].m;
     }
-    if (!vk_glsl_to_spirv(fragment, src, &words, &n))
+    /* NaN and infinity kept, as the CPU path keeps them (RCP of 0 is +inf
+     * there, and what follows from it): without SignedZeroInfNanPreserve a
+     * driver may fold x * 0 to 0 and the like. Inserted after #version. */
+    if (g_vk.nan_preserve && !strncmp(src, "#version 450\n", 13)) {
+        static const char mode[] =
+            "#version 450\n"
+            "#extension GL_EXT_spirv_intrinsics : require\n"
+            "spirv_execution_mode(capabilities = [4466], 4461, 32);\n";
+        size_t l = strlen(src);
+        char *full = (char *)malloc(l + sizeof mode);
+        int ok;
+        if (!full)
+            return VK_NULL_HANDLE;
+        memcpy(full, mode, sizeof mode - 1);
+        memcpy(full + sizeof mode - 1, src + 13, l - 13 + 1);
+        ok = vk_glsl_to_spirv(fragment, full, &words, &n);
+        free(full);
+        if (!ok)
+            return VK_NULL_HANDLE;
+    } else if (!vk_glsl_to_spirv(fragment, src, &words, &n)) {
         return VK_NULL_HANDLE;
+    }
     ci.codeSize = n * sizeof(uint32_t);
     ci.pCode = words;
     if (!VK_OK(vkCreateShaderModule(g_vk.device, &ci, NULL, &m)))

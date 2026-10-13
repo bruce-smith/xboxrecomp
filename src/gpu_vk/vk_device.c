@@ -167,6 +167,14 @@ static int device_init_locked(VkSurfaceKHR surface)
     g_vk.phys = pds[best];
     g_vk.qfam = (uint32_t)bestq;
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
+    {
+        VkPhysicalDeviceVulkan12Properties p12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES };
+        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &p12;
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.nan_preserve = p12.shaderSignedZeroInfNanPreserveFloat32
+                         && !getenv("RECOMP_VK_FAST_FLOAT");
+    }
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &g_vk.mem);
 
     qci.queueFamilyIndex = g_vk.qfam;
@@ -188,6 +196,7 @@ static int device_init_locked(VkSurfaceKHR surface)
     f2.features.samplerAnisotropy = have.samplerAnisotropy;
     f2.pNext = &f12;
     f12.hostQueryReset = VK_TRUE;
+    f12.timelineSemaphore = VK_TRUE;
     f12.pNext = &f13;
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;

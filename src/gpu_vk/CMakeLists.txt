@@ -44,6 +44,7 @@ set(GPU_VK_SOURCES
     vk_shader.c
     vk_backend.c
     vk_psh.c
+    vk_vsh.c
     ${xbr_volk_SOURCE_DIR}/volk.c
 )
 if(WIN32)
@@ -63,8 +64,15 @@ target_include_directories(xbox_gpu_vk
 # (nv2a_exec_texel, guest memory), which links it in turn.
 target_link_libraries(xbox_gpu_vk PRIVATE glslang glslang-default-resource-limits)
 target_compile_definitions(xbox_gpu_vk PRIVATE VK_NO_PROTOTYPES)
+# The backend's internals (vk_internal.h, volk, the Vulkan headers), for the
+# standalone tests in tests/gpu_vk_* that drive Vulkan themselves.
+add_library(xbox_gpu_vk_internal INTERFACE)
+target_include_directories(xbox_gpu_vk_internal INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../kernel
+    ${xbr_vulkan_headers_SOURCE_DIR}/include ${xbr_volk_SOURCE_DIR})
+target_compile_definitions(xbox_gpu_vk_internal INTERFACE VK_NO_PROTOTYPES)
 if(MSVC)
-    target_compile_options(xbox_gpu_vk PRIVATE /W3 /O2)
+    target_compile_options(xbox_gpu_vk PRIVATE /W3 /O2 /Zi)
     target_compile_definitions(xbox_gpu_vk PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_link_libraries(xbox_gpu_vk PRIVATE ${CMAKE_DL_LIBS})

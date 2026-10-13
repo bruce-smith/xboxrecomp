@@ -23,6 +23,7 @@ typedef struct {
     VkPhysicalDeviceMemoryProperties mem;
     VkCommandPool    pool;           /* window thread's command buffers */
     int              swapchain;      /* VK_KHR_swapchain enabled */
+    int              nan_preserve;   /* shaders may keep NaN/inf exactly */
 } XboxVk;
 
 extern XboxVk g_vk;
@@ -73,5 +74,15 @@ const char *const *vk_surface_extensions(void);
  * while the device is created, whichever thread gets there first. */
 void vk_lock(void);
 void vk_unlock(void);
+/* A thread, an auto-reset event (wait with a timeout in ms), a mutex and a
+ * yield: the backend's completion thread and its state. */
+int   vk_thread_start(void (*fn)(void *), void *arg);
+void *vk_event_new(void);
+void  vk_event_set(void *e);
+void  vk_event_wait(void *e, uint32_t ms);
+void *vk_mutex_new(void);
+void  vk_mutex_lock(void *m);
+void  vk_mutex_unlock(void *m);
+void  vk_yield(void);
 
 #endif

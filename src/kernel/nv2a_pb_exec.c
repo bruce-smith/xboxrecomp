@@ -5160,6 +5160,48 @@ static void backend_draw(void)
         s_gpu.batches_untransformed++;     /* fixed function: not drawn yet */
         return;
     }
+    /* The backend runs the program itself, unless it writes constants
+     * (CXT_WRITE: each vertex sees the last one's writes, so it runs here,
+     * in order) or RECOMP_VK_CPU_VSH=1 asks for the CPU anyway. */
+    {
+        static int cpu_vsh = -1;
+        const uint32_t (*w)[4];
+        uint32_t pn, k;
+        int raw;
+        if (cpu_vsh < 0)
+            cpu_vsh = getenv("RECOMP_VK_CPU_VSH") != NULL;
+        raw = s_backend->raw_vertices && !cpu_vsh && !nv2a_vsh_cxt_write()
+           && (pn = nv2a_vsh_program_words(&w)) != 0;
+        for (k = 0; raw && k < pn; k++)
+            if (((w[k][3] >> 12) & 0xF) && !((w[k][3] >> 11) & 1))
+                raw = 0;                   /* writes c[] */
+        if (raw) {
+            memset(&g, 0, sizeof g);
+            g.prim = s_gpu.prim;
+            g.n = n;
+            g.prog = w;
+            g.prog_n = pn;
+            g.constants = nv2a_vsh_constants();
+            for (k = 0; k < NV_VERTEX_ATTRS; k++) {
+                g.attr[k].offset = s_gpu.attr[k].offset;
+                g.attr[k].type = s_gpu.attr[k].type;
+                g.attr[k].size = s_gpu.attr[k].size;
+                g.attr[k].stride = s_gpu.attr[k].stride;
+            }
+            g.imm = (const float (*)[4])s_gpu.imm_attr;
+            g.idx = s_gpu.idx;
+            if (s_gpu.inline_active) {
+                g.inline_data = (const uint8_t *)s_gpu.inline_buf;
+                g.inline_bytes = s_gpu.inline_count * 4;
+            }
+            s_gpu.batches_program++;
+            s_gpu.verts_program += n;
+            backend_capture(&d);
+            s_backend->draw(&d, &g);
+            note_drawn();
+            return;
+        }
+    }
     for (i = 0; i < n; i += 4) {
         static float in[4][NV2A_VSH_INPUTS][4];
         static Nv2aVshOutput tail[4];
@@ -5179,6 +5221,7 @@ static void backend_draw(void)
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     backend_capture(&d);
+    memset(&g, 0, sizeof g);
     g.prim = s_gpu.prim;
     g.v = s_xf;
     g.n = n;
@@ -6172,15 +6215,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * differently when the answer comes late. */
         if (s_backend && !s_backend_compare) {
             static int force = -1;
-            uint32_t zc = s_backend->report();
             if (force < 0)
                 force = getenv("RECOMP_ZPASS_FORCE") != NULL;
-            if (force)
-                zc = 100000;
             stamp = (uint64_t)s_gpu.reports++ * 1000u;
-            memcpy(mem + at, &stamp, 8);
-            memcpy(mem + at + 8, &zc, 4);
-            memset(mem + at + 12, 0, 4);
+            s_backend->report(at, stamp, force);   /* written when known */
             break;
         }
         if (rq_async() && !rep_sync) {

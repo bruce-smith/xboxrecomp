@@ -33,6 +33,11 @@ typedef struct {
     float   bm[4][4];       /* bump matrix 00 01 10 11 */
     float   bl[4][4];       /* bump luminance scale, offset */
     int32_t at[4];          /* alpha test enable, func, ref */
+    /* Vertex pulling (vk_vsh.c), programs on the GPU only: */
+    uint32_t attr[16][4];   /* byte offset of element imin in the blob, stride,
+                               type | size << 4 | 0x100 no array */
+    float   imm[16][4];     /* inline values */
+    uint32_t imin[4];
 } VkDrawUniforms;
 
 #endif

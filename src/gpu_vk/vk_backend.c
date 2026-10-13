@@ -31,6 +31,7 @@
 #include "vk_internal.h"
 #include "nv2a_backend.h"
 #include "vk_psh.h"
+#include "vk_vsh.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -42,7 +43,9 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VKB_TEXS      1024
 #define VKB_PIPES     4096               /* hash table slots */
 #define VKB_FSH       2048               /* fragment shaders by combiner key */
+#define VKB_VSH       1024               /* vertex programs */
 #define VKB_ZEPOCHS   64
+#define VKB_REPORTS   32                 /* visibility answers in flight */
 #define VKB_ZDIM      1024               /* depth images: the software zbuf's size */
 
 #define NV_PRIM_TRIANGLES      5
@@ -56,6 +59,7 @@ typedef struct {
     VkCommandBuffer cb;
     VkFence fence;
     int pending;                         /* submitted, fence not yet seen */
+    uint64_t seq;                        /* its value on B.timeline */
     VkBuffer ring;
     VkDeviceMemory ringmem;
     uint8_t *ringmap;
@@ -91,7 +95,7 @@ typedef struct {
 
 typedef struct {
     uint64_t key;
-    VkShaderModule fs;
+    VkShaderModule vs, fs;
     VkPipeline pipe;
 } Pipe;
 
@@ -107,7 +111,14 @@ static struct {
     VkShaderModule vs;
     Pipe pipes[VKB_PIPES];
     int npipes;
+    uint32_t new_pipes, new_vsh;          /* created since the last stats line */
     struct { VkPshKey key; VkShaderModule fs; int used; } fsh[VKB_FSH];
+    /* Vertex programs, by their instruction words. */
+    struct { uint64_t h; uint32_t n; uint32_t (*w)[4]; VkShaderModule vs; } vsh[VKB_VSH];
+    /* The constants last uploaded, and where, valid while slot_gen holds. */
+    float cst[192][4];
+    VkDeviceSize cst_off;
+    uint32_t cst_gen, slot_gen;
     VkSampler samplers[2][8][8];         /* [linear][addr_u][addr_v] */
     Surf surf[VKB_SURFS];
     Tex tex[VKB_TEXS];
@@ -118,9 +129,17 @@ static struct {
     Surf *rt, *zt;
     int pending_barrier;                 /* something written must be visible */
     uint32_t frame;
-    /* Visibility tests. */
+    /* Visibility tests. Queries are summed per test (epoch) as their
+     * submissions complete; a GET_REPORT is answered by the completion thread
+     * once the GPU has passed the submission that ends it. `mtx` guards
+     * slot completion, the sums and the queue. */
     uint32_t epoch;
     uint64_t epoch_count[VKB_ZEPOCHS];
+    VkSemaphore timeline;                /* signalled with each submit's seq */
+    uint64_t seq;
+    void *mtx, *rep_event;
+    struct { uint32_t at, epoch, force; uint64_t stamp, seq; } rep[VKB_REPORTS];
+    int rep_head, nrep;
     /* Read-back of the presented frame. */
     VkBuffer rb;
     VkDeviceMemory rbmem;
@@ -194,8 +213,11 @@ static const char *k_vs =
 static void slot_complete(Slot *s)
 {
     uint32_t i;
-    if (!s->pending)
+    vk_mutex_lock(B.mtx);
+    if (!s->pending) {
+        vk_mutex_unlock(B.mtx);
         return;
+    }
     vkWaitForFences(g_vk.device, 1, &s->fence, VK_TRUE, UINT64_MAX);
     s->pending = 0;
     if (s->nq) {
@@ -209,6 +231,7 @@ static void slot_complete(Slot *s)
                 B.epoch_count[s->qepoch[i] % VKB_ZEPOCHS] += res[i];
         free(res);
     }
+    vk_mutex_unlock(B.mtx);
 }
 
 static void slot_begin(void)
@@ -224,6 +247,7 @@ static void slot_begin(void)
     s->ringpos = 0;
     s->nsets = 0;
     s->nq = 0;
+    B.slot_gen++;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s->cb, &bi);
     B.recording = 1;
@@ -292,9 +316,19 @@ static void submit(int wait)
     vkEndCommandBuffer(s->cb);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s->cb;
-    vk_lock();
-    VK_OK(vkQueueSubmit(g_vk.queue, 1, &si, s->fence));
-    vk_unlock();
+    {
+        VkTimelineSemaphoreSubmitInfo ti = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+        uint64_t v = B.seq + 1;
+        ti.signalSemaphoreValueCount = 1;
+        ti.pSignalSemaphoreValues = &v;
+        si.pNext = &ti;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &B.timeline;
+        vk_lock();
+        VK_OK(vkQueueSubmit(g_vk.queue, 1, &si, s->fence));
+        vk_unlock();
+        s->seq = ++B.seq;
+    }
     s->pending = 1;
     B.recording = 0;
     B.submits++;
@@ -869,7 +903,10 @@ static VkShaderModule frag_shader(const VkPshKey *k)
     return m;
 }
 
-static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModule fs)
+/* vs == VK_NULL_HANDLE: the CPU-transformed vertex shader with its vertex
+ * inputs; otherwise a program shader that pulls its own vertices. */
+static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModule vs,
+                           VkShaderModule fs)
 {
     uint32_t blend = st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0);
     uint32_t mask = (st->color_mask >> 16 & 1) | (st->color_mask >> 7 & 2)
@@ -909,19 +946,20 @@ static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModul
              | (uint64_t)(st->blend_dfactor & 0xFFFF) << 32
              | (uint64_t)(st->blend_equation & 0xFFFF) << 48;
     /* Pipelines by (fragment shader, fixed-function key). */
-    h = (key * 0x9E3779B97F4A7C15ull) ^ (uint64_t)(uintptr_t)fs;
+    h = (key * 0x9E3779B97F4A7C15ull) ^ (uint64_t)(uintptr_t)fs
+      ^ ((uint64_t)(uintptr_t)vs * 0xC2B2AE3D27D4EB4Full);
     slot = (unsigned)((h ^ (h >> 29)) % VKB_PIPES);
     for (probes = 0; probes < VKB_PIPES; probes++, slot = (slot + 1) % VKB_PIPES) {
         if (!B.pipes[slot].pipe)
             break;
-        if (B.pipes[slot].key == key && B.pipes[slot].fs == fs)
+        if (B.pipes[slot].key == key && B.pipes[slot].fs == fs && B.pipes[slot].vs == vs)
             return B.pipes[slot].pipe;
     }
 
     memset(ss, 0, sizeof ss);
     ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    ss[0].module = B.vs;
+    ss[0].module = vs ? vs : B.vs;
     ss[0].pName = "main";
     ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     ss[1].module = fs;
@@ -935,10 +973,12 @@ static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModul
         va[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
         va[i].offset = (uint32_t)(i * 16);    /* pos d0 d1 fog tex0..3 */
     }
-    vis.vertexBindingDescriptionCount = 1;
-    vis.pVertexBindingDescriptions = &vb;
-    vis.vertexAttributeDescriptionCount = 8;
-    vis.pVertexAttributeDescriptions = va;
+    if (!vs) {
+        vis.vertexBindingDescriptionCount = 1;
+        vis.pVertexBindingDescriptions = &vb;
+        vis.vertexAttributeDescriptionCount = 8;
+        vis.pVertexAttributeDescriptions = va;
+    }
     ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vps.viewportCount = 1;
     vps.scissorCount = 1;
@@ -974,9 +1014,11 @@ static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModul
     ci.layout = B.layout;
     if (!VK_OK(vkCreateGraphicsPipelines(g_vk.device, B.pcache, 1, &ci, NULL, &p)))
         return VK_NULL_HANDLE;
+    B.new_pipes++;
     if (probes < VKB_PIPES && B.npipes < VKB_PIPES * 3 / 4) {
         B.pipes[slot].key = key;
         B.pipes[slot].fs = fs;
+        B.pipes[slot].vs = vs;
         B.pipes[slot].pipe = p;
         B.npipes++;
     }
@@ -1009,6 +1051,67 @@ static VkStencilOp stencil_op(uint32_t op)
     case 0x8508: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
     default:     return VK_STENCIL_OP_KEEP;
     }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Vertex programs on the GPU (raw draws). */
+
+/* The shader for a program, by its instruction words. */
+static VkShaderModule vert_shader(const uint32_t (*w)[4], uint32_t n)
+{
+    uint64_t h = hash_bytes((const uint8_t *)w, (size_t)n * 16, 1469598103934665603ull);
+    unsigned i = (unsigned)(h % VKB_VSH), probes;
+    VkShaderModule m;
+    char *src;
+
+    for (probes = 0; probes < VKB_VSH; probes++, i = (i + 1) % VKB_VSH) {
+        if (!B.vsh[i].vs)
+            break;
+        if (B.vsh[i].h == h && B.vsh[i].n == n && !memcmp(B.vsh[i].w, w, (size_t)n * 16))
+            return B.vsh[i].vs;
+    }
+    if (!vk_vsh_supported(w, n))
+        return VK_NULL_HANDLE;
+    src = vk_vsh_glsl(w, n, NULL);
+    m = src ? vk_shader_module(0, src) : VK_NULL_HANDLE;
+    B.new_vsh++;
+    if (getenv("RECOMP_VK_SHADER_DUMP") && src)
+        fprintf(stderr, "[VKVSH] ---\n%s", src);
+    free(src);
+    if (m && probes < VKB_VSH) {
+        B.vsh[i].h = h;
+        B.vsh[i].n = n;
+        B.vsh[i].w = (uint32_t (*)[4])malloc((size_t)n * 16);
+        if (B.vsh[i].w) {
+            memcpy(B.vsh[i].w, w, (size_t)n * 16);
+            B.vsh[i].vs = m;
+        }
+    }
+    return m;
+}
+
+/* Bytes one element of an attribute takes (fetch_attr's reads). */
+static uint32_t elem_bytes(uint32_t type, uint32_t size)
+{
+    uint32_t n = size < 4 ? size : 4;
+    switch (type) {
+    case 0: return 4;                         /* D3DCOLOR, whatever the size */
+    case 2: return 4 * n;
+    case 4: return n;
+    case 1: case 5: return 2 * n;
+    case 6: return 4;
+    default: return 4;
+    }
+}
+
+/* Room for n more bytes in this slot's ring, moving to the next slot now if
+ * there is not: the allocations that follow then cannot. */
+static void ring_reserve(VkDeviceSize n)
+{
+    cmd();
+    if (B.slot[B.cur].ringpos + n + 1024 > VKB_RING)
+        submit(0);
+    cmd();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1139,6 +1242,14 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     uint32_t tw[4], th[4];
     int i;
     Slot *s;
+    /* Raw draws: the program runs here (vs), vertices are pulled from the
+     * blob, constants come from cst_off. */
+    int raw = g->v == NULL;
+    VkShaderModule vs = VK_NULL_HANDLE;
+    VkDeviceSize salign = g_vk.props.limits.minStorageBufferOffsetAlignment;
+    VkDeviceSize boff = 0, bbytes = 0;
+    uint32_t imin = 0, imax = 0, blob_lo = 0;
+    uint32_t aoff[16];
 
     if (!B.ok || g->n < 3)
         return;
@@ -1153,6 +1264,18 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         return;
     zt = target_zeta(st);
 
+    if (raw) {
+        uint32_t k;
+        vs = vert_shader(g->prog, g->prog_n);
+        if (!vs)
+            return;
+        imin = imax = g->idx[0];
+        for (k = 1; k < g->n; k++) {
+            if (g->idx[k] < imin) imin = g->idx[k];
+            if (g->idx[k] > imax) imax = g->idx[k];
+        }
+    }
+
     /* The combiner program's shader, and the stages it samples. */
     vk_psh_key(st, &key);
     fs = frag_shader(&key);
@@ -1165,15 +1288,126 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
                      : (key.cube[i] ? B.white_cube.view : B.white.view);
     }
 
-    /* Vertices, indices and the uniforms, one allocation (it may submit
-     * and move on, so before anything recorded into this slot's buffer). */
+    /* Vertices (or the raw vertex data), indices and the uniforms, in one
+     * slot: room is reserved first, so no allocation below moves on. */
     maxix = (g->n + 2) * 6;
-    {
+    if (salign < 16)
+        salign = 16;
+    if (ualign < 16)
+        ualign = 16;
+    if (raw) {
+        /* The span of guest memory the draw's attributes read, from element
+         * imin to imax: one copy when they interleave (the usual case),
+         * attribute by attribute when they are far apart. */
+        const uint8_t *src = g->inline_data ? g->inline_data
+                                            : (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t k, lo = 0xFFFFFFFFu, hi = 0, sum = 0;
+        int whole;
+        for (k = 0; k < 16; k++) {
+            const Nv2aAttrDesc *a = &g->attr[k];
+            uint32_t l, h;
+            aoff[k] = 0xFFFFFFFFu;
+            if (!a->size || !a->stride || (!g->inline_data && !a->offset))
+                continue;
+            l = a->offset + imin * a->stride;
+            h = a->offset + imax * a->stride + elem_bytes(a->type, a->size);
+            if (l < lo) lo = l;
+            if (h > hi) hi = h;
+            sum += h - l;
+        }
+        whole = hi > lo && hi - lo <= 4 * sum + 65536;
+        bbytes = hi <= lo ? 16 : whole ? (hi - (lo & ~3u)) + 8 : sum + 16 * 4 + 8;
+        if (bbytes > (32u << 20)) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [VK] draw reads %u bytes of vertex data; skipped\n",
+                        (unsigned)bbytes);
+            return;
+        }
+        ring_reserve(bbytes + salign + (VkDeviceSize)maxix * 4 + ualign
+                     + sizeof(VkDrawUniforms) + ualign + sizeof B.cst + ualign);
+        {
+            uint8_t *bp;
+            boff = ring_alloc(bbytes, salign, (void **)&bp);
+            if (boff == (VkDeviceSize)-1)
+                return;
+            /* rd32 may read one word on; an inline payload is cut at its end,
+             * where fetch_attr reads zeros, so all of it starts zeroed. */
+            if (g->inline_data)
+                memset(bp, 0, bbytes);
+            else
+                memset(bp + bbytes - 8, 0, 8);
+            if (whole) {
+                uint32_t base = lo & ~3u, n = hi - base;
+                if (g->inline_data)                  /* fetch_attr's bound */
+                    n = base < g->inline_bytes ? (n < g->inline_bytes - base ? n
+                                                  : g->inline_bytes - base) : 0;
+                memcpy(bp, src + base, n);
+                for (k = 0; k < 16; k++)
+                    if (g->attr[k].size && g->attr[k].stride
+                        && (g->inline_data || g->attr[k].offset))
+                        aoff[k] = g->attr[k].offset + imin * g->attr[k].stride - base;
+            } else if (hi > lo) {
+                uint32_t at = 0;
+                for (k = 0; k < 16; k++) {
+                    const Nv2aAttrDesc *a = &g->attr[k];
+                    uint32_t l, h;
+                    if (!a->size || !a->stride || (!g->inline_data && !a->offset))
+                        continue;
+                    l = (a->offset + imin * a->stride) & ~3u;
+                    h = a->offset + imax * a->stride + elem_bytes(a->type, a->size);
+                    if (g->inline_data && h > g->inline_bytes)
+                        h = g->inline_bytes > l ? g->inline_bytes : l;
+                    memcpy(bp + at, src + l, h - l);
+                    aoff[k] = at + ((a->offset + imin * a->stride) & 3u);
+                    at = (at + h - l + 3) & ~3u;
+                }
+            }
+        }
+        {
+            uint8_t *ip;
+            ioff = ring_alloc((VkDeviceSize)maxix * 4, 4, (void **)&ip);
+            ix = (uint32_t *)ip;
+        }
+        {
+            uint8_t *up;
+            uoff = ring_alloc(sizeof(VkDrawUniforms), ualign, (void **)&up);
+            U = (VkDrawUniforms *)up;
+        }
+        /* Constants: re-sent only when they changed or the slot did. */
+        if (B.cst_gen != B.slot_gen || memcmp(B.cst, g->constants, sizeof B.cst)) {
+            uint8_t *cp;
+            B.cst_off = ring_alloc(sizeof B.cst, ualign, (void **)&cp);
+            memcpy(B.cst, g->constants, sizeof B.cst);
+            memcpy(cp, B.cst, sizeof B.cst);
+            B.cst_gen = B.slot_gen;
+        }
+        voff = 0;
+        vp = NULL;
+        /* Built and remapped in host memory, then copied: the ring is
+         * write-combined, and reading it back costs a bus round trip per
+         * word (half the executor's time in a 4000-draw frame). */
+        {
+            static uint32_t *tmp;
+            static uint32_t cap;
+            uint32_t k;
+            if (maxix > cap) {
+                uint32_t *t = (uint32_t *)realloc(tmp, (size_t)maxix * 4);
+                if (!t)
+                    return;
+                tmp = t;
+                cap = maxix;
+            }
+            nix = prim_indices(g->prim, g->n, tmp);
+            for (k = 0; k < nix; k++)
+                tmp[k] = g->idx[tmp[k]];
+            memcpy(ix, tmp, (size_t)nix * 4);
+        }
+    } else {
         VkDeviceSize vbytes = ((VkDeviceSize)g->n * sizeof(Nv2aVshOutput) + 15) & ~(VkDeviceSize)15;
         VkDeviceSize ibytes = ((VkDeviceSize)maxix * 4 + ualign - 1) & ~(ualign - 1);
         uint8_t *base;
-        voff = ring_alloc(vbytes + ibytes + sizeof(VkDrawUniforms),
-                          ualign > 16 ? ualign : 16, (void **)&base);
+        voff = ring_alloc(vbytes + ibytes + sizeof(VkDrawUniforms), ualign, (void **)&base);
         if (voff == (VkDeviceSize)-1)
             return;
         vp = base;
@@ -1181,9 +1415,9 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         ioff = voff + vbytes;
         uoff = ioff + ibytes;
         U = (VkDrawUniforms *)(base + vbytes + ibytes);
+        memcpy(vp, g->v, (size_t)g->n * sizeof(Nv2aVshOutput));
+        nix = prim_indices(g->prim, g->n, ix);
     }
-    memcpy(vp, g->v, (size_t)g->n * sizeof(Nv2aVshOutput));
-    nix = prim_indices(g->prim, g->n, ix);
     if (!nix)
         return;
 
@@ -1236,13 +1470,24 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     U->at[0] = (int32_t)(st->alpha_test != 0);
     U->at[1] = (int32_t)st->alpha_func;
     U->at[2] = (int32_t)(st->alpha_ref & 0xFF);
+    if (raw) {
+        for (i = 0; i < 16; i++) {
+            const Nv2aAttrDesc *a = &g->attr[i];
+            U->attr[i][0] = aoff[i] == 0xFFFFFFFFu ? 0 : aoff[i];
+            U->attr[i][1] = a->stride;
+            U->attr[i][2] = (a->type & 0xF) | (a->size & 0xF) << 4
+                          | (a->size && aoff[i] == 0xFFFFFFFFu ? 0x100u : 0u);
+            memcpy(U->imm[i], g->imm[i], sizeof U->imm[i]);
+        }
+        U->imin[0] = imin;
+    }
 
     s = &B.slot[B.cur];
     {
         VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        VkDescriptorBufferInfo bi;
+        VkDescriptorBufferInfo bi, ci, bb;
         VkDescriptorImageInfo ii[4];
-        VkWriteDescriptorSet w[2];
+        VkWriteDescriptorSet w[4];
         ai.descriptorPool = s->dpool;
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &B.dsl;
@@ -1268,10 +1513,28 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         w[1].descriptorCount = 4;
         w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[1].pImageInfo = ii;
-        vkUpdateDescriptorSets(g_vk.device, 2, w, 0, NULL);
+        if (raw) {
+            ci.buffer = s->ring;
+            ci.offset = B.cst_off;
+            ci.range = sizeof B.cst;
+            bb.buffer = s->ring;
+            bb.offset = boff;
+            bb.range = bbytes;
+            w[2].sType = w[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[2].dstSet = w[3].dstSet = set;
+            w[2].dstBinding = 5;
+            w[2].descriptorCount = 1;
+            w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w[2].pBufferInfo = &ci;
+            w[3].dstBinding = 6;
+            w[3].descriptorCount = 1;
+            w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[3].pBufferInfo = &bb;
+        }
+        vkUpdateDescriptorSets(g_vk.device, raw ? 4 : 2, w, 0, NULL);
     }
 
-    p = pipeline(st, rt->fmt, fs);
+    p = pipeline(st, rt->fmt, vs, fs);
     if (!p)
         return;
     begin_rendering(rt, zt);
@@ -1279,7 +1542,8 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, 1, &set,
                             0, NULL);
-    vkCmdBindVertexBuffers(cb, 0, 1, &s->ring, &voff);
+    if (!raw)
+        vkCmdBindVertexBuffers(cb, 0, 1, &s->ring, &voff);
     vkCmdBindIndexBuffer(cb, s->ring, ioff, VK_INDEX_TYPE_UINT32);
 
     view.x = 0.0f;
@@ -1348,20 +1612,91 @@ static void vk_report_clear(void)
 {
     if (!B.ok)
         return;
-    /* Earlier tests' queries must be counted into their own epoch before the
-     * counter for the new one is reused. */
+    vk_mutex_lock(B.mtx);
     B.epoch++;
     B.epoch_count[B.epoch % VKB_ZEPOCHS] = 0;
+    vk_mutex_unlock(B.mtx);
 }
 
-static uint32_t vk_report(void)
+/* The 16-byte report: time stamp, count, then 0 for "done", last. */
+static void report_write(uint32_t at, uint64_t stamp, uint32_t count)
 {
-    uint64_t n;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t zero = 0;
+    memcpy(mem + at, &stamp, 8);
+    memcpy(mem + at + 8, &count, 4);
+#if defined(_MSC_VER)
+    _ReadWriteBarrier();                  /* x86 keeps stores in order */
+#else
+    __sync_synchronize();
+#endif
+    memcpy(mem + at + 12, &zero, 4);
+}
+
+/* Answers visibility tests as the GPU finishes their draws. */
+static void report_thread(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        vk_event_wait(B.rep_event, 100);
+        for (;;) {
+            uint64_t seq;
+            VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+            int i, k;
+            vk_mutex_lock(B.mtx);
+            if (!B.nrep) {
+                vk_mutex_unlock(B.mtx);
+                break;
+            }
+            seq = B.rep[B.rep_head].seq;
+            vk_mutex_unlock(B.mtx);
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &B.timeline;
+            wi.pValues = &seq;
+            vkWaitSemaphores(g_vk.device, &wi, UINT64_MAX);
+            /* Every submission up to seq is done: count its queries. */
+            for (i = 0; i < VKB_SLOTS; i++)
+                if (B.slot[i].pending && B.slot[i].seq <= seq)
+                    slot_complete(&B.slot[i]);
+            vk_mutex_lock(B.mtx);
+            k = B.rep_head;
+            {
+                uint64_t n = B.epoch_count[B.rep[k].epoch % VKB_ZEPOCHS];
+                uint32_t c = n > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)n;
+                report_write(B.rep[k].at, B.rep[k].stamp, B.rep[k].force ? 100000u : c);
+            }
+            B.rep_head = (B.rep_head + 1) % VKB_REPORTS;
+            B.nrep--;
+            vk_mutex_unlock(B.mtx);
+        }
+    }
+}
+
+/* GET_REPORT: queued, answered when the GPU gets there (as the software
+ * path's asynchronous mode does: the title polls the slot's last word). */
+static void vk_report(uint32_t at, uint64_t stamp, int force)
+{
+    int k;
     if (!B.ok)
-        return 0;
-    wait_idle();
-    n = B.epoch_count[B.epoch % VKB_ZEPOCHS];
-    return n > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)n;
+        return;
+    submit(0);                        /* the queries it counts go to the GPU */
+    for (;;) {                        /* never more than VKB_REPORTS behind */
+        vk_mutex_lock(B.mtx);
+        if (B.nrep < VKB_REPORTS)
+            break;
+        vk_mutex_unlock(B.mtx);
+        vk_event_set(B.rep_event);
+        vk_yield();
+    }
+    k = (B.rep_head + B.nrep) % VKB_REPORTS;
+    B.rep[k].at = at;
+    B.rep[k].stamp = stamp;
+    B.rep[k].epoch = B.epoch;
+    B.rep[k].force = (uint32_t)force;
+    B.rep[k].seq = B.seq;
+    B.nrep++;
+    vk_mutex_unlock(B.mtx);
+    vk_event_set(B.rep_event);
 }
 
 /* The colour surface at `addr` read back into B.rbmap (rows of w * bpp
@@ -1433,9 +1768,11 @@ static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
 static void frame_stats(void)
 {
     if (getenv("RECOMP_VK_STATS") && B.frame % 60 == 0) {
-        fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits"
-                " (last 60 frames)\n", B.frame, B.draws, B.tris, B.uploads, B.submits);
-        B.draws = B.tris = B.uploads = B.submits = 0;
+        fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits,"
+                " %u new pipelines (%d kept), %u new vertex shaders (last 60 frames)\n",
+                B.frame, B.draws, B.tris, B.uploads, B.submits, B.new_pipes, B.npipes,
+                B.new_vsh);
+        B.draws = B.tris = B.uploads = B.submits = B.new_pipes = B.new_vsh = 0;
     }
 }
 
@@ -1461,7 +1798,8 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
  * guest memory. A pixel differs when any channel is off by more than
  * RECOMP_VK_COMPARE_TOL (default 8). One [VKCMP] line per frame that has
  * differing pixels, and a summary every 300 flips; with
- * RECOMP_VK_COMPARE_DUMP=<prefix>, the worst frames (up to 40) are written as
+ * RECOMP_VK_COMPARE_DUMP=<prefix>, the worst frames and a sample of the rest
+ * (up to 60) are written as
  * <prefix>NNNNN_{vk,sw,diff}.bmp. */
 static void write_bmp32(const char *path, const uint32_t *px, uint32_t w, uint32_t h)
 {
@@ -1533,7 +1871,9 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
         bad_frames++;
         fprintf(stderr, "[VKCMP] flip %u: %u px (%.3f%%) off by > %d, max %u, mean %.3f\n",
                 flip, nbad, 100.0 * frac, tol, maxd, (double)sumd / ((double)w * h));
-        if (dump && dumps < 40 && frac > worst * 0.5) {
+        /* The worst frames so far, and every 150th differing frame so the
+         * ordinary ones are seen too. */
+        if (dump && dumps < 60 && (frac > worst * 0.5 || bad_frames % 150 == 0)) {
             char path[512];
             uint32_t *vkp = (uint32_t *)malloc((size_t)w * h * 4);
             uint32_t *swp = (uint32_t *)malloc((size_t)w * h * 4);
@@ -1627,10 +1967,10 @@ static int backend_init(void)
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkDescriptorSetLayoutBinding lb[5];
+    VkDescriptorSetLayoutBinding lb[7];
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolSize ps[3];
     VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     VkFormatProperties fp;
@@ -1658,9 +1998,11 @@ static int backend_init(void)
     ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps[0].descriptorCount = VKB_SETS * 4;
     ps[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ps[1].descriptorCount = VKB_SETS;
+    ps[1].descriptorCount = VKB_SETS * 2;
+    ps[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[2].descriptorCount = VKB_SETS;
     dpi.maxSets = VKB_SETS;
-    dpi.poolSizeCount = 2;
+    dpi.poolSizeCount = 3;
     dpi.pPoolSizes = ps;
     qpi.queryType = VK_QUERY_TYPE_OCCLUSION;
     qpi.queryCount = VKB_QUERIES;
@@ -1673,6 +2015,7 @@ static int backend_init(void)
             || !vk_buffer_create(VKB_RING, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
                                  | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
                                  | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                                 | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1693,7 +2036,15 @@ static int backend_init(void)
         lb[i].descriptorCount = 1;
         lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
-    dli.bindingCount = 5;
+    lb[5].binding = 5;                  /* vertex-program constants */
+    lb[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    lb[5].descriptorCount = 1;
+    lb[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    lb[6].binding = 6;                  /* the draw's vertex data */
+    lb[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    lb[6].descriptorCount = 1;
+    lb[6].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    dli.bindingCount = 7;
     dli.pBindings = lb;
     if (!VK_OK(vkCreateDescriptorSetLayout(g_vk.device, &dli, NULL, &B.dsl)))
         return 0;
@@ -1709,6 +2060,18 @@ static int backend_init(void)
     B.vs = vk_shader_module(0, k_vs);
     if (!B.vs)
         return 0;
+    {
+        VkSemaphoreTypeCreateInfo tci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        sci.pNext = &tci;
+        if (!VK_OK(vkCreateSemaphore(g_vk.device, &sci, NULL, &B.timeline)))
+            return 0;
+    }
+    B.mtx = vk_mutex_new();
+    B.rep_event = vk_event_new();
+    if (!B.mtx || !B.rep_event || !vk_thread_start(report_thread, NULL))
+        return 0;
     if (!make_white())
         return 0;
     fprintf(stderr, "  [VK] rendering backend up (%s, depth format %d)\n",
@@ -1718,7 +2081,7 @@ static int backend_init(void)
 }
 
 static const Nv2aBackend k_backend = {
-    "vulkan", vk_clear, vk_draw, vk_report_clear, vk_report, vk_flip, vk_compare
+    "vulkan", 1, vk_clear, vk_draw, vk_report_clear, vk_report, vk_flip, vk_compare
 };
 
 const Nv2aBackend *xbox_vk_backend(void)

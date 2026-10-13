@@ -96,6 +96,25 @@ static uint32_t px(int x, int y)
     return *(uint32_t *)(g_mem + SURF + (size_t)y * W * 4 + (size_t)x * 4);
 }
 
+/* GET_REPORT: answered asynchronously; poll the slot's last word as the
+ * title does. */
+#define REPORT 0x00380000u
+static uint32_t report(void)
+{
+    volatile uint32_t *done = (volatile uint32_t *)(g_mem + REPORT + 12);
+    uint32_t n, spins = 0;
+    *done = 0xFFFFFFFFu;
+    be->report(REPORT, 1000, 0);
+    while (*done != 0 && spins++ < 200000000u)
+        ;
+    if (*done != 0) {
+        printf("FAIL report never written\n");
+        failures++;
+    }
+    memcpy(&n, g_mem + REPORT + 8, 4);
+    return n;
+}
+
 static void flip(void)
 {
     memset(g_mem + SURF, 0xCD, W * H * 4);       /* must be overwritten */
@@ -311,12 +330,12 @@ int main(void)
     s.zpass_enable = 1;
     s.depth_mask = 0;
     rect(&s, 0, 0, 64, 64, 0.9f, green, 0);
-    n = be->report();
+    n = report();
     printf("%s report behind = %u\n", n == 0 ? "ok  " : "FAIL", n);
     failures += n != 0;
     be->report_clear();
     rect(&s, 40, 40, 48, 48, 0.05f, green, 0);
-    n = be->report();
+    n = report();
     printf("%s report 8x8 = %u\n", n == 64 ? "ok  " : "FAIL", n);
     failures += n != 64;
     s.zpass_enable = 0;

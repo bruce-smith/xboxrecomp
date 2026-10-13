@@ -74,25 +74,52 @@ typedef struct {
     Nv2aTexState tex[4];
 } Nv2aDrawState;
 
-/* A draw's geometry: the primitive (SET_BEGIN_END's NV_PRIM_*) over n
- * vertices already through the vertex program, in submission order. */
+/* One vertex attribute array as programmed (SET_VERTEX_DATA_ARRAY_*). */
+typedef struct {
+    uint32_t offset;            /* resolved guest address, or a byte offset
+                                   into `inline_data` when that is set */
+    uint32_t type, size, stride;
+} Nv2aAttrDesc;
+
+/* A draw's geometry: the primitive (SET_BEGIN_END's NV_PRIM_*) and either
+ *  - v: n vertices already through the vertex program, in submission
+ *    order (the executor ran it: a program that writes constants, or a
+ *    backend without its own vertex programs); or
+ *  - v == NULL: the raw draw, for a backend that runs the program itself:
+ *    the program's words, the constants, the attribute arrays with each
+ *    attribute's inline value (what an attribute with no array reads), and
+ *    the n indices into the arrays. */
 typedef struct {
     uint32_t prim;
     const Nv2aVshOutput *v;
     uint32_t n;
+    const uint32_t (*prog)[4];
+    uint32_t prog_n;
+    const float (*constants)[4];        /* NV2A_VSH_CONSTANTS of them */
+    Nv2aAttrDesc attr[16];
+    const float (*imm)[4];              /* 16 inline values */
+    const uint16_t *idx;
+    const uint8_t *inline_data;         /* INLINE_ARRAY / immediate payload */
+    uint32_t inline_bytes;
 } Nv2aDrawGeom;
 
 typedef struct Nv2aBackend {
     const char *name;
+    /* Takes raw draws (Nv2aDrawGeom.v == NULL) and runs vertex programs
+     * itself. RECOMP_VK_CPU_VSH=1 makes the executor transform anyway. */
+    int raw_vertices;
     /* CLEAR_SURFACE: `what` is its parameter (0xF0 colour, 1 depth, 2
      * stencil), over the state's clip rectangle. */
     void (*clear)(const Nv2aDrawState *s, uint32_t what);
     void (*draw)(const Nv2aDrawState *s, const Nv2aDrawGeom *g);
     /* Visibility tests: CLEAR_REPORT_VALUE starts counting from zero, and
      * GET_REPORT asks for the pixels that passed the depth test, in draws
-     * with zpass_enable, since then. May wait for the GPU. */
+     * with zpass_enable, since then. The backend writes the 16-byte report
+     * at guest address `at` -- `stamp`, the count (100000 with `force`,
+     * RECOMP_ZPASS_FORCE), then 0 for "done", last -- when the GPU has the
+     * answer, possibly from another thread: the title polls the last word. */
     void (*report_clear)(void);
-    uint32_t (*report)(void);
+    void (*report)(uint32_t at, uint64_t stamp, int force);
     /* FLIP_STALL: the frame in the colour surface at `addr` is finished.
      * Afterwards guest memory must hold it (the framebuffer window and the
      * frame dumps read it there). */
