@@ -2892,6 +2892,16 @@ void xbox_VblankKick(void)
         SetEvent(g_timer_wake);
 }
 
+/* The GPU interrupt, raised on the calling thread, which must hold the
+ * guest CPU and have a guest stack (a notify under the guest-CPU schedule,
+ * xbox_Nv2aNotify) -- and the DPC it queues, which is where D3D's handler
+ * services the notify: the GPU stalls at a notify until that has run. */
+void xbox_Nv2aRaiseInterruptNow(void)
+{
+    kernel_raise_interrupt(NV2A_VECTOR);
+    kernel_drain_dpcs();
+}
+
 void xbox_Nv2aRequestInterrupt(void)
 {
     InterlockedExchange(&g_nv2a_irq_req, 1);
@@ -2939,7 +2949,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i, turn;
         uint64_t fire_mask = 0;
 
-        if (g_timer_wake)
+        if (xbox_SchedReplaying())
+            ;                   /* a replay: straight to waiting for its turn */
+        else if (g_timer_wake)
             WaitForSingleObject(g_timer_wake, 10);
         else
             Sleep(10);

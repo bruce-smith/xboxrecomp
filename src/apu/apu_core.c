@@ -104,6 +104,23 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
  * routine never ran and no voice completion ever reached it. */
 static volatile LONG s_irq_line;
 
+/* The guest-CPU schedule (kernel/sched.c). The APU thread is an agent: each
+ * frame -- the voice processor and DSPs reading and writing guest memory,
+ * the interrupt and its DPC -- is one turn, taken before d->lock (a guest
+ * writing voice registers takes d->lock while it holds the CPU, so the
+ * thread must never wait for the CPU holding it). What the host clock
+ * decides is recorded: the FE-trap hold, the global sample counter the
+ * guest reads. A replay does not pace frames. */
+extern void     xbox_SchedBind(int agent);
+extern int      xbox_SchedEnter(void);
+extern void     xbox_SchedLeave(int entered);
+extern int      xbox_SchedBlockBegin(void);
+extern void     xbox_SchedBlockEnd(int released);
+extern int      xbox_SchedReplaying(void);
+extern uint64_t xbox_SchedValue(int kind, uint64_t live);
+#define APU_SCHED_AGENT 3      /* XBOX_SCHED_AGENT_APU */
+#define APU_SCHED_KIND  15     /* XBOX_SCHED_APU */
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -252,6 +269,7 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case NV_PAPU_XGSCNT:
         r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        r = xbox_SchedValue(APU_SCHED_KIND, r);   /* host time: recorded */
         break;
     default:
         if (addr < 0x20000) {
@@ -509,17 +527,27 @@ static double lt_now_ms(void)
 
 static void monitor_submit_xa2(MCPXAPUState *d, int samples)
 {
-    int waited = 0;
+    int waited = 0, sched_b;
 
     /* Wait for the device to make room: this is what keeps the APU in step
      * with the sound card. The lock is dropped so the title's VOICE_ON/OFF
-     * writes (voice_lock) are not held off while the device drains. */
+     * writes (voice_lock) are not held off while the device drains.
+     *
+     * Under a guest-CPU schedule the CPU is let go once here whether or not
+     * the device makes us wait, so how often the APU lets go does not depend
+     * on the sound card. */
+    qemu_mutex_unlock(&d->lock);
+    sched_b = xbox_SchedBlockBegin();
+    qemu_mutex_lock(&d->lock);
     while (xa2_queued_buffers() >= xa2_max_queued_buffers()) {
         if (++waited > 200) {
             if (g_mon_xa2_paced)
                 fprintf(stderr, "[APU] XAudio2 queue not draining; pacing on"
                                 " the clock instead\n");
             g_mon_xa2_paced = false;
+            qemu_mutex_unlock(&d->lock);
+            xbox_SchedBlockEnd(sched_b);
+            qemu_mutex_lock(&d->lock);
             return;
         }
         qemu_mutex_unlock(&d->lock);
@@ -531,6 +559,9 @@ static void monitor_submit_xa2(MCPXAPUState *d, int samples)
         }
         g_lt_waits++;
     }
+    qemu_mutex_unlock(&d->lock);
+    xbox_SchedBlockEnd(sched_b);
+    qemu_mutex_lock(&d->lock);
     g_mon_xa2_paced = true;
     /* An empty queue at submit time is an underrun: the device played out
      * everything it had and went silent until now -- a dropout. Logged
@@ -780,7 +811,9 @@ static double loop_ms(LARGE_INTEGER a, LARGE_INTEGER b)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    int turn = 0;
 
+    xbox_SchedBind(APU_SCHED_AGENT);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -801,7 +834,12 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
+        if (!xbox_SchedReplaying())     /* a replay: the schedule paces it */
+            throttle(d);
+
+        qemu_mutex_unlock(&d->lock);
+        turn = xbox_SchedEnter();
+        qemu_mutex_lock(&d->lock);
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -860,13 +898,15 @@ static void *mcpx_apu_frame_thread(void *arg)
                 if (!trap_t0.QuadPart)
                     trap_t0 = now;
                 held = (now.QuadPart - trap_t0.QuadPart) * 1000.0 / qpf.QuadPart;
-                if (held < TRAP_HOLD_MS) {
+                if (xbox_SchedValue(APU_SCHED_KIND, held < TRAP_HOLD_MS)) {
                     if (d->set_irq) {
                         update_irq(d);
                         d->set_irq = false;
                     }
                     apu_deliver_irq(d);
                     qemu_mutex_unlock(&d->lock);
+                    xbox_SchedLeave(turn);
+                    turn = 0;
                     Sleep(1);
                     qemu_mutex_lock(&d->lock);
                     continue;
@@ -944,6 +984,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * select, blocked in voice_lock at raised IRQL, which in turn held
          * off every USB interrupt. */
         qemu_mutex_unlock(&d->lock);
+        xbox_SchedLeave(turn);       /* end of this frame's turn */
+        turn = 0;
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
         QueryPerformanceCounter(&lt[5]);

@@ -1187,7 +1187,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
         int turn;
 
-        Sleep(OHCI_TICK_MS);
+        xbox_SchedHostPause(OHCI_TICK_MS);   /* none in a replay */
         /* Under a guest-CPU schedule each pass is one turn of the OHCI
          * agent: it reads and writes guest memory and calls the ISR. */
         turn = xbox_SchedEnter();

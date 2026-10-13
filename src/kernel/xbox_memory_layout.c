@@ -636,6 +636,18 @@ static void nv2a_vblank_ack(volatile uint8_t *regs)
  * then the interrupt. The handler clears 0x400720 on entry and sets it on
  * exit; the GPU stalls at a notify until it is serviced, and so does this,
  * so the executor's own ack loop cannot clear the bits first. */
+/* Set while a notify waits to be serviced. The ack pass clears PMC_INTR_0
+ * and PGRAPH_INTR wholesale; on its own thread that never met a pending
+ * notify (the thread was the one waiting), but under a guest-CPU schedule a
+ * yield point's pump runs the pass on another agent meanwhile and wiped the
+ * notify before D3D's ISR saw it -- the title then waited for ever. */
+static volatile LONG s_notify_pending;
+
+static int notify_serviced(void *regs)
+{
+    return *(volatile uint32_t *)((volatile uint8_t *)regs + 0x400720) != 0;
+}
+
 void xbox_Nv2aNotify(uint32_t method, uint32_t param)
 {
     extern void xbox_Nv2aRequestInterrupt(void);
@@ -653,6 +665,15 @@ void xbox_Nv2aNotify(uint32_t method, uint32_t param)
     *(volatile uint32_t *)(r + 0x000100) |= 1u << 12;    /* PMC: PGRAPH */
     MemoryBarrier();
     xbox_Nv2aRequestInterrupt();
+    /* Under a guest-CPU schedule this thread (the NV2A agent) holds the CPU
+     * and the timer agent raises the interrupt: let go of it while waiting,
+     * through the schedule, which records whether it was serviced in time. */
+    if (xbox_SchedMode() && xbox_SchedHeld()) {
+        InterlockedExchange(&s_notify_pending, 1);
+        xbox_SchedWaitUntil(notify_serviced, (void *)r, 100);
+        InterlockedExchange(&s_notify_pending, 0);
+        goto serviced;
+    }
     t0 = GetTickCount();
     while (!*(volatile uint32_t *)(r + 0x400720) && GetTickCount() - t0 < 100) {
         /* This thread is also the one that sees the title's vblank
@@ -666,6 +687,7 @@ void xbox_Nv2aNotify(uint32_t method, uint32_t param)
             nv2a_vblank_ack(r);
         Sleep(0);
     }
+serviced:
     if (!*(volatile uint32_t *)(r + 0x400720) && slow++ < 8)
         fprintf(stderr, "  [NV2A] notify 0x%X param 0x%X not serviced in 100 ms"
                 " (PMC %08X EN %08X PGRAPH_INTR %08X)\n", method, param,
@@ -696,7 +718,35 @@ void xbox_Nv2aSemaphoreAt(uint32_t device_ptr_va, uint32_t base_ptr_off)
             " *(*(0x%08X) + 0x%X) + offset\n", device_ptr_va, base_ptr_off);
 }
 
+/* A release the executor reached before the title had stored its device
+ * pointer: kept and written as soon as the address resolves (the next
+ * release or the next ack pass). Dropping it left the title waiting for a
+ * fence that had already passed -- which, run by the executor's own thread,
+ * only happened if the thread got there early; on the guest-CPU schedule it
+ * runs at the main thread's first wait and got there early every time. */
+static volatile LONG s_sem_pending;
+static uint32_t s_sem_pending_off, s_sem_pending_val;
+static int sem_release(uint32_t offset, uint32_t value);
+
 int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
+{
+    int rc = sem_release(offset, value);
+    if (rc < 0) {
+        s_sem_pending_off = offset;
+        s_sem_pending_val = value;
+        InterlockedExchange(&s_sem_pending, 1);
+    } else
+        InterlockedExchange(&s_sem_pending, 0);
+    return rc;
+}
+
+static void sem_release_pending(void)
+{
+    if (s_sem_pending && sem_release(s_sem_pending_off, s_sem_pending_val) == 0)
+        InterlockedExchange(&s_sem_pending, 0);
+}
+
+static int sem_release(uint32_t offset, uint32_t value)
 {
     uint32_t dev, base;
 
@@ -707,14 +757,26 @@ int xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
         return -1;
     base = *(volatile uint32_t *)((uintptr_t)(dev + g_sem_base_ptr_off)
                                   + g_memory_offset);
-    if (!fence_readable(base + offset, 4))
+    if (!fence_readable(base + offset, 4)) {
+        static unsigned n;
+        if (n++ < 8)
+            fprintf(stderr, "  NV2A semaphore: release of %u not written: device "
+                    "0x%08X, base 0x%08X + 0x%X not readable\n", value, dev,
+                    base, offset);
         return -1;
+    }
     {
         static uint32_t last_at;
+        static unsigned n;
+        static int trace = -1;
         if (base + offset != last_at) {
             last_at = base + offset;
             fprintf(stderr, "  NV2A semaphore: releasing at 0x%08X\n", last_at);
         }
+        if (trace < 0)
+            trace = getenv("RECOMP_NV2A_TRACE") != NULL;
+        if (trace && n++ < 16)
+            fprintf(stderr, "  NV2A semaphore: release %u\n", value);
     }
     if (g_nv2a_memory) {
         /* Only the fence bits: the rest is the pushbuffer position the
@@ -1023,7 +1085,9 @@ static void framebuffer_probe_tick(void)
 /* One pass of the acknowledgement work below. The thread repeats it
  * continuously; under a guest-CPU schedule (sched.c) there is no thread and
  * the timer agent runs one pass per turn, with its recorded clock (tick),
- * so the guest sees these registers change only at recorded moments. */
+ * so the guest sees these registers change only at recorded moments.
+ * sched_pass: 0 the thread, 1 a timer turn, 2 a yield point's pump (the
+ * acknowledgements only, not the pushbuffer). */
 static void nv2a_ack_pass(volatile uint32_t *regs, int vblank, int sched_pass,
                           DWORD tick)
 {
@@ -1037,6 +1101,10 @@ static void nv2a_ack_pass(volatile uint32_t *regs, int vblank, int sched_pass,
             mask &= ~(1u << 24);
         if (vblank && NV2A_ACK[i].offset == 0x600100)
             mask &= ~(1u | XBOX_NV2A_VBLANK_MARK);
+        if (s_notify_pending && NV2A_ACK[i].offset == 0x000100)
+            mask &= ~(1u << 12);                       /* PMC: PGRAPH */
+        if (s_notify_pending && NV2A_ACK[i].offset == 0x400100)
+            mask = 0;                                  /* PGRAPH_INTR */
         if (*r & mask) {
             *r &= ~mask;
         }
@@ -1062,6 +1130,7 @@ static void nv2a_ack_pass(volatile uint32_t *regs, int vblank, int sched_pass,
      * The advance now happens after the scan, further down, which is
      * also the only ordering that gives the title real back-pressure. */
     fence_mirrors_tick();
+    sem_release_pending();
     dsp_ack_tick();
     poke_tick();
     counter_mirrors_tick();
@@ -1088,7 +1157,10 @@ static void nv2a_ack_pass(volatile uint32_t *regs, int vblank, int sched_pass,
         static uint32_t last_put;
         DWORD now_ms = sched_pass ? tick : GetTickCount();
         uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-        if (put != last_put || (now_ms - last_put_ms) > 2000) {
+        /* A yield point's pump (sched_pass 2) leaves the pushbuffer to the
+         * NV2A agent: executing it there would wait at a notify in the middle
+         * of whatever D3D code was spinning. */
+        if (sched_pass != 2 && (put != last_put || (now_ms - last_put_ms) > 2000)) {
             /* Survey the segment the title just submitted, once. */
             {
                 extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
@@ -1224,6 +1296,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
      * disappears, and that is the ack. Then both bits drop, which is also
      * what ends D3D's "ack, then spin while PMC_INTR_0 says PCRTC" loop. */
     int vblank = getenv("RECOMP_VBLANK") != NULL;
+    if (xbox_SchedMode()) {
+        /* Under a guest-CPU schedule: the NV2A agent. Each pass -- register
+         * acks, the pushbuffer executor, fences, notifies -- is one turn,
+         * on its own recorded clock; KeTickCount is the timer agent's. */
+        xbox_SchedBind(XBOX_SCHED_AGENT_NV2A);
+        while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+            int turn;
+            DWORD tick;
+            xbox_SchedHostPause(1);
+            turn = xbox_SchedEnter();
+            tick = (DWORD)xbox_SchedValue(XBOX_SCHED_TICK, GetTickCount());
+            nv2a_ack_pass(regs, vblank, 1, tick);
+            xbox_SchedLeave(turn);
+        }
+        return 0;
+    }
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_pass(regs, vblank, 0, 0);
         Sleep(0);  /* yield; the waiter is spinning on another core */
@@ -1269,8 +1357,7 @@ void xbox_Nv2aAckPassSched(uint32_t now_ms)
         return;
     if (vblank < 0)
         vblank = getenv("RECOMP_VBLANK") != NULL;
-    s_sched_tick = now_ms;
-    nv2a_ack_pass((volatile uint32_t *)g_nv2a_memory, vblank, 1, now_ms);
+    s_sched_tick = now_ms;     /* the pumps' clock; the NV2A agent does the pass */
 }
 
 /* At a yield point the spinner usually waits for exactly this work (a busy
@@ -1284,7 +1371,7 @@ static void nv2a_sched_pump(void)
         return;
     if (vblank < 0)
         vblank = getenv("RECOMP_VBLANK") != NULL;
-    nv2a_ack_pass((volatile uint32_t *)g_nv2a_memory, vblank, 1, s_sched_tick);
+    nv2a_ack_pass((volatile uint32_t *)g_nv2a_memory, vblank, 2, s_sched_tick);
 }
 
 static void xbox_Nv2aAckStart(void)
@@ -1293,9 +1380,11 @@ static void xbox_Nv2aAckStart(void)
     poke_init();
     g_nv2a_ack_stop = 0;
     if (xbox_SchedMode()) {
-        /* No threads of their own: what they did happens in the timer
-         * agent's turns and at the guest's yield points. */
+        /* The ack thread is the NV2A agent; the vblank ack has no thread of
+         * its own and happens at the guest's yield points (the pump). */
         xbox_SchedAddPump(nv2a_sched_pump);
+        g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
+                                         g_nv2a_memory, 0, NULL);
         fprintf(stderr, "  NV2A acknowledgements: on the guest-CPU schedule\n");
         return;
     }

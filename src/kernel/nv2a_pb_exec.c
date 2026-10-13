@@ -6492,9 +6492,13 @@ static void peek_chain(void)
  * RECOMP_RASTER_GET_WAIT=1 restores the wait. */
 void nv2a_pb_exec_drain(void)
 {
+    extern int xbox_SchedMode(void);
     static int wait = -1;
+    /* Under a guest-CPU schedule (sched.c) the workers' writes to render
+     * targets in guest memory must be done within the agent's turn, or they
+     * land during someone else's: it waits. */
     if (wait < 0)
-        wait = getenv("RECOMP_RASTER_GET_WAIT") != NULL;
+        wait = getenv("RECOMP_RASTER_GET_WAIT") != NULL || xbox_SchedMode();
     if (wait)
         rq_sync();
     else

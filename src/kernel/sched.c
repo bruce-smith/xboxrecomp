@@ -24,8 +24,8 @@
  * goes into the same file as a per-agent value stream, and replay gives the
  * recorded value back. Sleeps do not sleep in a replay.
  *
- * Agents: 1 timer thread (vblank, DPCs, kernel timers, and the NV2A
- * acknowledgements and main.c's device shims as its "ticks"), 2 OHCI
+ * Agents: 1 timer thread (vblank, DPCs, kernel timers, KeTickCount, and
+ * main.c's device shims as its "ticks"), 2 OHCI
  * controller, 16 the title's main thread, 17+ the guest threads in the order
  * they were created (creation happens on a thread that holds the CPU, so the
  * numbering is the same in every run). Whatever an agent allocates from the
@@ -38,9 +38,12 @@
  * --yield-points names known spins that also run "pumps" (the device
  * acknowledgements they wait for).
  *
- * Not on the schedule yet: the pushbuffer executor (RECOMP_PB_EXEC) and the
- * APU, which write guest memory from host threads of their own. A run with
- * either on records and replays, but not exactly; it says so.
+ * The device models with threads of their own are agents too: 3 the APU
+ * (one frame a turn; xbox_SchedHostPause and the FE-trap hold), 4 the NV2A
+ * thread (register acks and the pushbuffer executor, one pass a turn; the
+ * raster pool is waited for inside it, and a notify waits for the timer
+ * agent through xbox_SchedWaitUntil). A replay does not sleep between a
+ * device model's turns.
  *
  * File: "BX2SCHED", u32 version, then tagged records:
  *   0x01 varint agent, varint count            a run
@@ -300,13 +303,6 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
         const char *p = getenv("RECOMP_SCHED_REPLAY");
         int mode = 0;
         QueryPerformanceFrequency(&s_qpf);
-        /* The pushbuffer executor and the APU run on host threads that are
-         * not agents yet: what they write into guest memory is host timing,
-         * and a schedule recorded with them on will not replay exactly. */
-        if (((p && *p) || (r && *r))
-            && (getenv("RECOMP_PB_EXEC") || getenv("RECOMP_AC97_READY")))
-            fprintf(stderr, "  [SCHED] warning: RECOMP_PB_EXEC / audio are not on "
-                    "the schedule yet; this run will not replay exactly\n");
         if (p && *p) {
             mode = sched_load(p) ? 2 : 0;
         } else if (r && *r) {
@@ -538,6 +534,15 @@ void xbox_SchedYield(uint32_t va)
         s_pumps[i]();
     b = xbox_SchedBlockBegin();
     xbox_SchedBlockEnd(b);
+}
+
+/* A device model's pause between passes. In a replay its turns come when the
+ * schedule says, and a host sleep only made everyone else wait out its
+ * period at each of them: the agent goes straight to waiting for its turn. */
+void xbox_SchedHostPause(DWORD ms)
+{
+    if (xbox_SchedMode() != 2)
+        Sleep(ms);
 }
 
 void xbox_SchedAddPump(void (*fn)(void))
@@ -851,4 +856,36 @@ int xbox_SchedThreadEnded(HANDLE h, DWORD *code)
             return 1;
         }
     return 0;
+}
+
+/* Let go of the CPU and wait until done(ctx) holds or ms pass -- a device
+ * model waiting for an agent to service it (the GPU stalled at a notify
+ * until the timer agent has run the interrupt). Whether it was done in time
+ * is host timing: recorded, and a replay waits only if the recording's wait
+ * succeeded. Exactly one let-go either way. */
+int xbox_SchedWaitUntil(int (*done)(void *ctx), void *ctx, DWORD ms)
+{
+    int b, ok;
+    DWORD t0;
+    if (!t_held) {
+        t0 = GetTickCount();
+        while (!(ok = done(ctx)) && GetTickCount() - t0 < ms)
+            Sleep(0);
+        return ok;
+    }
+    b = xbox_SchedBlockBegin();
+    if (s_mode == 2) {
+        ok = (int)sched_value(XBOX_SCHED_WAIT, 1, 1);
+        t0 = GetTickCount();
+        while (ok && !done(ctx) && GetTickCount() - t0 < 60000)
+            Sleep(0);
+        xbox_SchedBlockEnd(b);
+        return ok;
+    }
+    t0 = GetTickCount();
+    while (!(ok = done(ctx)) && GetTickCount() - t0 < ms)
+        Sleep(0);
+    xbox_SchedBlockEnd(b);
+    xbox_SchedValue(XBOX_SCHED_WAIT, (uint64_t)ok);
+    return ok;
 }
