@@ -135,6 +135,19 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+
+/* File times are host time -- a cache file the last run wrote, a copy this
+ * run made -- so under a guest-CPU schedule they are recorded, and a replay
+ * hands back the recorded ones (sched.c). */
+static void sched_file_times(LARGE_INTEGER *c, LARGE_INTEGER *a, LARGE_INTEGER *w)
+{
+    if (!xbox_SchedMode())
+        return;
+    c->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)c->QuadPart);
+    a->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)a->QuadPart);
+    w->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)w->QuadPart);
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -192,6 +205,22 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        /* Under a guest-CPU schedule an open the guest would make must not
+         * fail because something outside -- a virus scan of the save folder,
+         * the last run's process still closing -- has the file for a
+         * moment: the guest would take another path, and a replay would
+         * diverge. Retried for up to 3 s. */
+        if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION
+            && xbox_SchedMode()) {
+            int tries;
+            for (tries = 0; tries < 300 && h == INVALID_HANDLE_VALUE
+                            && GetLastError() == ERROR_SHARING_VIOLATION; tries++) {
+                Sleep(10);
+                h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+                    xbox_share_to_win32(ShareAccess), NULL,
+                    xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+            }
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -347,6 +376,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastAccessTime.HighPart = fi.ftLastAccessTime.dwHighDateTime;
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
+            sched_file_times(&info->CreationTime, &info->LastAccessTime,
+                             &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -390,6 +421,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastAccessTime.HighPart = fi.ftLastAccessTime.dwHighDateTime;
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
+            sched_file_times(&info->CreationTime, &info->LastAccessTime,
+                             &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
@@ -527,6 +560,14 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
+            /* The host disk's free space: it moves with whatever else writes
+             * to the disk, so under a guest-CPU schedule it is recorded. */
+            if (xbox_SchedMode()) {
+                info->TotalAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
+                    XBOX_SCHED_DISKSPACE, (uint64_t)info->TotalAllocationUnits.QuadPart);
+                info->AvailableAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
+                    XBOX_SCHED_DISKSPACE, (uint64_t)info->AvailableAllocationUnits.QuadPart);
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
@@ -573,6 +614,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     FileInformation->LastAccessTime.HighPart = fad.ftLastAccessTime.dwHighDateTime;
     FileInformation->LastWriteTime.LowPart   = fad.ftLastWriteTime.dwLowDateTime;
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
+    sched_file_times(&FileInformation->CreationTime, &FileInformation->LastAccessTime,
+                     &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
@@ -728,6 +771,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->LastAccessTime.HighPart = ctx->find_data.ftLastAccessTime.dwHighDateTime;
     entry->LastWriteTime.LowPart  = ctx->find_data.ftLastWriteTime.dwLowDateTime;
     entry->LastWriteTime.HighPart = ctx->find_data.ftLastWriteTime.dwHighDateTime;
+    sched_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                     &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
@@ -965,6 +1010,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_ctime, 0, &info->CreationTime);
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
+            sched_file_times(&info->CreationTime, &info->LastAccessTime,
+                             &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -996,6 +1043,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_ctime, 0, &info->CreationTime);
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
+            sched_file_times(&info->CreationTime, &info->LastAccessTime,
+                             &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = st.st_size;
             info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
@@ -1133,6 +1182,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     unix_to_filetime(st.st_ctime, 0, &FileInformation->CreationTime);
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &FileInformation->LastWriteTime);
+    sched_file_times(&FileInformation->CreationTime, &FileInformation->LastAccessTime,
+                     &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = st.st_size;
     FileInformation->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
@@ -1237,6 +1288,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
     unix_to_filetime(st.st_atime, 0, &entry->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &entry->LastWriteTime);
+    sched_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                     &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;

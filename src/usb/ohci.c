@@ -1165,8 +1165,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned first_port = 0, settle = 0;
 
     (void)unused;
+    xbox_SchedBind(XBOX_SCHED_AGENT_OHCI);
     {
+        /* Under a guest-CPU schedule the TIB (guest heap) is taken in a
+         * scheduled turn, in a recorded order. */
+        int setup = xbox_SchedEnter();
         uint32_t tib = xbox_AllocThreadTib();
+        xbox_SchedLeave(setup);
         if (!tib) {
             fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
                             "not delivering interrupts\n");
@@ -1180,8 +1185,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+        int turn;
 
         Sleep(OHCI_TICK_MS);
+        /* Under a guest-CPU schedule each pass is one turn of the OHCI
+         * agent: it reads and writes guest memory and calls the ISR. */
+        turn = xbox_SchedEnter();
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -1196,10 +1205,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * the pad silently never arrived. An idle controller costs one
              * wake per tick. */
             ++waited;
-            continue;
+            goto next;
         }
         if (!(enable & INTR_MIE))
-            continue;
+            goto next;
 
         /* Plug the device in once, after the driver is running and listening.
          * Presenting it earlier does not work: the driver clears the connect
@@ -1357,7 +1366,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     deliver:
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
-            continue;
+            goto next;
 
         /* Bounded, because the mask is a model and not the hardware.
          *
@@ -1377,7 +1386,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         hc->index, xbox_IrqlRaisedCount(), status);
                 fflush(stderr);
             }
-            continue;
+            goto next;
         }
         if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
             held_off_forced = 1;
@@ -1406,6 +1415,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                                 "with no acknowledgement; stopping\n",
                         hc->index, status);
                 fflush(stderr);
+                xbox_SchedLeave(turn);
                 break;
             }
         } else {
@@ -1414,6 +1424,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             repeats     = 0;
         }
         ohci_raise(hc, status);
+    next:
+        xbox_SchedLeave(turn);
     }
     return 0;
 }

@@ -169,7 +169,9 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart == 0) {
         /* Zero interval = yield the thread's time slice */
+        int b = xbox_SchedBlockBegin();   /* and the guest CPU, if held */
         SwitchToThread();
+        xbox_SchedBlockEnd(b);
         return STATUS_SUCCESS;
     }
 
@@ -190,13 +192,10 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
-    if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
-        if (result == WAIT_IO_COMPLETION)
-            return STATUS_ALERTED;
-    } else {
-        Sleep(ms);
-    }
+    /* Through the guest-CPU schedule: lets go of the CPU while asleep, and a
+     * replay does not sleep at all (sched.c). */
+    if (xbox_SchedSleep(ms, Alertable ? TRUE : FALSE) == WAIT_IO_COMPLETION)
+        return STATUS_ALERTED;
 
     return STATUS_SUCCESS;
 }
@@ -301,7 +300,9 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode)
 
 NTSTATUS __stdcall xbox_NtYieldExecution(void)
 {
+    int b = xbox_SchedBlockBegin();       /* the guest CPU too, if held */
     SwitchToThread();
+    xbox_SchedBlockEnd(b);
     return STATUS_SUCCESS;
 }
 
@@ -356,7 +357,12 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
      * the two are not interchangeable: -1 must become an error status rather
      * than a suspend count of 0xFFFFFFFF.
      */
-    prev = SuspendThread(ThreadHandle);
+    /* A thread suspending itself blocks until another resumes it: it must
+     * not keep the guest CPU while it waits. */
+    if (GetThreadId(ThreadHandle) == GetCurrentThreadId())
+        prev = xbox_SchedSuspendSelf(ThreadHandle);
+    else
+        prev = SuspendThread(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
@@ -379,7 +385,7 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     DWORD prev;
 
     /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
-    prev = ResumeThread(ThreadHandle);
+    prev = xbox_SchedResume(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());

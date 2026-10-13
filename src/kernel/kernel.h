@@ -815,6 +815,48 @@ void    xbox_IrqlDumpHolders(void);
 void    xbox_DpcDumpRunning(void);              /* the DPC running now, if any */
 void    xbox_SetVblankGate(int (*gate)(int due)); /* title decides each vblank */
 void    xbox_VblankKick(void);                  /* wake the timer thread now */
+
+/* The guest CPU and its recorded schedule (sched.c). RECOMP_SCHED_RECORD /
+ * RECOMP_SCHED_REPLAY; off, all of these are no-ops. */
+#define XBOX_SCHED_AGENT_TIMER  1
+#define XBOX_SCHED_AGENT_OHCI   2
+#define XBOX_SCHED_AGENT_APU    3
+#define XBOX_SCHED_AGENT_MAIN   16
+enum {                                          /* xbox_SchedValue kinds */
+    XBOX_SCHED_QPC = 1, XBOX_SCHED_SYSTIME, XBOX_SCHED_INTTIME, XBOX_SCHED_RDTSC,
+    XBOX_SCHED_TICK, XBOX_SCHED_WAIT, XBOX_SCHED_SLEEP, XBOX_SCHED_TIMER_PASS,
+    XBOX_SCHED_TIMERS_FIRED, XBOX_SCHED_PAD, XBOX_SCHED_LOCKWAIT,
+    XBOX_SCHED_PREEMPT, XBOX_SCHED_FILETIME, XBOX_SCHED_DISKSPACE
+};
+int      xbox_SchedMode(void);                  /* 0 off, 1 record, 2 replay */
+int      xbox_SchedReplaying(void);
+void     xbox_SchedBind(int agent);             /* this host thread is that agent */
+int      xbox_SchedAgent(void);
+int      xbox_SchedNewGuestAgent(void);         /* next guest thread's number */
+int      xbox_SchedEnter(void);                 /* take the CPU if not held */
+void     xbox_SchedLeave(int entered);
+int      xbox_SchedBlockBegin(void);            /* about to block: let go */
+void     xbox_SchedBlockEnd(int released);
+int      xbox_SchedHeld(void);
+void     xbox_SchedYield(uint32_t va);          /* a spin loop's yield point */
+void     xbox_SchedAddPump(void (*fn)(void));   /* run at every yield point */
+void     xbox_SchedAddTick(void (*fn)(void));   /* run at every timer turn */
+void     xbox_SchedRunTicks(void);
+uint64_t xbox_SchedValue(int kind, uint64_t live);
+void     xbox_SchedLoopCheck(void);             /* RECOMP_LOOP_HEAD, now and then */
+void     xbox_SchedFlush(void);
+void     xbox_SchedClose(void);                 /* last run + flush, at exit */
+#ifdef _WIN32
+DWORD    xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
+                          DWORD ms, DWORD timeout_code);
+void     xbox_SchedEnterCS(CRITICAL_SECTION *cs);
+DWORD    xbox_SchedSleep(DWORD ms, BOOL alertable);
+DWORD    xbox_SchedSuspendSelf(HANDLE self);
+DWORD    xbox_SchedResume(HANDLE h);
+void     xbox_SchedThreadStarting(void);
+void     xbox_SchedThreadEnding(DWORD code);    /* while it holds the CPU */
+int      xbox_SchedThreadEnded(HANDLE h, DWORD *code);
+#endif
 /* Called on the DPC's own thread when one invocation of a DPC has made 1000,
  * 10000 and 100000 KeQuerySystemTime calls -- a loop that reads the clock
  * once per pass and never finds what it waits for. The game registers it to

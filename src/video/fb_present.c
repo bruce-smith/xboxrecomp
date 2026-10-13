@@ -231,6 +231,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         InterlockedExchange(&s_fb_running, 0);
         fprintf(stderr, "  [FBWIN] window closed; exiting\n");
         fflush(stderr);
+        {
+            extern void xbox_SchedClose(void);   /* kernel/sched.c */
+            xbox_SchedClose();
+        }
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     case WM_DESTROY:

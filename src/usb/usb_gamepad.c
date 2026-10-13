@@ -12,6 +12,7 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "../kernel/kernel.h"     /* xbox_SchedValue */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -593,7 +594,35 @@ static void pad_rest_apply(int pad, uint8_t *out)
     out[11] = trig[1];
 }
 
+static int usb_gamepad_report_live(int pad, uint8_t *out, int max);
+
+/* The report, through the guest-CPU schedule (sched.c): what the host pad,
+ * keyboard or script said is recorded -- one value when it is the same as
+ * the last report, the 18 state bytes when it changed -- and a replay hands
+ * back the recorded report whatever the host has plugged in. */
 int usb_gamepad_report(int pad, uint8_t *out, int max)
+{
+    static uint8_t last[4][18];
+    uint64_t v[3] = { 0, 0, 0 };
+    int n = usb_gamepad_report_live(pad, out, max), changed;
+
+    if (n != 20 || !xbox_SchedMode())
+        return n;
+    pad &= 3;
+    changed = memcmp(last[pad], out + 2, 18) != 0;
+    changed = (int)xbox_SchedValue(XBOX_SCHED_PAD, (uint64_t)changed);
+    if (changed) {
+        memcpy(v, out + 2, 18);
+        v[0] = xbox_SchedValue(XBOX_SCHED_PAD, v[0]);
+        v[1] = xbox_SchedValue(XBOX_SCHED_PAD, v[1]);
+        v[2] = xbox_SchedValue(XBOX_SCHED_PAD, v[2]);
+        memcpy(last[pad], v, 18);
+    }
+    memcpy(out + 2, last[pad], 18);
+    return n;
+}
+
+static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;

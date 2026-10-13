@@ -390,6 +390,18 @@ void recomp_icall_not_code_log(uint32_t va);
  * make that division wrong by the ratio of the two clocks; the runtime scales
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
+/* A spin loop's head named by tools.recomp --yield-points: under the
+ * runtime's guest-CPU schedule, let another guest thread or a device model
+ * run (kernel/sched.c); otherwise nothing. */
+void xbox_SchedYield(uint32_t va);
+#define RECOMP_YIELD_POINT(va) xbox_SchedYield(va)
+/* Every loop head, with tools.recomp --loop-heads: a per-thread count of
+ * loop iterations, and now and then a check for the guest-CPU schedule's
+ * preemption (kernel/sched.c). Off that schedule the check never comes. */
+extern RECOMP_TLS uint64_t g_loop_n, g_loop_chk;
+void xbox_SchedLoopCheck(void);
+#define RECOMP_LOOP_HEAD() \
+    do { if (++g_loop_n >= g_loop_chk) xbox_SchedLoopCheck(); } while (0)
 
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))

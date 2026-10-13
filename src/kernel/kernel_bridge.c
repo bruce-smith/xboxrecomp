@@ -222,6 +222,10 @@ static void kernel_data_init(void)
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+    /* With a guest-CPU schedule only the timer agent moves it, by recorded
+     * values; it starts from a fixed one, not the host's uptime. */
+    if (xbox_SchedMode())
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = 1000;
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -457,6 +461,8 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
+    int agent;                     /* guest-CPU schedule number (sched.c) */
+    uint32_t tib;                  /* allocated by the creator, see below */
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -481,6 +487,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
+    xbox_SchedBind(s->agent);
+    xbox_SchedThreadStarting();
+
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
      * The TIB carries the SEH chain head and, through fs:[4], the CRT's
@@ -491,7 +500,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
-        uint32_t tib = xbox_AllocThreadTib();
+        uint32_t tib = s->tib;
         if (tib)
             g_fs_base = tib;
         else
@@ -502,6 +511,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    xbox_SchedThreadEnding(g_eax);
     guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
@@ -522,6 +532,13 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    /* Numbered here, by the creating thread, which holds the guest CPU: the
+     * same thread gets the same number in every run. */
+    s->agent = xbox_SchedNewGuestAgent();
+    /* The TIB comes off the guest heap. Taken here, on the thread that holds
+     * the guest CPU, not when the host thread happens to start: the heap's
+     * order of allocations is the same in every run. */
+    s->tib = xbox_AllocThreadTib();
 
     /* CreateSuspended maps onto a suspended host thread; the title's
      * NtResumeThread on the handle token releases it. Starting it anyway broke
@@ -1479,6 +1496,7 @@ static void bridge_RtlLeaveCriticalSection(void)
 static void bridge_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
+    li.QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_QPC, (uint64_t)li.QuadPart);
     g_eax = (uint32_t)li.LowPart;
     g_edx = (uint32_t)li.HighPart;
 }
@@ -1497,6 +1515,13 @@ static void bridge_KeQuerySystemTime(void)
 {
     uint32_t time_ptr = STACK_ARG(0);
     xbox_KeQuerySystemTime(XBOX_TO_NATIVE(time_ptr));
+    if (time_ptr && xbox_SchedMode()) {
+        uint64_t t = (uint64_t)BRIDGE_MEM32(time_ptr)
+                   | ((uint64_t)BRIDGE_MEM32(time_ptr + 4) << 32);
+        t = xbox_SchedValue(XBOX_SCHED_SYSTIME, t);
+        BRIDGE_MEM32(time_ptr) = (uint32_t)t;
+        BRIDGE_MEM32(time_ptr + 4) = (uint32_t)(t >> 32);
+    }
     dpc_note_clock_read();
     g_eax = 0;
 }
@@ -1997,6 +2022,8 @@ static void bridge_PsTerminateSystemThread(void)
          * to do it. */
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
+        xbox_SchedThreadEnding(exit_status);   /* ended, as others will see it */
+        xbox_SchedLeave(xbox_SchedHeld());     /* the guest CPU goes too */
         ExitThread(exit_status);
     }
 }
@@ -2242,7 +2269,7 @@ static BOOL CALLBACK intr_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
 void xbox_InterruptLock(uint32_t kint)
 {
     InitOnceExecuteOnce(&g_intr_lock_once, intr_lock_init, NULL, NULL);
-    EnterCriticalSection(&g_intr_lock[(kint >> 4) % INTR_LOCKS]);
+    xbox_SchedEnterCS(&g_intr_lock[(kint >> 4) % INTR_LOCKS]);
 }
 
 void xbox_InterruptUnlock(uint32_t kint)
@@ -2509,11 +2536,19 @@ static void kernel_vblank_tick(void)
     /* Each nonzero answer from the gate is exactly one vblank raised. One it
      * holds back restarts the cadence, so the next arrives a period after the
      * gate lets it, not in a burst the moment it does: a vblank that lands
-     * before the title's frame loop resets its counter is lost to the loop. */
-    if (gate ? !gate(due) : !due) {
-        if (due)
-            next = now.QuadPart + period;
-        return;
+     * before the title's frame loop resets its counter is lost to the loop.
+     *
+     * With a guest-CPU schedule the decision is host timing, so it is
+     * recorded, and a replay raises exactly the recorded ones (sched.c). */
+    {
+        int go = gate ? gate(due) : due;
+        if (xbox_SchedHeld())
+            go = (int)xbox_SchedValue(XBOX_SCHED_TIMER_PASS, (uint64_t)(go != 0));
+        if (!go) {
+            if (due)
+                next = now.QuadPart + period;
+            return;
+        }
     }
     if (due) {
         next += period;
@@ -2866,8 +2901,13 @@ void xbox_Nv2aRequestInterrupt(void)
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
-    int slot = xbox_worker_stack_alloc();
+    int slot, setup;
 
+    /* Under a guest-CPU schedule the stack slot and the TIB (guest heap)
+     * are taken in the timer agent's first turn, in a recorded order. */
+    xbox_SchedBind(XBOX_SCHED_AGENT_TIMER);
+    setup = xbox_SchedEnter();
+    slot = xbox_worker_stack_alloc();
     (void)unused;
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
@@ -2886,31 +2926,60 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
                             "timer DPCs will not run\n");
             fflush(stderr);
+            xbox_SchedLeave(setup);
             return 0;
         }
         g_fs_base = tib;
     }
+    xbox_SchedLeave(setup);
 
     g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
     for (;;) {
         long long now;
-        int i;
+        int i, turn;
+        uint64_t fire_mask = 0;
 
         if (g_timer_wake)
             WaitForSingleObject(g_timer_wake, 10);
         else
             Sleep(10);
+        /* With a guest-CPU schedule, everything below is one turn of the
+         * timer agent: the device models' periodic work, the vblank, the
+         * DPCs, the timers -- with what host time decided recorded. */
+        turn = xbox_SchedEnter();
+        if (turn) {
+            extern void xbox_Nv2aAckPassSched(uint32_t now_ms);
+            uint32_t tick = (uint32_t)xbox_SchedValue(XBOX_SCHED_TICK, GetTickCount());
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = tick;
+            xbox_Nv2aAckPassSched(tick);
+            xbox_SchedRunTicks();
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
-        if (InterlockedExchange(&g_nv2a_irq_req, 0))
-            kernel_raise_interrupt(NV2A_VECTOR);
+        {
+            int req = InterlockedExchange(&g_nv2a_irq_req, 0) != 0;
+            if (turn)
+                req = (int)xbox_SchedValue(XBOX_SCHED_TIMER_PASS, (uint64_t)req);
+            if (req)
+                kernel_raise_interrupt(NV2A_VECTOR);
+        }
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
+        if (turn) {
+            for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+                EnterCriticalSection(&g_timer_lock);
+                if (g_timers[i].timer_va && now >= g_timers[i].due_ms)
+                    fire_mask |= 1ull << i;
+                LeaveCriticalSection(&g_timer_lock);
+            }
+            fire_mask = xbox_SchedValue(XBOX_SCHED_TIMERS_FIRED, fire_mask);
+        }
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
 
             EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            if (!g_timers[i].timer_va
+                || (turn ? !(fire_mask & (1ull << i)) : now < g_timers[i].due_ms)) {
                 LeaveCriticalSection(&g_timer_lock);
                 continue;
             }
@@ -2936,6 +3005,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        xbox_SchedLeave(turn);
     }
 }
 
@@ -4411,9 +4481,14 @@ static void bridge_ObReferenceObjectByHandle(void)
             }
             if (blk) {
                 DWORD code = 0;
-                int done = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
-                if (done)
-                    GetExitCodeThread(h, &code);
+                /* Under a guest-CPU schedule, ended is what the thread said
+                 * while it held the CPU, not how far its host exit got. */
+                int done = xbox_SchedThreadEnded(h, &code);
+                if (done < 0) {
+                    done = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+                    if (done)
+                        GetExitCodeThread(h, &code);
+                }
                 BRIDGE_MEM8(blk + 4)       = done ? 1 : 0;   /* SignalState */
                 BRIDGE_MEM32(blk + 0x120)  = code;           /* ExitStatus  */
                 if (object_ptr) BRIDGE_MEM32(object_ptr) = blk;
@@ -4863,7 +4938,7 @@ static void bridge_IoDeleteDevice(void)
  * half goes to g_edx exactly like the performance-counter bridges. */
 static void bridge_KeQueryInterruptTime(void)
 {
-    uint64_t t = xbox_KeQueryInterruptTime();
+    uint64_t t = xbox_SchedValue(XBOX_SCHED_INTTIME, xbox_KeQueryInterruptTime());
 
     g_eax = (uint32_t)t;
     g_edx = (uint32_t)(t >> 32);
@@ -6781,7 +6856,8 @@ static void bridge_MmGlobalData(void)
 static void bridge_KeInterruptTime(void)
 {
     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
+    ULONGLONG t = xbox_SchedValue(XBOX_SCHED_INTTIME,
+                                  (ULONGLONG)GetTickCount64() * 10000ull);
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
@@ -6792,9 +6868,12 @@ static void bridge_KeSystemTime(void)
 {
     /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
     FILETIME ft;
+    uint64_t t;
     GetSystemTimeAsFileTime(&ft);
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+    t = xbox_SchedValue(XBOX_SCHED_SYSTIME,
+                        ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = (uint32_t)t;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
 }
 
@@ -7591,7 +7670,7 @@ static void bridge_KeResumeThread(void)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
     if (hThread)
-        g_eax = (uint32_t)ResumeThread(hThread);
+        g_eax = (uint32_t)xbox_SchedResume(hThread);
     else
         g_eax = 0;
 }
@@ -7604,7 +7683,9 @@ static void bridge_KeSuspendThread(void)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
     if (hThread)
-        g_eax = (uint32_t)SuspendThread(hThread);
+        g_eax = (uint32_t)(GetThreadId(hThread) == GetCurrentThreadId()
+                           ? xbox_SchedSuspendSelf(hThread)
+                           : SuspendThread(hThread));
     else
         g_eax = 0;
 }
@@ -9838,6 +9919,8 @@ static RECOMP_TLS int t_dispatch_depth;
 
 static int guest_cpu_enabled(void)
 {
+    if (xbox_SchedMode())      /* sched.c: holds through kernel calls instead */
+        return 0;
     if (g_guest_cpu_on < 0) {
         const char *e = getenv("RECOMP_GUEST_LOCK");
         InitializeCriticalSection(&g_guest_cpu);
@@ -9852,6 +9935,15 @@ static int guest_cpu_enabled(void)
  * guest instruction. */
 void guest_cpu_join(void)
 {
+    if (xbox_SchedMode()) {
+        /* The thread that runs the title's entry point is the main agent;
+         * spawned threads were numbered when they were created. */
+        if (!xbox_SchedAgent())
+            xbox_SchedBind(XBOX_SCHED_AGENT_MAIN);
+        t_guest_thread = 1;
+        xbox_SchedEnter();
+        return;
+    }
     t_guest_thread = 1;
     if (guest_cpu_enabled() && !t_guest_held) {
         EnterCriticalSection(&g_guest_cpu);
@@ -9861,6 +9953,11 @@ void guest_cpu_join(void)
 
 void guest_cpu_part(void)
 {
+    if (xbox_SchedMode()) {
+        xbox_SchedLeave(xbox_SchedHeld());
+        t_guest_thread = 0;
+        return;
+    }
     if (t_guest_held) {
         t_guest_held = 0;
         LeaveCriticalSection(&g_guest_cpu);

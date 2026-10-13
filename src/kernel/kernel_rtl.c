@@ -510,7 +510,11 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
-    EnterCriticalSection(cs);
+    {   /* Blocks: the holder may need the guest CPU to get out (sched.c). */
+        int b = xbox_SchedBlockBegin();
+        EnterCriticalSection(cs);
+        xbox_SchedBlockEnd(b);
+    }
     xbox_cs_note_owner(cs);
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",

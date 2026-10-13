@@ -460,7 +460,8 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, force_returns=None, icall_sites=None):
+                 trace_functions=None, force_returns=None, icall_sites=None,
+                 yield_points=None, loop_heads=False):
         """
         xbe_data: bytes - raw XBE file contents
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
@@ -478,6 +479,8 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        self.yield_points = set(yield_points or ())
+        self.loop_heads = bool(loop_heads)
         self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
@@ -2535,6 +2538,13 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+            # A spin loop's head: let another guest thread (or a device's
+            # acknowledgement) run, or a serialized guest CPU never leaves.
+            if bb.start in self.yield_points:
+                lines.append(f"    RECOMP_YIELD_POINT(0x{bb.start:08X}u);")
+            # A loop head: something reaches it from at or after itself.
+            if self.loop_heads and any(p >= bb.start for p in preds[bb.start]):
+                lines.append("    RECOMP_LOOP_HEAD();")
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
@@ -2705,7 +2715,8 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, yield_points=None,
+                 loop_heads=False):
         self.xbe_path = xbe_path
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -2765,7 +2776,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites)
+            force_returns=force_returns, icall_sites=self.icall_sites,
+            yield_points=yield_points, loop_heads=loop_heads)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

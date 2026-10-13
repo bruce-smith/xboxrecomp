@@ -128,6 +128,12 @@ static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
+static DWORD dispatch_wait(void *ctx, DWORD ms)
+{
+    (void)ctx;
+    return WaitForSingleObject(s_dispatch_mutex, ms);
+}
+
 static void dispatch_lock(DWORD timeout_ms, const char *who)
 {
     DWORD r;
@@ -135,7 +141,9 @@ static void dispatch_lock(DWORD timeout_ms, const char *who)
     InitOnceExecuteOnce(&s_dispatch_once, dispatch_lock_init, NULL, NULL);
     if (!s_dispatch_mutex)
         return;
-    r = WaitForSingleObject(s_dispatch_mutex, timeout_ms);
+    /* Through the guest-CPU schedule: the holder may be an agent waiting for
+     * the CPU, so a contended wait lets go of it (sched.c). */
+    r = xbox_SchedWaitFn(dispatch_wait, NULL, timeout_ms, WAIT_TIMEOUT);
     if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
         t_dispatch_held = 1;
         return;
@@ -1110,7 +1118,15 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
  * ========================================================================= */
 #define XBOX_TSC_HZ 733333333ull
 
+static uint64_t read_tsc_live(void);
+
+/* rdtsc in lifted code. Host time, so recorded under a guest-CPU schedule. */
 uint64_t xbox_ReadTimeStampCounter(void)
+{
+    return xbox_SchedValue(XBOX_SCHED_RDTSC, read_tsc_live());
+}
+
+static uint64_t read_tsc_live(void)
 {
     static LARGE_INTEGER freq;
     static LARGE_INTEGER origin;

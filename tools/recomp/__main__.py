@@ -259,6 +259,18 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--yield-points", metavar="FILE",
+                        help="JSON list of loop-head addresses to emit "
+                             "RECOMP_YIELD_POINT(va) at: spin loops that wait "
+                             "for another thread or a device, where a "
+                             "serialized guest CPU (the runtime's guest-CPU "
+                             "schedule) must let go or it never ends")
+    parser.add_argument("--loop-heads", action="store_true",
+                        help="Emit RECOMP_LOOP_HEAD() at every loop head (a "
+                             "back-edge target): a per-thread iteration count "
+                             "the runtime's guest-CPU schedule uses to preempt "
+                             "a spinning thread at a point it can replay. A "
+                             "TLS increment and compare per iteration")
     parser.add_argument("--force-return", metavar="ADDR=VALUE",
                         action="append", default=[],
                         help="Make a function hand its callers a constant "
@@ -340,6 +352,8 @@ def main():
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
+        yield_points=_load_addrs(args.yield_points),
+        loop_heads=args.loop_heads,
         force_returns=_parse_force_returns(args.force_return),
         coalesce_json_paths=args.coalesce_functions,
         protected_function_starts=protected_function_starts,

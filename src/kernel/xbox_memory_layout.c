@@ -1020,6 +1020,197 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* One pass of the acknowledgement work below. The thread repeats it
+ * continuously; under a guest-CPU schedule (sched.c) there is no thread and
+ * the timer agent runs one pass per turn, with its recorded clock (tick),
+ * so the guest sees these registers change only at recorded moments. */
+static void nv2a_ack_pass(volatile uint32_t *regs, int vblank, int sched_pass,
+                          DWORD tick)
+{
+    if (vblank)
+        nv2a_vblank_ack((volatile uint8_t *)regs);
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        if (vblank && NV2A_ACK[i].offset == 0x000100)
+            mask &= ~(1u << 24);
+        if (vblank && NV2A_ACK[i].offset == 0x600100)
+            mask &= ~(1u | XBOX_NV2A_VBLANK_MARK);
+        if (*r & mask) {
+            *r &= ~mask;
+        }
+    }
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+            *r |= NV2A_IDLE[i].idle_mask;
+        }
+    }
+    /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
+     * before the scan below had executed anything.
+     *
+     * GET is what tells the title how far the GPU has consumed, and D3D
+     * waits on it before reusing the ring. Reporting "all consumed"
+     * while the commands were still unread gave the title permission to
+     * overwrite them, and it took it: the executor then read whatever
+     * part of the segment had survived, so each pass drew a different
+     * subset of the frame. It looks like unstable geometry and is a
+     * lost-command race.
+     *
+     * The advance now happens after the scan, further down, which is
+     * also the only ordering that gives the title real back-pressure. */
+    fence_mirrors_tick();
+    dsp_ack_tick();
+    poke_tick();
+    counter_mirrors_tick();
+    frame_counters_tick();
+    framebuffer_probe_tick();
+
+    /* Which framebuffer the display would be scanning out.
+     *
+     * PCRTC_START holds the address the CRTC reads pixels from, so
+     * whatever the title last set there is the frame it believes is on
+     * screen. Nothing here scans out, so this is the one place that says
+     * whether the guest is producing an image at all -- and where it is.
+     * Gated, because it is a bring-up question, not a runtime one. */
+    /* Not gated on the trace flag: nv2a_pb_scan is what drives the
+     * executor, and it already returns unless RECOMP_PB_SCAN or
+     * RECOMP_PB_EXEC asked for it. Gating the call as well meant
+     * RECOMP_PB_EXEC on its own did nothing at all, and the executor
+     * only ran when someone happened to also be tracing. */
+    {
+        /* Is the title submitting GPU work at all? PUT is where the
+         * title's pushbuffer writer has got to; if it never moves, nothing
+         * is being drawn and the missing piece is upstream of the GPU. */
+        static DWORD  last_put_ms;
+        static uint32_t last_put;
+        DWORD now_ms = sched_pass ? tick : GetTickCount();
+        uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+        if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            /* Survey the segment the title just submitted, once. */
+            {
+                extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
+                extern void nv2a_pb_scan_report(void);
+                static DWORD last_report;
+
+                /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
+                 * `VA & 0x0FFFFFFF` and reads the GPU's position back as
+                 * `GET | 0x80000000`. nv2a_pb_scan reads guest VAs, so
+                 * handing it the raw register value pointed it at low
+                 * memory: for the Xbox Dashboard, whose pushbuffer is at
+                 * 0x80001000, PUT reads 0x1000 and the survey walked the
+                 * fake TIB. It reported a plausible-looking inventory of
+                 * nothing, which is worse than reporting none -- the
+                 * conclusion drawn was "the title submits no methods"
+                 * while it was submitting them the whole time.
+                 *
+                 * The contiguous window IS the physical-address view, so
+                 * OR-ing its base is the documented round trip, not a
+                 * guess. */
+                /* The pushbuffer is a ring, so PUT coming back below
+                 * where it was is a wrap, not a rewind. Scanning only
+                 * forward segments dropped everything written across
+                 * the seam -- one whole submission each time round.
+                 *
+                 * So the walk follows the stream from the old PUT to
+                 * the new one through the title's own wrap JUMP, as the
+                 * GPU's fetch does. It used to guess the ring's end from
+                 * the highest PUT seen, which fell short whenever the
+                 * last submission before a wrap was never seen as a PUT
+                 * of its own; the commands between the guess and the
+                 * JUMP were skipped, and with them any fence a title
+                 * then waited on forever. */
+                if (last_put && put != last_put)
+                    nv2a_pb_scan_ring(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                /* Periodic, because what the title submits at init is not
+                 * what it submits once it is drawing a menu, and the
+                 * question the survey answers is about the latter. */
+                /* RECOMP_PB_REPORT_MS shortens it: the report is also
+                 * when RECOMP_FB_DUMP writes a frame, and stepping a
+                 * scripted pad through a menu needs a picture per
+                 * press rather than one every ten seconds. */
+                static long report_ms = -1;
+                if (report_ms < 0) {
+                    const char *e = getenv("RECOMP_PB_REPORT_MS");
+                    report_ms = e ? atol(e) : 10000;
+                    if (report_ms < 100) report_ms = 100;
+                }
+                if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
+                    last_report = now_ms;
+                    nv2a_pb_scan_report();
+                }
+            }
+            /* Consumed, now that it has actually been executed --
+             * including the triangles the executor queued for its
+             * raster workers. GET at PUT tells D3D it may reuse what the
+             * commands pointed at (vertex data, textures it rewrites), so
+             * no queued pixel may still be reading it. */
+            {
+                extern void nv2a_pb_exec_drain(void);
+                volatile uint32_t *get;
+                nv2a_pb_exec_drain();
+                get =
+                    (volatile uint32_t *)((char *)regs
+                                          + NV2A_USER_DMA_GET);
+                *get = put;
+            }
+            last_put = put; last_put_ms = now_ms;
+            /* GET as well as PUT. A title that stops submitting has either
+             * finished or is spinning on the GPU catching up, and only GET
+             * tells those apart -- D3D waits for GET to reach PUT before it
+             * reuses the buffer, so GET stuck behind PUT is the shape of a
+             * pushbuffer-full hang. Also show the same pair as the Xbox
+             * Dashboard reads them: its D3D holds a register-block pointer
+             * in its device struct rather than assuming 0xFD800000, and
+             * mirroring the wrong block leaves it spinning on a GET that
+             * never moves. */
+            if (s_nv2a_log) {
+                uint32_t g = *(volatile uint32_t *)
+                             ((char *)regs + NV2A_USER_DMA_GET);
+                fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
+                        "0x%08X%s\n", put, g,
+                        g == put ? "" : "  (GPU behind)");
+            }
+            /* No fflush(stderr) here. This runs on every pushbuffer kick,
+             * many per frame, and with a title's stderr fully buffered
+             * it wrote out every thread's pending log on the NV2A
+             * thread: 7% of the executor in Blinx 2's hub. The title's
+             * own stderr policy decides when output appears. */
+        }
+    }
+    if (s_nv2a_log) {
+        static uint32_t last_start = 0xFFFFFFFFu;
+        uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
+        if (start != last_start) {
+            last_start = start;
+            fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
+            fflush(stderr);
+        }
+    }
+
+    if (g_mcpx_regs && !g_apu_mmio_trapped) {
+        for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
+            volatile uint32_t *c =
+                (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
+            *c += 1;
+        }
+    }
+
+    /* Advance KeTickCount. It was written once at init and left frozen,
+     * which silently breaks every timeout that polls it: Halo's DHCP setup
+     * waits on a tick deadline that never arrives and spins forever bringing
+     * up XNet. A live clock is also just the truth -- KeTickCount ticks on
+     * hardware whether or not anyone is asleep. GetTickCount() shares the
+     * millisecond unit, so the rate matches. */
+    if (!sched_pass)     /* the timer agent sets it under a schedule */
+        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                               + g_memory_offset) = GetTickCount();
+
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1034,187 +1225,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
      * what ends D3D's "ack, then spin while PMC_INTR_0 says PCRTC" loop. */
     int vblank = getenv("RECOMP_VBLANK") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        if (vblank)
-            nv2a_vblank_ack((volatile uint8_t *)regs);
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            uint32_t mask = NV2A_ACK[i].busy_mask;
-            if (vblank && NV2A_ACK[i].offset == 0x000100)
-                mask &= ~(1u << 24);
-            if (vblank && NV2A_ACK[i].offset == 0x600100)
-                mask &= ~(1u | XBOX_NV2A_VBLANK_MARK);
-            if (*r & mask) {
-                *r &= ~mask;
-            }
-        }
-        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
-            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-                *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
-        /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
-         * before the scan below had executed anything.
-         *
-         * GET is what tells the title how far the GPU has consumed, and D3D
-         * waits on it before reusing the ring. Reporting "all consumed"
-         * while the commands were still unread gave the title permission to
-         * overwrite them, and it took it: the executor then read whatever
-         * part of the segment had survived, so each pass drew a different
-         * subset of the frame. It looks like unstable geometry and is a
-         * lost-command race.
-         *
-         * The advance now happens after the scan, further down, which is
-         * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
-        dsp_ack_tick();
-        poke_tick();
-        counter_mirrors_tick();
-        frame_counters_tick();
-        framebuffer_probe_tick();
-
-        /* Which framebuffer the display would be scanning out.
-         *
-         * PCRTC_START holds the address the CRTC reads pixels from, so
-         * whatever the title last set there is the frame it believes is on
-         * screen. Nothing here scans out, so this is the one place that says
-         * whether the guest is producing an image at all -- and where it is.
-         * Gated, because it is a bring-up question, not a runtime one. */
-        /* Not gated on the trace flag: nv2a_pb_scan is what drives the
-         * executor, and it already returns unless RECOMP_PB_SCAN or
-         * RECOMP_PB_EXEC asked for it. Gating the call as well meant
-         * RECOMP_PB_EXEC on its own did nothing at all, and the executor
-         * only ran when someone happened to also be tracing. */
-        {
-            /* Is the title submitting GPU work at all? PUT is where the
-             * title's pushbuffer writer has got to; if it never moves, nothing
-             * is being drawn and the missing piece is upstream of the GPU. */
-            static DWORD  last_put_ms;
-            static uint32_t last_put;
-            DWORD now_ms = GetTickCount();
-            uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
-                /* Survey the segment the title just submitted, once. */
-                {
-                    extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
-                    extern void nv2a_pb_scan_report(void);
-                    static DWORD last_report;
-
-                    /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
-                     * `VA & 0x0FFFFFFF` and reads the GPU's position back as
-                     * `GET | 0x80000000`. nv2a_pb_scan reads guest VAs, so
-                     * handing it the raw register value pointed it at low
-                     * memory: for the Xbox Dashboard, whose pushbuffer is at
-                     * 0x80001000, PUT reads 0x1000 and the survey walked the
-                     * fake TIB. It reported a plausible-looking inventory of
-                     * nothing, which is worse than reporting none -- the
-                     * conclusion drawn was "the title submits no methods"
-                     * while it was submitting them the whole time.
-                     *
-                     * The contiguous window IS the physical-address view, so
-                     * OR-ing its base is the documented round trip, not a
-                     * guess. */
-                    /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * So the walk follows the stream from the old PUT to
-                     * the new one through the title's own wrap JUMP, as the
-                     * GPU's fetch does. It used to guess the ring's end from
-                     * the highest PUT seen, which fell short whenever the
-                     * last submission before a wrap was never seen as a PUT
-                     * of its own; the commands between the guess and the
-                     * JUMP were skipped, and with them any fence a title
-                     * then waited on forever. */
-                    if (last_put && put != last_put)
-                        nv2a_pb_scan_ring(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                          XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    /* Periodic, because what the title submits at init is not
-                     * what it submits once it is drawing a menu, and the
-                     * question the survey answers is about the latter. */
-                    /* RECOMP_PB_REPORT_MS shortens it: the report is also
-                     * when RECOMP_FB_DUMP writes a frame, and stepping a
-                     * scripted pad through a menu needs a picture per
-                     * press rather than one every ten seconds. */
-                    static long report_ms = -1;
-                    if (report_ms < 0) {
-                        const char *e = getenv("RECOMP_PB_REPORT_MS");
-                        report_ms = e ? atol(e) : 10000;
-                        if (report_ms < 100) report_ms = 100;
-                    }
-                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
-                        last_report = now_ms;
-                        nv2a_pb_scan_report();
-                    }
-                }
-                /* Consumed, now that it has actually been executed --
-                 * including the triangles the executor queued for its
-                 * raster workers. GET at PUT tells D3D it may reuse what the
-                 * commands pointed at (vertex data, textures it rewrites), so
-                 * no queued pixel may still be reading it. */
-                {
-                    extern void nv2a_pb_exec_drain(void);
-                    volatile uint32_t *get;
-                    nv2a_pb_exec_drain();
-                    get =
-                        (volatile uint32_t *)((char *)regs
-                                              + NV2A_USER_DMA_GET);
-                    *get = put;
-                }
-                last_put = put; last_put_ms = now_ms;
-                /* GET as well as PUT. A title that stops submitting has either
-                 * finished or is spinning on the GPU catching up, and only GET
-                 * tells those apart -- D3D waits for GET to reach PUT before it
-                 * reuses the buffer, so GET stuck behind PUT is the shape of a
-                 * pushbuffer-full hang. Also show the same pair as the Xbox
-                 * Dashboard reads them: its D3D holds a register-block pointer
-                 * in its device struct rather than assuming 0xFD800000, and
-                 * mirroring the wrong block leaves it spinning on a GET that
-                 * never moves. */
-                if (s_nv2a_log) {
-                    uint32_t g = *(volatile uint32_t *)
-                                 ((char *)regs + NV2A_USER_DMA_GET);
-                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
-                            "0x%08X%s\n", put, g,
-                            g == put ? "" : "  (GPU behind)");
-                }
-                /* No fflush(stderr) here. This runs on every pushbuffer kick,
-                 * many per frame, and with a title's stderr fully buffered
-                 * it wrote out every thread's pending log on the NV2A
-                 * thread: 7% of the executor in Blinx 2's hub. The title's
-                 * own stderr policy decides when output appears. */
-            }
-        }
-        if (s_nv2a_log) {
-            static uint32_t last_start = 0xFFFFFFFFu;
-            uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
-            if (start != last_start) {
-                last_start = start;
-                fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
-                fflush(stderr);
-            }
-        }
-
-        if (g_mcpx_regs && !g_apu_mmio_trapped) {
-            for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
-                volatile uint32_t *c =
-                    (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
-                *c += 1;
-            }
-        }
-
-        /* Advance KeTickCount. It was written once at init and left frozen,
-         * which silently breaks every timeout that polls it: Halo's DHCP setup
-         * waits on a tick deadline that never arrives and spins forever bringing
-         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
-
+        nv2a_ack_pass(regs, vblank, 0, 0);
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -1247,11 +1258,47 @@ static DWORD WINAPI nv2a_vblank_ack_thread(LPVOID param)
     return 0;
 }
 
+/* Under a guest-CPU schedule (sched.c): the timer agent's pass, and the
+ * acknowledgements a spinning guest waits for, run at its yield points. */
+static DWORD s_sched_tick;      /* the timer agent's last recorded clock */
+
+void xbox_Nv2aAckPassSched(uint32_t now_ms)
+{
+    static int vblank = -1;
+    if (!g_nv2a_memory || !xbox_SchedMode())
+        return;
+    if (vblank < 0)
+        vblank = getenv("RECOMP_VBLANK") != NULL;
+    s_sched_tick = now_ms;
+    nv2a_ack_pass((volatile uint32_t *)g_nv2a_memory, vblank, 1, now_ms);
+}
+
+/* At a yield point the spinner usually waits for exactly this work (a busy
+ * bit to drop, the vblank ack, the DSP doorbell), so it gets a whole pass.
+ * How many yields a spin makes is part of the recorded schedule, so the
+ * passes are the same in a replay. */
+static void nv2a_sched_pump(void)
+{
+    static int vblank = -1;
+    if (!g_nv2a_memory)
+        return;
+    if (vblank < 0)
+        vblank = getenv("RECOMP_VBLANK") != NULL;
+    nv2a_ack_pass((volatile uint32_t *)g_nv2a_memory, vblank, 1, s_sched_tick);
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    if (xbox_SchedMode()) {
+        /* No threads of their own: what they did happens in the timer
+         * agent's turns and at the guest's yield points. */
+        xbox_SchedAddPump(nv2a_sched_pump);
+        fprintf(stderr, "  NV2A acknowledgements: on the guest-CPU schedule\n");
+        return;
+    }
     if (getenv("RECOMP_VBLANK")) {
         HANDLE h = CreateThread(NULL, 0, nv2a_vblank_ack_thread,
                                 g_nv2a_memory, 0, NULL);
@@ -1938,6 +1985,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    xbox_SchedClose();
     _exit(3);
     return 0;
 }
