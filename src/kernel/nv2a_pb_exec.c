@@ -2915,6 +2915,7 @@ typedef struct {
     Nv2aVshOutput v[NV_RQ_TRIS][3];
     PixState st[NV_RQ_STATES];
     uint32_t surf_lo[NV_RQ_SURFS], surf_hi[NV_RQ_SURFS];
+    uint32_t surf_lay[NV_RQ_SURFS];     /* how it was written: rq_layout */
     /* What the batch's draws sample, so a later draw that renders into one of
      * them starts a new batch (see rq_tex_overlaps). ntex < 0: too many. */
     int ntex;
@@ -3707,6 +3708,18 @@ static uint32_t rq_phys(uint32_t va)
     return va & 0x0FFFFFFFu;
 }
 
+/* How a surface write lays its texels out: the pitch, or swizzled at the
+ * surface's size. Bands split work by pitch rows; a swizzled texel's bytes
+ * lie in other bands' rows, so two writes to the same memory in different
+ * layouts are only in order if the first is finished everywhere. D3D
+ * clears a swizzled target as pitch and then draws it swizzled (P7,
+ * 4810b1d: Blinx 2's reflection targets); this is the general case of it:
+ * any write after a queued write of other layout to overlapping memory. */
+static uint32_t rq_layout(const SwzTable *swz, uint32_t pitch)
+{
+    return swz ? 0x80000000u | (swz->w << 16) | swz->h : pitch;
+}
+
 static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
 {
     int i;
@@ -3718,7 +3731,21 @@ static int rq_surf_overlaps(const RasterBatch *b, uint32_t lo, uint32_t hi)
     return 0;
 }
 
-static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
+/* Does batch b write memory overlapping [lo, hi) in another layout? */
+static int rq_surf_relayout(const RasterBatch *b, uint32_t lo, uint32_t hi,
+                            uint32_t lay)
+{
+    int i;
+    if (b->nsurf < 0)
+        return 1;
+    for (i = 0; i < b->nsurf; i++)
+        if (lo < b->surf_hi[i] && b->surf_lo[i] < hi && b->surf_lay[i] != lay)
+            return 1;
+    return 0;
+}
+
+static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi,
+                            uint32_t lay)
 {
     int i;
     hi = rq_phys(lo) + (hi - lo);
@@ -3726,7 +3753,7 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
     if (b->nsurf < 0)
         return;
     for (i = 0; i < b->nsurf; i++)
-        if (b->surf_lo[i] == lo && b->surf_hi[i] == hi)
+        if (b->surf_lo[i] == lo && b->surf_hi[i] == hi && b->surf_lay[i] == lay)
             return;
     if (b->nsurf == NV_RQ_SURFS) {
         b->nsurf = -1;                    /* every textured draw syncs */
@@ -3734,6 +3761,7 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi)
     }
     b->surf_lo[b->nsurf] = lo;
     b->surf_hi[b->nsurf] = hi;
+    b->surf_lay[b->nsurf] = lay;
     b->nsurf++;
 }
 
@@ -3763,6 +3791,27 @@ static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
         for (seq = rq_unordered_from(); seq < s_pool.head; seq++)
             if (!s_pool.done[seq % NV_RQ_DEPTH]
                 && rq_surf_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
+                return 1;
+    }
+#endif
+    return 0;
+}
+
+/* Does anything queued write memory overlapping [lo, hi) in another
+ * layout than `lay` (rq_layout)? Kinds as rq_queue_overlaps. */
+static int rq_queue_relayout(uint32_t lo, uint32_t hi, uint32_t lay)
+{
+    hi = rq_phys(lo) + (hi - lo);
+    lo = rq_phys(lo);
+    if (s_rq[s_rq_fill] && rq_surf_relayout(s_rq[s_rq_fill], lo, hi, lay))
+        return 2;
+#if defined(_WIN32)
+    {
+        LONG seq;
+        rq_reap();
+        for (seq = rq_unordered_from(); seq < s_pool.head; seq++)
+            if (!s_pool.done[seq % NV_RQ_DEPTH]
+                && rq_surf_relayout(s_rq[seq % NV_RQ_DEPTH], lo, hi, lay))
                 return 1;
     }
 #endif
@@ -3878,6 +3927,8 @@ static int rq_clear_job(uint8_t *mem, uint32_t bpp)
     hi = lo + (swz ? swz->w * swz->h * bpp
                    : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch);
     (void)rq_barrier(rq_queue_samples(lo, hi));    /* a queued draw samples it */
+    (void)rq_barrier(rq_queue_relayout(lo, hi,       /* or wrote it otherwise */
+                                       rq_layout(swz, s_gpu.pitch)));
     memset(&J, 0, sizeof J);
     J.job = 1;
     J.mem = mem;
@@ -3889,7 +3940,8 @@ static int rq_clear_job(uint8_t *mem, uint32_t bpp)
     J.minx = (int)s_gpu.clip_x; J.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
     J.miny = (int)s_gpu.clip_y; J.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
     rq_push_job(&J);
-    rq_note_surface(s_rq[s_rq_fill], lo, hi);     /* a later sample orders after */
+    rq_note_surface(s_rq[s_rq_fill], lo, hi,      /* a later sample orders after */
+                    rq_layout(swz, s_gpu.pitch));
     /* What comes next waits for the whole clear. The job clears its rows
      * band by band, which keeps it in order with draws that use the same
      * layout. D3D clears a swizzled render target with the surface set to
@@ -4072,6 +4124,8 @@ static RasterBatch *rq_draw_state(RasterBatch *b, uint32_t bpp)
                 : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
     if (rq_barrier(rq_queue_samples(lo, lo + bytes)))
         b = s_rq[s_rq_fill];
+    if (rq_barrier(rq_queue_relayout(lo, lo + bytes, rq_layout(swz, s_gpu.pitch))))
+        b = s_rq[s_rq_fill];
     rt_seen_note(lo, lo + bytes);
     ps = &b->st[b->nst];
     pix_capture(ps);
@@ -4080,7 +4134,7 @@ static RasterBatch *rq_draw_state(RasterBatch *b, uint32_t bpp)
     else
         b->nst++;
     s_rq_ps = ps;
-    rq_note_surface(b, lo, lo + bytes);
+    rq_note_surface(b, lo, lo + bytes, rq_layout(swz, s_gpu.pitch));
     rq_note_textures(b);
     return b;
 }
