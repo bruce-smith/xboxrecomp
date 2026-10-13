@@ -3506,11 +3506,24 @@ static void rq_kick(void)
             s_gpu.rq_inline++;
         }
     }
-    b = s_rq[s_rq_fill];
+    /* An empty batch is not handed over, and the one filled next is the
+     * same batch under the same number. A barrier set on it is still owed
+     * to whatever goes in next: rq_barrier recorded that number as
+     * s_rq_bar_seq, and later render-to-texture checks skip every batch
+     * before it on the strength of it. Cleared here, it went in without a
+     * barrier while the skip stayed. That happened whenever a kick (GET
+     * reaching PUT, a notify) came between the barrier and the draw's first
+     * triangle, or the draw was culled entirely. The draws after it then
+     * sampled render targets still being drawn: one-frame dark flashes in
+     * stage 01-01's water (P7). */
+    {
+        int keep = b == s_rq[s_rq_fill] ? b->barrier : 0;
+        b = s_rq[s_rq_fill];
+        b->barrier = keep;
+    }
     b->n = b->nst = b->nsurf = b->ntex = 0;
     b->ngeo = 0;
     b->nin = 0;
-    b->barrier = 0;
     b->px = 0;
     b->ymin = 1 << 30;
     b->ymax = 0;
