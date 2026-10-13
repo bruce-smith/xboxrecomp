@@ -22,7 +22,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+#include "xbox_vk.h"
+#endif
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* RECOMP_VK_PRESENT=1: frames reach the screen through a Vulkan swapchain
+ * (src/gpu_vk) instead of StretchDIBits. Set once the window thread has a
+ * working swapchain; anything that fails leaves GDI in charge. */
+static int s_vk;
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -187,6 +196,12 @@ static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px
     RECT c;
     int cw, ch, dw, dh, dx, dy;
 
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk) {
+        xbox_vk_present_frame(px, s_fb_width, s_fb_height, (int)s_linear);
+        return;
+    }
+#endif
     GetClientRect(hwnd, &c);
     cw = c.right - c.left;
     ch = c.bottom - c.top;
@@ -442,6 +457,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
     hdc = GetDC(hwnd);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (getenv("RECOMP_VK_PRESENT")) {
+        s_vk = xbox_vk_present_init(hwnd);
+        if (!s_vk)
+            fprintf(stderr, "  [FBWIN] Vulkan presentation unavailable; using GDI\n");
+    }
+#endif
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -520,6 +542,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         Sleep(16);
     }
 
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        xbox_vk_present_shutdown();
+    s_vk = 0;
+#endif
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);

@@ -53,6 +53,18 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# GPU: Vulkan backend (RECOMP_VK_PRESENT / RECOMP_GPU=vulkan). Fetches
+# Vulkan-Headers, volk and glslang at configure time (src/gpu_vk); the loader
+# is opened at run time, so the exe still starts (software path) where
+# Vulkan is missing. -DXBOXRECOMP_VULKAN=OFF builds without it.
+option(XBOXRECOMP_VULKAN "Build the Vulkan GPU backend" ON)
+if(XBOXRECOMP_VULKAN)
+    add_subdirectory(src/gpu_vk)
+    # The executor installs the backend when RECOMP_GPU=vulkan.
+    target_link_libraries(xbox_kernel PRIVATE xbox_gpu_vk)
+    target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_HAVE_VULKAN)
+endif()
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 

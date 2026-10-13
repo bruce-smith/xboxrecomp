@@ -37,6 +37,10 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
+#include "nv2a_backend.h"
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+extern const Nv2aBackend *xbox_vk_backend(void);   /* src/gpu_vk */
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -4995,6 +4999,193 @@ static void raster_batch_program(void)
     xfq_end();
 }
 
+/* ── GPU backend (nv2a_backend.h) ─────────────────────────────────────────
+ *
+ * RECOMP_GPU=vulkan hands draws, clears, visibility reports and flips to a
+ * backend instead of the software rasteriser. Everything else here --
+ * decoding, fences, the GPU position, NOTIFY, flips counted, the vblank --
+ * stays as it is, so the guest sees the same GPU either way. Unset (or
+ * "soft"), nothing below runs and the software path is the reference. */
+static const Nv2aBackend *s_backend;
+/* RECOMP_VK_COMPARE=1 (with RECOMP_GPU=vulkan): both renderers. The
+ * software path stays in charge of everything the guest sees -- its pixels,
+ * its visibility counts -- and the backend draws the same stream alongside;
+ * at every flip the backend's frame is diffed against the software one. The
+ * same frames by construction, which is what a parity check needs. */
+static int s_backend_compare;
+
+static void backend_select(void)
+{
+    const char *g = getenv("RECOMP_GPU");
+    if (!g || !*g || !strcmp(g, "soft"))
+        return;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (!strcmp(g, "vulkan"))
+        s_backend = xbox_vk_backend();
+#endif
+    s_backend_compare = s_backend && getenv("RECOMP_VK_COMPARE") != NULL;
+    fprintf(stderr, "  [GPU] RECOMP_GPU=%s: %s%s\n", g,
+            s_backend ? s_backend->name : "not available, rendering in software",
+            s_backend_compare ? " (compared against software, which renders)" : "");
+}
+
+static void tex_to_backend(const Texture *t, Nv2aTexState *o)
+{
+    memset(o, 0, sizeof *o);
+    o->offset = t->offset;
+    o->width = t->width;
+    o->height = t->height;
+    o->pitch = t->pitch;
+    o->color = t->color;
+    o->addr_u = t->addr_u;
+    o->addr_v = t->addr_v;
+    o->palette = t->palette;
+    o->levels = t->levels;
+    o->filter = t->filter;
+    o->cube = t->cube;
+    o->valid = t->valid;
+    o->normalized = tex_size_from_format(t->color);
+    o->face_stride = t->valid ? tex_face_stride(t) : 0;
+    memcpy(o->bump_mat, t->bump_mat, sizeof o->bump_mat);
+    o->bump_scale = t->bump_scale;
+    o->bump_offset = t->bump_offset;
+}
+
+int nv2a_exec_texel(const Nv2aTexState *t, uint32_t face_offset,
+                    uint32_t u, uint32_t v, uint32_t *argb)
+{
+    Texture tx;
+    memset(&tx, 0, sizeof tx);
+    tx.offset = t->offset;
+    tx.width = t->width;
+    tx.height = t->height;
+    tx.pitch = t->pitch;
+    tx.color = t->color;
+    tx.addr_u = t->addr_u;
+    tx.addr_v = t->addr_v;
+    tx.palette = t->palette;
+    tx.levels = t->levels;
+    tx.filter = t->filter;
+    tx.cube = t->cube;
+    tx.valid = t->valid;
+    tx.swz = tex_swizzle_table(&tx);
+    return sample_tex(&tx, face_offset, u, v, argb);
+}
+
+static void backend_capture(Nv2aDrawState *d)
+{
+    const SwzTable *swz = surface_swizzled();
+    const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
+    int i;
+
+    memset(d, 0, sizeof *d);
+    d->color_addr = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
+    d->surface_format = s_gpu.format;
+    d->pitch = s_gpu.pitch;
+    d->bpp = surface_bpp();
+    if (swz) {
+        d->swz_w = swz->w;
+        d->swz_h = swz->h;
+    }
+    d->clip_x = s_gpu.clip_x; d->clip_y = s_gpu.clip_y;
+    d->clip_w = s_gpu.clip_w; d->clip_h = s_gpu.clip_h;
+    /* The software path keys its depth buffers by the raw offset. */
+    d->zeta_addr = s_gpu.zeta_offset;
+    d->zeta_format = (s_gpu.format >> 4) & 0xF;
+    d->zstencil_clear = s_gpu.zstencil_clear;
+    d->clear_color = s_gpu.clear_color;
+    d->color_mask = s_gpu.color_mask;
+    d->alpha_test = s_gpu.alpha_test;
+    d->alpha_func = s_gpu.alpha_func;
+    d->alpha_ref = s_gpu.alpha_ref;
+    d->blend_enable = s_gpu.blend_enable;
+    d->blend_sfactor = s_gpu.blend_sfactor;
+    d->blend_dfactor = s_gpu.blend_dfactor;
+    d->blend_equation = s_gpu.blend_equation;
+    d->blend_color = s_gpu.blend_color;
+    d->depth_test = s_gpu.depth_test;
+    d->depth_func = s_gpu.depth_func;
+    d->depth_mask = s_gpu.depth_mask;
+    d->st_test = s_gpu.st_test;
+    d->st_func = s_gpu.st_func;
+    d->st_ref = s_gpu.st_ref;
+    d->st_fmask = s_gpu.st_fmask;
+    d->st_wmask = s_gpu.st_wmask;
+    d->st_fail = s_gpu.st_fail;
+    d->st_zfail = s_gpu.st_zfail;
+    d->st_zpass = s_gpu.st_zpass;
+    d->cull_enable = s_gpu.cull_enable;
+    d->cull_face = s_gpu.cull_face;
+    d->front_face = s_gpu.front_face;
+    for (i = 0; i < 3; i++) {
+        d->vp_scale[i] = sc[i];
+        d->vp_offset[i] = of[i];
+    }
+    d->fog_enable = s_gpu.fog_enable;
+    d->fog_mode = s_gpu.fog_mode;
+    d->fog_color = s_gpu.fog_color;
+    d->fog_param[0] = s_gpu.fog_param[0];
+    d->fog_param[1] = s_gpu.fog_param[1];
+    d->rc = s_gpu.rc;
+    d->rc_seen = s_gpu.rc_seen;
+    d->clip_plane_mode = s_gpu.clip_plane_mode;
+    d->other_stage_input = s_gpu.other_stage_input;
+    d->zpass_enable = s_gpu.zpass_enable;
+    for (i = 0; i < 4; i++)
+        tex_to_backend(&s_gpu.texs[i], &d->tex[i]);
+}
+
+static void backend_clear(uint32_t param)
+{
+    Nv2aDrawState d;
+    backend_capture(&d);
+    s_backend->clear(&d, param);
+    if (!(param & NV097_CLEAR_COLOR_MASK) || s_backend_compare)
+        return;
+    s_gpu.clears++;
+    if (s_gpu.flips == 0)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    xbox_FramebufferWindowStart();
+}
+
+/* A vertex-program batch: the program runs here, as in the software path's
+ * serial mode (nv2a_vsh_run4), and the backend draws the outputs. */
+static void backend_draw(void)
+{
+    uint32_t i, n = s_gpu.idx_count;
+    Nv2aDrawState d;
+    Nv2aDrawGeom g;
+
+    if ((s_gpu.xf_mode & 3) != 2) {
+        s_gpu.batches_untransformed++;     /* fixed function: not drawn yet */
+        return;
+    }
+    for (i = 0; i < n; i += 4) {
+        static float in[4][NV2A_VSH_INPUTS][4];
+        static Nv2aVshOutput tail[4];
+        const float (*ip[4])[4];
+        Nv2aVshOutput *op[4];
+        uint32_t l, a;
+        for (l = 0; l < 4; l++) {
+            uint32_t j = i + l < n ? i + l : n - 1;
+            for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                fetch_input(a, s_gpu.idx[j], in[l][a]);
+            ip[l] = (const float (*)[4])in[l];
+            op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
+        }
+        if (!nv2a_vsh_run4(ip, op))
+            return;                        /* no program loaded */
+    }
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    backend_capture(&d);
+    g.prim = s_gpu.prim;
+    g.v = s_xf;
+    g.n = n;
+    s_backend->draw(&d, &g);
+    note_drawn();
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -5002,6 +5193,11 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    if (s_backend) {
+        backend_draw();
+        if (!s_backend_compare)
+            return;
+    }
     static int no_vsh = -1;
     if (no_vsh < 0)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
@@ -5815,6 +6011,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
+        backend_select();
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
@@ -5928,6 +6125,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        if (s_backend && !s_backend_compare) {
+            s_backend->report_clear();
+            s_gpu.zpass_count = 0;
+            break;
+        }
         if (rq_async()) {
             /* A new test: draws from here count in a fresh epoch. */
             uint32_t e;
@@ -5968,6 +6170,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * drain, even under async sync points -- a diagnostic: a title that
          * polls a result once and takes "not ready" for "not visible" reads
          * differently when the answer comes late. */
+        if (s_backend && !s_backend_compare) {
+            static int force = -1;
+            uint32_t zc = s_backend->report();
+            if (force < 0)
+                force = getenv("RECOMP_ZPASS_FORCE") != NULL;
+            if (force)
+                zc = 100000;
+            stamp = (uint64_t)s_gpu.reports++ * 1000u;
+            memcpy(mem + at, &stamp, 8);
+            memcpy(mem + at + 8, &zc, 4);
+            memset(mem + at + 12, 0, 4);
+            break;
+        }
         if (rq_async() && !rep_sync) {
             /* Answered when the batches before it are done, by whichever
              * thread finishes them (rq_advance_prefix). The title polls the
@@ -6035,6 +6250,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_fsum_clr[c].x = s_gpu.clip_x; s_fsum_clr[c].y = s_gpu.clip_y;
             s_fsum_clr[c].w = s_gpu.clip_w; s_fsum_clr[c].h = s_gpu.clip_h;
             s_fsum_clr[c].at = s_fsum_draws;
+        }
+        if (s_backend) {
+            backend_clear(param);
+            if (!s_backend_compare)
+                break;
         }
         clear_surface(param);
         if (param & 0x03)                         /* Z, stencil */
@@ -6180,6 +6400,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                : s_gpu.color_offset;
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
+            if (done && s_backend) {
+                /* The frame is on the GPU: into guest memory, where the
+                 * window and the dumps read it. */
+                uint32_t bpp = s_gpu.drawn_offset ? s_gpu.drawn_bpp : surface_bpp();
+                uint32_t w = s_gpu.drawn_offset ? s_gpu.drawn_x + s_gpu.drawn_w
+                                                : s_gpu.clip_x + s_gpu.clip_w;
+                uint32_t h = s_gpu.drawn_offset ? s_gpu.drawn_y + s_gpu.drawn_h
+                                                : s_gpu.clip_y + s_gpu.clip_h;
+                if (s_backend_compare)
+                    s_backend->compare(dma_resolve(done), pitch, bpp, w, h, s_gpu.flips);
+                else
+                    s_backend->flip(dma_resolve(done), pitch, bpp, w, h);
+            }
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
