@@ -88,6 +88,7 @@ static int s_last_agent = -1;
 static uint32_t s_run;
 static uint64_t s_prev_val[SCHED_AGENTS][SCHED_KINDS];
 static uint64_t s_runs_written, s_vals_written;
+static volatile DWORD s_agent_tid[256];      /* host thread of each agent */
 
 /* --- replay ---------------------------------------------------------- */
 typedef struct { uint8_t agent; uint32_t count; } SchedRun;
@@ -109,6 +110,9 @@ static volatile LONG s_desync_reports;
 typedef struct { uint64_t *n; uint32_t count, i; } SchedPreempts;
 static SchedPreempts s_pre[SCHED_AGENTS];      /* replay: loop counts to yield at */
 static void sched_arm_loop_check(void);
+static uint64_t sched_value(int kind, uint64_t live, int released);
+static int s_sites;                     /* RECOMP_SCHED_SITES, see sched_value */
+static volatile LONG s_site_reports;
 static void sched_preempt_load(int agent, uint64_t n);
 
 /* Pumps: run at every yield point, holding the CPU. A device model's
@@ -339,6 +343,8 @@ int xbox_SchedReplaying(void)
 void xbox_SchedBind(int agent)
 {
     t_agent = agent;
+    if (agent > 0 && agent < SCHED_AGENTS)
+        s_agent_tid[agent] = GetCurrentThreadId();
 }
 
 int xbox_SchedAgent(void)
@@ -427,6 +433,32 @@ static void sched_backtrace(void)
         for (i = 0; i < 8; i++)
             fprintf(stderr, " %08X", *(uint32_t *)(g_xbox_mem_offset + g_esp + 4 * i));
     fprintf(stderr, "\n");
+}
+
+/* Kind-0 entries (RECOMP_SCHED_SITES): a guest call site, a page hash, or
+ * a let-go of the CPU tagged with the host code that made it. */
+#define SCHED_LETGO_TAG 0xB10C000000000000ull
+
+static void sched_describe(uint64_t v, char *buf, size_t n)
+{
+    if ((v & 0xFFFF000000000000ull) == SCHED_LETGO_TAG) {
+        char sb[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+        DWORD64 off = 0;
+        DWORD64 a = (DWORD64)(uintptr_t)GetModuleHandleA(NULL) + (v & 0xFFFFFFFFull);
+        static int sym;
+        if (!sym) {
+            SymInitialize(GetCurrentProcess(), NULL, TRUE);
+            sym = 1;
+        }
+        memset(sb, 0, sizeof sb);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        snprintf(buf, n, "a let-go of the CPU from %s+0x%llx",
+                 SymFromAddr(GetCurrentProcess(), a, &off, si) ? si->Name : "?",
+                 (unsigned long long)off);
+    } else
+        snprintf(buf, n, "0x%08llX", (unsigned long long)v);
 }
 
 static void sched_stuck(DWORD waited_ms)
@@ -577,6 +609,57 @@ static void sched_release(void)
     ReleaseSRWLockExclusive(&s_rlock);
 }
 
+/* RECOMP_SCHED_SITES_PAGES=<va>[+<va>...] (with RECOMP_SCHED_SITES, both
+ * runs): at every turn a hash of those 4 KB guest pages is recorded and, in
+ * a replay, compared -- the first turn that differs follows the run that
+ * wrote something else. A debugging aid. */
+static void sched_turn_pages(void)
+{
+    static int n = -1;
+    static uint32_t va[16];
+    uint32_t h = 2166136261u;
+    int i, k;
+    if (n < 0) {
+        const char *e = getenv("RECOMP_SCHED_SITES_PAGES");
+        n = 0;
+        while (e && *e && n < 16) {
+            char *end;
+            va[n++] = (uint32_t)strtoul(e, &end, 16) & ~0xFFFu;
+            e = *end == '+' ? end + 1 : "";
+        }
+    }
+    if (s_sites < 0)
+        s_sites = getenv("RECOMP_SCHED_SITES") != NULL;
+    if (!n || !s_sites || !t_agent || t_agent >= SCHED_AGENTS)
+        return;
+    for (i = 0; i < n; i++) {
+        const uint32_t *p = (const uint32_t *)(g_xbox_mem_offset + va[i]);
+        for (k = 0; k < 1024; k++)
+            h = (h ^ p[k]) * 16777619u;
+    }
+    if (s_mode == 1) {
+        sched_value(0, h, 0);
+        return;
+    }
+    {
+        SchedQueue *q = &s_q[t_agent];
+        if (q->i < q->n && q->kind[q->i] == 0) {
+            uint64_t rec = q->val[q->i++];
+            if (rec != h && InterlockedIncrement(&s_site_reports) <= 6) {
+                char d[300];
+                sched_describe(rec, d, sizeof d);
+                fprintf(stderr, "  [SCHED] agent %d turn at run %zu: pages differ "
+                        "(recorded %s, now %08X); runs before: agent %d, %d, %d\n",
+                        t_agent, s_cur, d, h,
+                        s_cur >= 1 ? s_runs[s_cur - 1].agent : -1,
+                        s_cur >= 2 ? s_runs[s_cur - 2].agent : -1,
+                        s_cur >= 3 ? s_runs[s_cur - 3].agent : -1);
+                fflush(stderr);
+            }
+        }
+    }
+}
+
 int xbox_SchedEnter(void)
 {
     if (!xbox_SchedMode() || !t_agent || t_held)
@@ -584,6 +667,7 @@ int xbox_SchedEnter(void)
     sched_acquire();
     t_held = 1;
     sched_arm_loop_check();
+    sched_turn_pages();
     return 1;
 }
 
@@ -599,6 +683,38 @@ int xbox_SchedBlockBegin(void)
 {
     if (!t_held)
         return 0;
+    if (s_sites < 0)
+        s_sites = getenv("RECOMP_SCHED_SITES") != NULL;
+    if (s_sites > 0 && t_agent > 0 && t_agent < SCHED_AGENTS) {
+        /* RECOMP_SCHED_SITES: which host code let go, so a replay that does
+         * not let go here (or does elsewhere) names it. */
+        uint64_t tag = SCHED_LETGO_TAG | (uint64_t)(uint32_t)
+            ((char *)_ReturnAddress() - (char *)GetModuleHandleA(NULL));
+        if (s_mode == 1)
+            sched_value(0, tag, 0);
+        else {
+            SchedQueue *q = &s_q[t_agent];
+            if (q->i < q->n && q->kind[q->i] == 0) {
+                uint64_t rec = q->val[q->i++];
+                if (rec != tag) {
+                    /* The same function counts as the same let-go: some
+                     * (the loop check) let go from one branch per mode. */
+                    char d1[300], d2[300];
+                    const char *p1, *p2;
+                    sched_describe(rec, d1, sizeof d1);
+                    sched_describe(tag, d2, sizeof d2);
+                    p1 = strrchr(d1, '+');
+                    p2 = strrchr(d2, '+');
+                    if (!(p1 && p2 && p1 - d1 == p2 - d2 && !strncmp(d1, d2, p1 - d1))
+                        && InterlockedIncrement(&s_site_reports) <= 6) {
+                        fprintf(stderr, "  [SCHED] agent %d value #%u: recorded "
+                                "%s; replay: %s\n", t_agent, q->i, d1, d2);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
     if (t_agent > 0 && t_agent < SCHED_AGENTS) {
         s_where[t_agent] = _ReturnAddress();
         s_where_ret[t_agent] = g_esp && g_esp < 0x08000000u
@@ -610,6 +726,8 @@ int xbox_SchedBlockBegin(void)
     return 1;
 }
 
+static RECOMP_TLS int t_no_pages;
+
 void xbox_SchedBlockEnd(int released)
 {
     if (!released)
@@ -618,6 +736,20 @@ void xbox_SchedBlockEnd(int released)
         s_blocked[t_agent] = 0;
     sched_acquire();
     t_held = 1;
+    if (s_mode == 2)
+        sched_arm_loop_check();     /* see xbox_SchedLoopCheck */
+    if (!t_no_pages)
+        sched_turn_pages();
+}
+
+/* xbox_SchedBlockEnd for a let-go whose outcome is a value: the recording
+ * writes it after the CPU is back, a replay reads it before, so a per-turn
+ * page hash (sched_turn_pages) between would be read in the wrong order. */
+static void sched_block_end_valued(int b)
+{
+    t_no_pages = 1;
+    xbox_SchedBlockEnd(b);
+    t_no_pages = 0;
 }
 
 int xbox_SchedHeld(void)
@@ -671,9 +803,7 @@ void xbox_SchedRunTicks(void)
  * place in the order is then fixed. (sched_value_released is the exception,
  * for the waits and sleeps below, which take their recorded outcome in a
  * replay before they have the CPU back.) */
-static uint64_t sched_value(int kind, uint64_t live, int released);
 static int s_sites = -1;
-static volatile LONG s_site_reports;
 
 uint64_t xbox_SchedValue(int kind, uint64_t live)
 {
@@ -711,11 +841,13 @@ static uint64_t sched_value(int kind, uint64_t live, int released)
         else {
             SchedQueue *q = &s_q[a];
             if (q->i < q->n && q->kind[q->i] == 0) {
-                uint32_t rec = (uint32_t)q->val[q->i++];
+                uint64_t rec = q->val[q->i++];
                 if (rec != site && InterlockedIncrement(&s_site_reports) <= 6) {
+                    char d[300];
+                    sched_describe(rec, d, sizeof d);
                     fprintf(stderr, "  [SCHED] agent %d value #%u (kind %d): "
-                            "recorded at guest 0x%08X, replay at 0x%08X\n",
-                            a, q->i, kind, rec, site);
+                            "recorded %s, replay at guest 0x%08X\n",
+                            a, q->i, kind, d, site);
                     if (s_site_reports <= 2)
                         sched_backtrace();
                     fflush(stderr);
@@ -793,12 +925,12 @@ DWORD xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
         if (ms != INFINITE || s_file_ver >= 2)
             rec = (DWORD)sched_value(XBOX_SCHED_WAIT, timeout_code, 1);
         if (rec == timeout_code && ms != INFINITE) {
-            xbox_SchedBlockEnd(b);
+            sched_block_end_valued(b);
             return rec;
         }
         if (s_file_ver < 2) {
             r = try_wait(ctx, INFINITE);
-            xbox_SchedBlockEnd(b);
+            sched_block_end_valued(b);
             return r;
         }
         /* The agent's next turn means the recording's wait was satisfied. A
@@ -817,11 +949,11 @@ DWORD xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
                 break;
             }
         }
-        xbox_SchedBlockEnd(b);
+        sched_block_end_valued(b);
         return r;
     }
     r = try_wait(ctx, ms);
-    xbox_SchedBlockEnd(b);
+    sched_block_end_valued(b);
     xbox_SchedValue(XBOX_SCHED_WAIT, r);
     return r;
 }
@@ -862,18 +994,53 @@ static int cs_try(void *cs)
     return TryEnterCriticalSection((CRITICAL_SECTION *)cs) != 0;
 }
 
+/* Until it is free, without taking it: entering and leaving it here held it
+ * for a moment while not holding the CPU, so an agent that tried it then
+ * failed and let go -- a turn in the recording that a replay, which does not
+ * wait here, never makes. That split replays a few minutes in. */
 static void cs_wait_free(void *cs)
 {
-    EnterCriticalSection((CRITICAL_SECTION *)cs);
-    LeaveCriticalSection((CRITICAL_SECTION *)cs);
+    while (((volatile CRITICAL_SECTION *)cs)->OwningThread)
+        SwitchToThread();
 }
 
 /* A host critical section that another agent may hold. */
 void xbox_SchedEnterCS(CRITICAL_SECTION *cs)
 {
     if (!t_held) {
+        /* RECOMP_SCHED_CS_TRACE: taken outside the schedule (who owns it
+         * then is host timing) -- the first few, with where from. */
+        static int tr = -1;
+        static volatile LONG shown;
+        if (tr < 0)
+            tr = getenv("RECOMP_SCHED_CS_TRACE") != NULL;
+        if (tr && xbox_SchedMode() && InterlockedIncrement(&shown) <= 8) {
+            fprintf(stderr, "  [CSW] agent %d takes CS %p without the CPU\n",
+                    t_agent, (void *)cs);
+            sched_backtrace();
+            fflush(stderr);
+        }
         EnterCriticalSection(cs);
         return;
+    }
+    {
+        static int tr = -1;
+        static volatile LONG shown;
+        if (tr < 0)
+            tr = getenv("RECOMP_SCHED_CS_TRACE") != NULL;
+        if (tr && !TryEnterCriticalSection(cs)) {
+            if (InterlockedIncrement(&shown) <= 4000) {
+                DWORD owner = (DWORD)(uintptr_t)cs->OwningThread;
+                int a, oa = 0;
+                for (a = 1; a < SCHED_AGENTS; a++)
+                    if (s_agent_tid[a] == owner) { oa = a; break; }
+                fprintf(stderr, "  [CSW] run %zu agent %d waits for CS %p held "
+                        "by agent %d (tid %lu)\n", s_mode == 2 ? s_cur : (size_t)s_runs_written,
+                        t_agent, (void *)cs, oa, (unsigned long)owner);
+            }
+        } else if (tr) {
+            return;                     /* took it */
+        }
     }
     xbox_SchedTakeLock(cs_try, cs_wait_free, cs);
 }
@@ -890,11 +1057,11 @@ DWORD xbox_SchedSleep(DWORD ms, BOOL alertable)
     b = xbox_SchedBlockBegin();
     if (s_mode == 2) {
         r = (DWORD)sched_value(XBOX_SCHED_SLEEP, 0, 1);
-        xbox_SchedBlockEnd(b);
+        sched_block_end_valued(b);
         return r;
     }
     r = SleepEx(ms, alertable);
-    xbox_SchedBlockEnd(b);
+    sched_block_end_valued(b);
     xbox_SchedValue(XBOX_SCHED_SLEEP, r);
     return r;
 }
@@ -996,10 +1163,32 @@ static void sched_arm_loop_check(void)
     }
 }
 
+static uint64_t s_pre_next(void)
+{
+    SchedPreempts *p = &s_pre[t_agent];
+    return p->i < p->count ? p->n[p->i] : ~0ull;
+}
+
 void xbox_SchedLoopCheck(void)
 {
     if (!t_held || !t_agent) {
-        g_loop_chk = s_mode == 1 ? g_loop_n + SCHED_LOOP_INTERVAL : ~0ull;
+        /* No preemption without the CPU, in either mode. A replay used to
+         * disarm here (~0) and re-arm only in xbox_SchedEnter, which a guest
+         * thread seldom calls again (it lets go and takes the CPU back
+         * through BlockBegin/BlockEnd): after one check made while not
+         * holding, it never preempted again, ran on where the recording had
+         * let go, and the replay diverged. Both now keep checking. */
+        static volatile LONG shown;
+        if (t_agent && s_mode == 2 && InterlockedIncrement(&shown) <= 3) {
+            fprintf(stderr, "  [SCHED] agent %d: loop check without the CPU "
+                    "(count %llu)\n", t_agent, (unsigned long long)g_loop_n);
+            sched_backtrace();
+            fflush(stderr);
+        }
+        if (s_mode == 1 || !t_agent)
+            g_loop_chk = g_loop_n + SCHED_LOOP_INTERVAL;
+        else
+            g_loop_chk = g_loop_n + 1 > s_pre_next() ? g_loop_n + 1 : s_pre_next();
         return;
     }
     if (s_mode == 1) {
@@ -1020,6 +1209,13 @@ void xbox_SchedLoopCheck(void)
         if (p->i < p->count && p->n[p->i] == g_loop_n) {
             p->i++;
             xbox_SchedBlockEnd(xbox_SchedBlockBegin());
+        } else if (p->i < p->count && p->n[p->i] < g_loop_n
+                   && !getenv("RECOMP_REPLAY_KEEP_GOING")) {
+            char why[128];
+            snprintf(why, sizeof why, "agent %d ran past the loop count %llu "
+                     "where the recording let go of the CPU (now %llu)", t_agent,
+                     (unsigned long long)p->n[p->i], (unsigned long long)g_loop_n);
+            sched_replay_fail(t_agent, why);
         }
         sched_arm_loop_check();
     }
@@ -1099,13 +1295,13 @@ int xbox_SchedWaitUntil(int (*done)(void *ctx), void *ctx, DWORD ms)
         t0 = GetTickCount();
         while (ok && !done(ctx) && GetTickCount() - t0 < 60000)
             Sleep(0);
-        xbox_SchedBlockEnd(b);
+        sched_block_end_valued(b);
         return ok;
     }
     t0 = GetTickCount();
     while (!(ok = done(ctx)) && GetTickCount() - t0 < ms)
         Sleep(0);
-    xbox_SchedBlockEnd(b);
+    sched_block_end_valued(b);
     xbox_SchedValue(XBOX_SCHED_WAIT, (uint64_t)ok);
     return ok;
 }

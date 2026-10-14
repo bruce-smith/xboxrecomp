@@ -118,6 +118,8 @@ int xbox_IrqlRaisedCount(void)
 static HANDLE s_dispatch_mutex;
 static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
 static XBOX_THREAD_LOCAL int t_dispatch_held;
+/* Who holds it (host thread id), for dispatch_wait_free. */
+static volatile DWORD s_dispatch_owner;
 
 static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -136,11 +138,15 @@ static int dispatch_try(void *ctx)
     return r == WAIT_OBJECT_0 || r == WAIT_ABANDONED;
 }
 
+/* Until it is free, without taking it. Taking and releasing it here (as
+ * this did) held it for a moment while not holding the guest CPU: an agent
+ * that tried it then failed, let go, and the recording had a turn that a
+ * replay -- which does not wait here -- never makes (sched.c). */
 static void dispatch_wait_free(void *ctx)
 {
     (void)ctx;
-    if (WaitForSingleObject(s_dispatch_mutex, INFINITE) == WAIT_OBJECT_0)
-        ReleaseMutex(s_dispatch_mutex);
+    while (s_dispatch_owner)
+        SwitchToThread();
 }
 
 static void dispatch_lock(DWORD timeout_ms, const char *who)
@@ -156,11 +162,13 @@ static void dispatch_lock(DWORD timeout_ms, const char *who)
     if (xbox_SchedHeld()) {
         xbox_SchedTakeLock(dispatch_try, dispatch_wait_free, NULL);
         t_dispatch_held = 1;
+        s_dispatch_owner = GetCurrentThreadId();
         return;
     }
     r = WaitForSingleObject(s_dispatch_mutex, timeout_ms);
     if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) {
         t_dispatch_held = 1;
+        s_dispatch_owner = GetCurrentThreadId();
         return;
     }
     {
@@ -179,6 +187,7 @@ static void dispatch_unlock(void)
 {
     if (t_dispatch_held) {
         t_dispatch_held = 0;
+        s_dispatch_owner = 0;
         ReleaseMutex(s_dispatch_mutex);
     }
 }
