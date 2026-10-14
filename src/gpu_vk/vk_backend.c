@@ -761,6 +761,30 @@ static VkImageView tex_view(const Nv2aTexState *t, int cube, uint32_t *iw, uint3
         for (i = 0; i < VKB_SURFS; i++) {
             Surf *s = &B.surf[i];
             if (s->img && !s->depth && s->addr == t->offset) {
+                /* RECOMP_VK_RTT_TRACE=1: each distinct render target /
+                 * texture pairing once -- how the title samples what it
+                 * rendered (sizes, formats, layout). */
+                static int trace = -1;
+                if (trace < 0)
+                    trace = getenv("RECOMP_VK_RTT_TRACE") != NULL;
+                if (trace) {
+                    static uint32_t seen[256][4];
+                    static unsigned nseen;
+                    uint32_t key[4] = { t->offset, t->width << 16 | t->height,
+                                        t->color << 8 | (uint32_t)t->normalized,
+                                        s->w << 16 | s->h };
+                    unsigned k;
+                    for (k = 0; k < nseen && memcmp(seen[k], key, sizeof key); k++)
+                        ;
+                    if (k == nseen && nseen < 256) {
+                        memcpy(seen[nseen++], key, sizeof key);
+                        fprintf(stderr, "[VKRTT] %08X: texture %ux%u fmt %02X %s pitch %u"
+                                " <- surface %ux%u bpp %u fmt %d (frame %u)\n",
+                                t->offset, t->width, t->height, t->color,
+                                t->normalized ? "swizzled" : "linear", t->pitch,
+                                s->w, s->h, s->bpp, (int)s->fmt, B.frame);
+                    }
+                }
                 if (s->dirty)
                     B.pending_barrier = 1;
                 *iw = s->w;
