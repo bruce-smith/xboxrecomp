@@ -2440,7 +2440,7 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
             float w0 = T->ea[0] * dx + r0;
             float w1 = T->ea[1] * dx + r1;
             float w2 = T->ea[2] * dx + r2;
-            float l0, l1, l2, z, col[4], pw;
+            float l0, l1, l2, z, col[4], pw, rpw;
             uint32_t argb;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
@@ -2486,16 +2486,24 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
                 }
                 argb = 0;
                 if (shade) {
-                    for (k = 0; k < 4; k++)
-                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
+                    /* Colours and fog perspective-correct, like the texture
+                     * coordinates: smooth shading (xemu's default-smooth
+                     * varyings), which near-plane clipping in clip space
+                     * also assumes. */
                     pw = l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2];
+                    rpw = 1.0f / pw;
+                    for (k = 0; k < 4; k++)
+                        col[k] = (l0 * (va->d0[k] * T->iw[0]) + l1 * (vb->d0[k] * T->iw[1])
+                                + l2 * (vc->d0[k] * T->iw[2])) * rpw;
                     if (T->use_rc) {
                         float d1[4], fog[4], t[4][4], out[4], tc[4];
                         int st, j, keep = 1;
                         for (k = 0; k < 4; k++)
-                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
+                            d1[k] = (l0 * (va->d1[k] * T->iw[0]) + l1 * (vb->d1[k] * T->iw[1])
+                                   + l2 * (vc->d1[k] * T->iw[2])) * rpw;
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
-                        fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
+                        fog[3] = (l0 * (T->vfog[0] * T->iw[0]) + l1 * (T->vfog[1] * T->iw[1])
+                                + l2 * (T->vfog[2] * T->iw[2])) * rpw;
                         for (st = 0; st < 4 && keep; st++) {
                             if (!((P->rcp.rc.stage_program >> (st * 5)) & 0x1F)) {
                                 t[st][0] = t[st][1] = t[st][2] = 0.0f;
@@ -2683,18 +2691,22 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
                     continue;
             }
             if (shade) {
-                __m128 col[4], d1[4], fog[4], t[4][4], out[4], pw;
+                __m128 col[4], d1[4], fog[4], t[4][4], out[4], pw, rpw;
                 float ol[4][4], lt[4][4][4];      /* lane, stage, channel */
                 int st;
-                for (k = 0; k < 4; k++) {
-                    col[k] = bary3(l0, l1, l2, va->d0[k], vb->d0[k], vc->d0[k]);
-                    d1[k] = bary3(l0, l1, l2, va->d1[k], vb->d1[k], vc->d1[k]);
-                }
                 pw = bary3(l0, l1, l2, T->iw[0], T->iw[1], T->iw[2]);
+                rpw = _mm_div_ps(_mm_set1_ps(1.0f), pw);
+                for (k = 0; k < 4; k++) {           /* perspective-correct */
+                    col[k] = _mm_mul_ps(bary3(l0, l1, l2, va->d0[k] * T->iw[0],
+                                              vb->d0[k] * T->iw[1], vc->d0[k] * T->iw[2]), rpw);
+                    d1[k] = _mm_mul_ps(bary3(l0, l1, l2, va->d1[k] * T->iw[0],
+                                             vb->d1[k] * T->iw[1], vc->d1[k] * T->iw[2]), rpw);
+                }
                 fog[0] = _mm_set1_ps(T->fogc[0]);
                 fog[1] = _mm_set1_ps(T->fogc[1]);
                 fog[2] = _mm_set1_ps(T->fogc[2]);
-                fog[3] = bary3(l0, l1, l2, T->vfog[0], T->vfog[1], T->vfog[2]);
+                fog[3] = _mm_mul_ps(bary3(l0, l1, l2, T->vfog[0] * T->iw[0],
+                                          T->vfog[1] * T->iw[1], T->vfog[2] * T->iw[2]), rpw);
                 for (st = 0; st < 4; st++) {
                     __m128 tc[4];
                     float tcl[4][4], tl[4][4];
