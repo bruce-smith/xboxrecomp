@@ -240,6 +240,22 @@ static int src_image(uint32_t w, uint32_t h)
     return 1;
 }
 
+/* Frames that could not be shown, by reason: each reason is logged the
+ * first three times, and RECOMP_VK_STATS prints the counts every 600 calls.
+ * (A window that stays blank with no error logged was the reason.) */
+static unsigned s_shown, s_drop[7];
+static const char *const k_drop[7] = {
+    "not ready", "no surface capabilities", "minimised (zero extent)",
+    "swapchain rebuild failed", "swapchain out of date",
+    "no source image", "no staging buffer"
+};
+static int drop(int why)
+{
+    if (s_drop[why]++ < 3)
+        fprintf(stderr, "  [VK] present: frame dropped: %s\n", k_drop[why]);
+    return 0;
+}
+
 int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -256,25 +272,38 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
     VkResult r, r_;
     VkCommandBuffer cb;
 
+    {
+        static int stats = -1;
+        unsigned calls = s_shown;
+        int i;
+        if (stats < 0)
+            stats = getenv("RECOMP_VK_STATS") != NULL;
+        for (i = 0; i < 7; i++)
+            calls += s_drop[i];
+        if (stats && calls && calls % 600 == 0)
+            fprintf(stderr, "[VKPRESENT] %u shown; dropped: %u not ready, %u caps, %u minimised,"
+                    " %u rebuild, %u out of date, %u source, %u staging\n", s_shown,
+                    s_drop[0], s_drop[1], s_drop[2], s_drop[3], s_drop[4], s_drop[5], s_drop[6]);
+    }
     if (!s.ok || !px || !w || !h)
-        return 0;
+        return drop(0);
     vkWaitForFences(g_vk.device, 1, &s.f[s.fi].fence, VK_TRUE, UINT64_MAX);
 
     /* Follow the window: a size change makes the old chain out of date. */
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, s.surface, &caps) != VK_SUCCESS)
-        return 0;
+        return drop(1);
     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0)
-        return 0;                                   /* minimised */
+        return drop(2);                             /* minimised */
     if (!s.chain || s.stale || caps.currentExtent.width != s.extent.width
         || caps.currentExtent.height != s.extent.height)
         if (!chain_build())
-            return 0;
+            return drop(3);
 
     r = vkAcquireNextImageKHR(g_vk.device, s.chain, UINT64_MAX,
                               s.f[s.fi].acquired, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         s.stale = 1;
-        return 0;
+        return drop(4);
     }
     if (r == VK_SUBOPTIMAL_KHR)
         s.stale = 1;
@@ -282,7 +311,7 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
         return vk_fail("vkAcquireNextImageKHR", r);
 
     if (!src_image(w, h))
-        return 0;
+        return drop(5);
     if (s.f[s.fi].size < bytes) {
         if (s.f[s.fi].staging) {
             vkDestroyBuffer(g_vk.device, s.f[s.fi].staging, NULL);
@@ -294,7 +323,7 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
                               &s.f[s.fi].staging, &s.f[s.fi].smem, &s.f[s.fi].map)) {
             s.f[s.fi].size = 0;
             s.f[s.fi].staging = VK_NULL_HANDLE;
-            return 0;
+            return drop(6);
         }
         s.f[s.fi].size = bytes;
     }
@@ -392,6 +421,7 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
     else if (r != VK_SUCCESS)
         vk_fail("vkQueuePresentKHR", r);
     s.fi = (s.fi + 1) % VKP_FRAMES;
+    s_shown++;
     return 1;
 }
 
