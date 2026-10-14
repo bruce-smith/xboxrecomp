@@ -14,6 +14,8 @@ XboxVk g_vk;
 
 int vk_fail(const char *what, VkResult r)
 {
+    if (r == VK_ERROR_DEVICE_LOST)
+        g_vk.lost = 1;                   /* the renderer hands back to software */
     fprintf(stderr, "  [VK] %s failed: VkResult %d\n", what, (int)r);
     fflush(stderr);
     return 0;

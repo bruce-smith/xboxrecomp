@@ -135,6 +135,11 @@ typedef struct Nv2aBackend {
      * software path's frame; diff against it instead of writing it. */
     void (*compare)(uint32_t addr, uint32_t pitch, uint32_t bpp,
                     uint32_t width, uint32_t height, uint32_t flip);
+    /* Nonzero once the backend can no longer render (the GPU was lost):
+     * asked after each flip; the executor then renders in software. The
+     * title redraws its render targets every frame, so the next frame is
+     * whole again. May be NULL. */
+    int (*lost)(void);
 } Nv2aBackend;
 
 /* Offered by the executor to backends: one texel of a stage in its own

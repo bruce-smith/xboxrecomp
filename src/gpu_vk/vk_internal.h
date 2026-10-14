@@ -24,6 +24,7 @@ typedef struct {
     VkCommandPool    pool;           /* window thread's command buffers */
     int              swapchain;      /* VK_KHR_swapchain enabled */
     int              nan_preserve;   /* shaders may keep NaN/inf exactly */
+    volatile int     lost;           /* VK_ERROR_DEVICE_LOST seen */
 } XboxVk;
 
 extern XboxVk g_vk;

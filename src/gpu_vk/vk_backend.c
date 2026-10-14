@@ -2297,8 +2297,24 @@ static int backend_init(void)
     return 1;
 }
 
+/* The device is gone (driver reset, GPU removed): the executor renders in
+ * software from the next frame. RECOMP_VK_SIMULATE_LOST=<flips> pretends
+ * it happened after that many flips (testing). */
+static int vk_lost(void)
+{
+    static int after = -2;
+    if (after == -2) {
+        const char *e = getenv("RECOMP_VK_SIMULATE_LOST");
+        after = e ? atoi(e) : -1;
+    }
+    if (after >= 0 && B.frame >= (uint32_t)after)
+        g_vk.lost = 1;
+    return g_vk.lost;
+}
+
 static const Nv2aBackend k_backend = {
-    "vulkan", 1, vk_clear, vk_draw, vk_report_clear, vk_report, vk_flip, vk_compare
+    "vulkan", 1, vk_clear, vk_draw, vk_report_clear, vk_report, vk_flip, vk_compare,
+    vk_lost
 };
 
 const Nv2aBackend *xbox_vk_backend(void)

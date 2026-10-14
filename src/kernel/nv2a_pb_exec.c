@@ -6470,6 +6470,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_backend->compare(dma_resolve(done), pitch, bpp, w, h, s_gpu.flips);
                 else
                     s_backend->flip(dma_resolve(done), pitch, bpp, w, h);
+                /* The GPU is gone: software from the next frame on (the
+                 * decoded state is the same; the title redraws its render
+                 * targets every frame). */
+                if (s_backend->lost && s_backend->lost()) {
+                    fprintf(stderr, "  [GPU] %s backend lost its device at flip %u;"
+                            " rendering in software from here\n", s_backend->name,
+                            s_gpu.flips);
+                    s_backend = NULL;
+                    s_backend_compare = 0;
+                }
             }
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
