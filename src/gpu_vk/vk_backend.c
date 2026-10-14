@@ -233,6 +233,9 @@ static const char *k_vs =
 /* ---------------------------------------------------------------------- */
 /* Slots. */
 
+/* RECOMP_VK_SIMULATE_LOST: submissions are swallowed from now on. */
+static int s_gpu_silent;
+
 /* Waits never block for ever: a lost device (driver reset) may never
  * signal anything, and a thread stuck here would leave the title polling a
  * visibility report that is never answered. They wait in 100 ms steps and
@@ -413,6 +416,8 @@ static void submit(int wait)
             }
             if (fail_at >= 0 && (long)B.submits + 1 >= fail_at) {
                 mark_lost("RECOMP_VK_FAIL_AT");
+            } else if (s_gpu_silent && !g_vk.lost) {
+                ok = 1;                  /* "sent", never signals (SIMULATE_LOST) */
             } else if (!g_vk.lost) {
                 vk_lock();
                 ok = VK_OK(vkQueueSubmit(g_vk.queue, 1, &si, s->fence));
@@ -2377,8 +2382,10 @@ static int backend_init(void)
 }
 
 /* The device is gone (driver reset, GPU removed): the executor renders in
- * software from the next frame. RECOMP_VK_SIMULATE_LOST=<flips> pretends
- * it happened after that many flips (testing). */
+ * software from the next frame. RECOMP_VK_SIMULATE_LOST=<flips>: from that
+ * flip on the GPU goes silent -- submissions are accepted but never run, so
+ * nothing signals and nothing reports an error, the hardest case: only the
+ * 2 s wait limits notice, and the title must not hang meanwhile (testing). */
 static int vk_lost(void)
 {
     static int after = -2;
@@ -2386,8 +2393,11 @@ static int vk_lost(void)
         const char *e = getenv("RECOMP_VK_SIMULATE_LOST");
         after = e ? atoi(e) : -1;
     }
-    if (after >= 0 && B.frame >= (uint32_t)after)
-        g_vk.lost = 1;
+    if (after >= 0 && B.frame >= (uint32_t)after && !s_gpu_silent) {
+        fprintf(stderr, "  [VK] RECOMP_VK_SIMULATE_LOST: the GPU goes silent at flip %u\n",
+                B.frame);
+        s_gpu_silent = 1;
+    }
     return g_vk.lost;
 }
 
