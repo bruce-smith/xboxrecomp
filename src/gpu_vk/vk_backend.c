@@ -233,6 +233,56 @@ static const char *k_vs =
 /* ---------------------------------------------------------------------- */
 /* Slots. */
 
+/* Waits never block for ever: a lost device (driver reset) may never
+ * signal anything, and a thread stuck here would leave the title polling a
+ * visibility report that is never answered. They wait in 100 ms steps and
+ * give up once the device is lost, or after 2 s, which then counts as lost.
+ * 1 when the wait completed. */
+static void mark_lost(const char *why)
+{
+    if (!g_vk.lost)
+        fprintf(stderr, "  [VK] device lost (%s): the GPU renderer stops\n", why);
+    g_vk.lost = 1;
+}
+
+static int fence_wait(VkFence f)
+{
+    int i;
+    for (i = 0; i < 20 && !g_vk.lost; i++) {
+        VkResult r = vkWaitForFences(g_vk.device, 1, &f, VK_TRUE, 100000000ull);
+        if (r == VK_SUCCESS)
+            return 1;
+        if (r != VK_TIMEOUT) {
+            mark_lost("a fence wait failed");
+            return 0;
+        }
+    }
+    if (!g_vk.lost)
+        mark_lost("a fence did not signal in 2 s");
+    return 0;
+}
+
+static int timeline_wait(uint64_t value)
+{
+    VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    int i;
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &B.timeline;
+    wi.pValues = &value;
+    for (i = 0; i < 20 && !g_vk.lost; i++) {
+        VkResult r = vkWaitSemaphores(g_vk.device, &wi, 100000000ull);
+        if (r == VK_SUCCESS)
+            return 1;
+        if (r != VK_TIMEOUT) {
+            mark_lost("a timeline wait failed");
+            return 0;
+        }
+    }
+    if (!g_vk.lost)
+        mark_lost("the GPU did not finish in 2 s");
+    return 0;
+}
+
 static void slot_complete(Slot *s)
 {
     uint32_t i;
@@ -241,7 +291,11 @@ static void slot_complete(Slot *s)
         vk_mutex_unlock(B.mtx);
         return;
     }
-    vkWaitForFences(g_vk.device, 1, &s->fence, VK_TRUE, UINT64_MAX);
+    if (!fence_wait(s->fence)) {
+        s->pending = 0;                  /* lost: its queries count nothing */
+        vk_mutex_unlock(B.mtx);
+        return;
+    }
     s->pending = 0;
     if (s->nq) {
         uint64_t *res = (uint64_t *)malloc(sizeof(uint64_t) * s->nq);
@@ -347,10 +401,32 @@ static void submit(int wait)
         si.pNext = &ti;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &B.timeline;
-        vk_lock();
-        VK_OK(vkQueueSubmit(g_vk.queue, 1, &si, s->fence));
-        vk_unlock();
-        s->seq = ++B.seq;
+        {
+            /* RECOMP_VK_FAIL_AT=<n>: the nth submission is never sent and
+             * the device counts as lost -- the timeline then never reaches
+             * it, as after a real loss (testing the fall-back). */
+            static long fail_at = -2;
+            int ok = 0;
+            if (fail_at == -2) {
+                const char *e = getenv("RECOMP_VK_FAIL_AT");
+                fail_at = e ? atol(e) : -1;
+            }
+            if (fail_at >= 0 && (long)B.submits + 1 >= fail_at) {
+                mark_lost("RECOMP_VK_FAIL_AT");
+            } else if (!g_vk.lost) {
+                vk_lock();
+                ok = VK_OK(vkQueueSubmit(g_vk.queue, 1, &si, s->fence));
+                vk_unlock();
+                if (!ok)
+                    mark_lost("a submission failed");
+            }
+            s->seq = ++B.seq;
+            if (!ok) {
+                B.recording = 0;
+                B.cur = (B.cur + 1) % VKB_SLOTS;
+                return;
+            }
+        }
     }
     s->pending = 1;
     B.recording = 0;
@@ -1252,7 +1328,7 @@ static void vk_clear(const Nv2aDrawState *st, uint32_t what)
     VkClearRect cr;
     uint32_t n = 0;
 
-    if (!B.ok)
+    if (!B.ok || g_vk.lost)
         return;
     rt = target_color(st);
     if (!rt)
@@ -1360,7 +1436,7 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     uint32_t imin = 0, imax = 0, blob_lo = 0;
     uint32_t aoff[16];
 
-    if (!B.ok || g->n < 3)
+    if (!B.ok || g_vk.lost || g->n < 3)
         return;
     /* Per-slot limits first, so nothing below has to move to a new slot
      * half-way through a draw. */
@@ -1719,7 +1795,7 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
 
 static void vk_report_clear(void)
 {
-    if (!B.ok)
+    if (!B.ok || g_vk.lost)
         return;
     vk_mutex_lock(B.mtx);
     B.epoch++;
@@ -1748,8 +1824,7 @@ static void report_thread(void *unused)
         vk_event_wait(B.rep_event, 100);
         for (;;) {
             uint64_t seq;
-            VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-            int i, k;
+            int i, k, done;
             vk_mutex_lock(B.mtx);
             if (!B.nrep) {
                 vk_mutex_unlock(B.mtx);
@@ -1757,20 +1832,20 @@ static void report_thread(void *unused)
             }
             seq = B.rep[B.rep_head].seq;
             vk_mutex_unlock(B.mtx);
-            wi.semaphoreCount = 1;
-            wi.pSemaphores = &B.timeline;
-            wi.pValues = &seq;
-            vkWaitSemaphores(g_vk.device, &wi, UINT64_MAX);
+            done = timeline_wait(seq);
             /* Every submission up to seq is done: count its queries. */
-            for (i = 0; i < VKB_SLOTS; i++)
+            for (i = 0; done && i < VKB_SLOTS; i++)
                 if (B.slot[i].pending && B.slot[i].seq <= seq)
                     slot_complete(&B.slot[i]);
             vk_mutex_lock(B.mtx);
             k = B.rep_head;
             {
+                /* A lost device answers "visible": drawing what might have
+                 * been hidden beats a title waiting for ever. */
                 uint64_t n = B.epoch_count[B.rep[k].epoch % VKB_ZEPOCHS];
                 uint32_t c = n > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)n;
-                report_write(B.rep[k].at, B.rep[k].stamp, B.rep[k].force ? 100000u : c);
+                report_write(B.rep[k].at, B.rep[k].stamp,
+                             B.rep[k].force || !done ? 100000u : c);
             }
             B.rep_head = (B.rep_head + 1) % VKB_REPORTS;
             B.nrep--;
@@ -1786,6 +1861,10 @@ static void vk_report(uint32_t at, uint64_t stamp, int force)
     int k;
     if (!B.ok)
         return;
+    if (g_vk.lost) {                  /* nothing will ever count it: visible */
+        report_write(at, stamp, 100000u);
+        return;
+    }
     submit(0);                        /* the queries it counts go to the GPU */
     for (;;) {                        /* never more than VKB_REPORTS behind */
         vk_mutex_lock(B.mtx);
@@ -1901,18 +1980,16 @@ static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
 }
 
 /* An asynchronous read-back finished: wait for its submission (normally
- * long done) and make it visible to the CPU. */
-static void readback_finish(Readback *r)
+ * long done) and make it visible to the CPU. 0 if it never will. */
+static int readback_finish(Readback *r)
 {
-    VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
     VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &B.timeline;
-    wi.pValues = &r->seq;
-    vkWaitSemaphores(g_vk.device, &wi, UINT64_MAX);
+    if (!timeline_wait(r->seq))
+        return 0;
     mr.memory = r->mem;
     mr.size = VK_WHOLE_SIZE;
     vkInvalidateMappedMemoryRanges(g_vk.device, 1, &mr);
+    return 1;
 }
 
 static void frame_stats(void)
@@ -1954,7 +2031,7 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
     static int mode = -1;
     Readback *r, *prev;
 
-    if (!B.ok)
+    if (!B.ok || g_vk.lost)
         return;
     if (mode < 0) {
         const char *e = getenv("RECOMP_VK_READBACK");
@@ -1994,9 +2071,9 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
     }
     if (prev->pending) {
         uint32_t pw = prev->w < w ? prev->w : w, ph = prev->h < h ? prev->h : h;
-        readback_finish(prev);
+        int ready = readback_finish(prev);
         rowb = prev->w * bpp;
-        for (y = 0; y < ph; y++)
+        for (y = 0; ready && y < ph; y++)
             memcpy(mem + addr + (size_t)y * pitch, prev->map + (size_t)y * rowb,
                    (size_t)pw * bpp);
         prev->pending = 0;
@@ -2046,7 +2123,7 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
     uint32_t x, y, maxd = 0, nbad = 0;
     uint64_t sumd = 0;
 
-    if (!B.ok)
+    if (!B.ok || g_vk.lost)
         return;
     if (tol < 0) {
         const char *t = getenv("RECOMP_VK_COMPARE_TOL");
@@ -2287,9 +2364,11 @@ static int backend_init(void)
     B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL;
     B.mtx = vk_mutex_new();
     B.rep_event = vk_event_new();
-    if (!B.mtx || !B.rep_event || !vk_thread_start(report_thread, NULL))
+    if (!B.mtx || !B.rep_event || !make_white())
         return 0;
-    if (!make_white())
+    /* Last: nothing may fail after the thread is running (it would be left
+     * working for a backend that never came up). */
+    if (!vk_thread_start(report_thread, NULL))
         return 0;
     fprintf(stderr, "  [VK] rendering backend up (%s, depth format %d)\n",
             g_vk.props.deviceName, (int)B.zfmt);
