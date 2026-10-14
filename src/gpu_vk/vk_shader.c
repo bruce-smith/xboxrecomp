@@ -99,12 +99,12 @@ VkShaderModule vk_shader_module(int fragment, const char *src)
      * - NaN and infinity kept, as the CPU path keeps them (RCP of 0 is +inf
      *   there, and what follows from it): without SignedZeroInfNanPreserve
      *   a driver may fold x * 0 to 0 and the like.
-     * - CQ, the interpolation of the vertex colours and fog: noperspective,
-     *   as the software span loop interpolates them, or with
-     *   RECOMP_VK_SMOOTH_COLOR=1 perspective-correct (smooth), as xemu
-     *   does. They differ inside one triangle, and the software clipper's
-     *   clip-space interpolation at the near plane only agrees with
-     *   Vulkan's clipper for smooth varyings. */
+     * - CQ, the interpolation of the vertex colours and fog: perspective-
+     *   correct (smooth), as xemu does and as the software span loops do
+     *   since 1b37fdc -- which is also the only way the software clipper's
+     *   clip-space interpolation at the near plane agrees with Vulkan's
+     *   clipper. RECOMP_VK_SMOOTH_COLOR=0: screen-linear (noperspective),
+     *   the old behaviour, for comparing with older captures. */
     if (!strncmp(src, "#version 450\n", 13)) {
         static const char nan_mode[] =
             "#extension GL_EXT_spirv_intrinsics : require\n"
@@ -116,8 +116,10 @@ VkShaderModule vk_shader_module(int fragment, const char *src)
         int ok;
         if (!full)
             return VK_NULL_HANDLE;
-        if (smooth < 0)
-            smooth = getenv("RECOMP_VK_SMOOTH_COLOR") != NULL;
+        if (smooth < 0) {
+            const char *e = getenv("RECOMP_VK_SMOOTH_COLOR");
+            smooth = !(e && *e == '0');
+        }
         snprintf(cq, sizeof cq, "#define CQ %s\n", smooth ? "smooth" : "noperspective");
         snprintf(full, l + sizeof nan_mode + sizeof cq, "#version 450\n%s%s%s",
                  g_vk.nan_preserve ? nan_mode : "", cq, src + 13);
