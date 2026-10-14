@@ -4058,16 +4058,24 @@ static int rq_clear_job(uint8_t *mem, uint32_t bpp)
     rq_push_job(&J);
     rq_note_surface(s_rq[s_rq_fill], lo, hi,      /* a later sample orders after */
                     rq_layout(swz, s_gpu.pitch));
-    /* What comes next waits for the whole clear. The job clears its rows
-     * band by band, which keeps it in order with draws that use the same
-     * layout. D3D clears a swizzled render target with the surface set to
-     * pitch, then draws into it swizzled (Blinx 2's reflection targets:
-     * format 0x08080128 for the clear, 0x08080228 for the draws). A
-     * swizzled texel's bytes lie in the pitch rows of other bands, so one
-     * band could still be clearing rows another had already drawn into.
-     * The cleared holes showed as one-frame dark blocks in stage 01-01's
-     * sea under RECOMP_ASYNC_SYNC. */
-    (void)rq_barrier(2);
+    /* The job clears its rows band by band, which keeps it in order with
+     * draws that use the same layout. D3D clears a swizzled render target
+     * with the surface set to pitch, then draws into it swizzled (Blinx 2's
+     * reflection targets: format 0x08080128 for the clear, 0x08080228 for
+     * the draws). A swizzled texel's bytes lie in the pitch rows of other
+     * bands, so one band could still be clearing rows another had already
+     * drawn into: one-frame dark blocks in stage 01-01's sea. The surface
+     * noted above with its layout catches that: a draw into it in the other
+     * layout waits for the clear (rq_queue_relayout in rq_draw_state). Every
+     * colour clear used to be followed by a barrier for it, about one a
+     * frame; RECOMP_CLEAR_BARRIER=1 restores that. */
+    {
+        static int clear_bar = -1;
+        if (clear_bar < 0)
+            clear_bar = getenv("RECOMP_CLEAR_BARRIER") != NULL;
+        if (clear_bar)
+            (void)rq_barrier(2);
+    }
     return 1;
 }
 
