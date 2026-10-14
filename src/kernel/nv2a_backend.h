@@ -124,8 +124,11 @@ typedef struct Nv2aBackend {
     void (*report_clear)(void);
     void (*report)(uint32_t at, uint64_t stamp, int force);
     /* FLIP_STALL: the frame in the colour surface at `addr` is finished.
-     * Afterwards guest memory must hold it (the framebuffer window and the
-     * frame dumps read it there). */
+     * The framebuffer window and the frame dumps read frames from guest
+     * memory, so the backend puts them there for whoever reads them: frame
+     * dumps get this frame before flip() returns; the window may get the
+     * previous frame instead (one frame late, without waiting for the
+     * GPU); a run with neither may get nothing. */
     void (*flip)(uint32_t addr, uint32_t pitch, uint32_t bpp,
                  uint32_t width, uint32_t height);
     /* RECOMP_VK_COMPARE: the same, but guest memory already holds the

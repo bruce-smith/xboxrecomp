@@ -287,6 +287,13 @@ int main(void)
     Nv2aDrawState s;
     uint32_t n;
 
+    /* Every check reads the frame from guest memory right after its flip.
+     * (Set before the backend reads it.) */
+#ifdef _WIN32
+    _putenv("RECOMP_VK_WRITEBACK=1");
+#else
+    setenv("RECOMP_VK_WRITEBACK", "1", 1);
+#endif
     g_mem = (uint8_t *)calloc(1, MEM_BYTES);
     be = xbox_vk_backend();
     if (!g_mem || !be) {

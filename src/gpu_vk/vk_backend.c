@@ -95,6 +95,17 @@ typedef struct {
     uint32_t used;
 } Tex;
 
+/* A host-visible buffer a frame is read back into, and when it is done. */
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint8_t *map;
+    VkDeviceSize size;
+    uint64_t seq;                        /* submission that fills it */
+    uint32_t w, h;                       /* what it holds */
+    int pending;                         /* filled, not yet written out */
+} Readback;
+
 typedef struct {
     uint64_t key;
     VkShaderModule vs, fs;
@@ -146,11 +157,11 @@ static struct {
     void *mtx, *rep_event;
     struct { uint32_t at, epoch, force; uint64_t stamp, seq; } rep[VKB_REPORTS];
     int rep_head, nrep;
-    /* Read-back of the presented frame. */
-    VkBuffer rb;
-    VkDeviceMemory rbmem;
-    uint8_t *rbmap;
-    VkDeviceSize rbsize;
+    /* Read-back of the presented frame: rb for the synchronous kinds
+     * (compare mode, frame dumps, RECOMP_VK_WRITEBACK=1), arb[] the two
+     * a flip alternates between when it does not wait. */
+    Readback rb, arb[2];
+    int arbi;
     /* Stats. */
     uint32_t draws, tris, uploads, submits;
 } B;
@@ -1764,9 +1775,11 @@ static void vk_report(uint32_t at, uint64_t stamp, int force)
     }
 }
 
-/* The colour surface at `addr` read back into B.rbmap (rows of w * bpp
- * bytes), everything before it finished. 0 if there is no such surface. */
-static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
+/* The colour surface at `addr` read back into r->map (rows of w * bpp
+ * bytes): recorded and submitted; with `wait`, also finished and visible
+ * to the CPU on return. 0 if there is no such surface. */
+static int readback_into(Readback *r, uint32_t addr, uint32_t bpp, uint32_t *pw,
+                         uint32_t *ph, int wait)
 {
     Surf *s = NULL;
     int i;
@@ -1783,25 +1796,24 @@ static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
     if (w > s->w) w = s->w;
     if (h > s->h) h = s->h;
     need = (VkDeviceSize)w * h * bpp;
-    if (need > B.rbsize) {
+    if (need > r->size) {
         wait_idle();
-        if (B.rb) {
-            vkDestroyBuffer(g_vk.device, B.rb, NULL);
-            vkFreeMemory(g_vk.device, B.rbmem, NULL);
+        if (r->buf) {
+            vkDestroyBuffer(g_vk.device, r->buf, NULL);
+            vkFreeMemory(g_vk.device, r->mem, NULL);
         }
         if (!vk_buffer_create(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                               | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                              &B.rb, &B.rbmem, (void **)&B.rbmap)
+                              &r->buf, &r->mem, (void **)&r->map)
             && !vk_buffer_create(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                 &B.rb, &B.rbmem, (void **)&B.rbmap)) {
-            B.rb = VK_NULL_HANDLE;
-            B.rbsize = 0;
+                                 &r->buf, &r->mem, (void **)&r->map)) {
+            memset(r, 0, sizeof *r);
             return 0;
         }
-        B.rbsize = need;
+        r->size = need;
     }
     full_barrier();
     memset(&c, 0, sizeof c);
@@ -1810,7 +1822,7 @@ static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
     c.imageExtent.width = w;
     c.imageExtent.height = h;
     c.imageExtent.depth = 1;
-    vkCmdCopyImageToBuffer(cmd(), s->img, VK_IMAGE_LAYOUT_GENERAL, B.rb, 1, &c);
+    vkCmdCopyImageToBuffer(cmd(), s->img, VK_IMAGE_LAYOUT_GENERAL, r->buf, 1, &c);
     {
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1818,16 +1830,39 @@ static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
         vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    submit(1);
-    {
-        VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
-        r.memory = B.rbmem;
-        r.size = VK_WHOLE_SIZE;
-        vkInvalidateMappedMemoryRanges(g_vk.device, 1, &r);
+    submit(wait);
+    r->seq = B.seq;
+    r->w = w;
+    r->h = h;
+    if (wait) {
+        VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+        mr.memory = r->mem;
+        mr.size = VK_WHOLE_SIZE;
+        vkInvalidateMappedMemoryRanges(g_vk.device, 1, &mr);
     }
     *pw = w;
     *ph = h;
     return 1;
+}
+
+static int readback(uint32_t addr, uint32_t bpp, uint32_t *pw, uint32_t *ph)
+{
+    return readback_into(&B.rb, addr, bpp, pw, ph, 1);
+}
+
+/* An asynchronous read-back finished: wait for its submission (normally
+ * long done) and make it visible to the CPU. */
+static void readback_finish(Readback *r)
+{
+    VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &B.timeline;
+    wi.pValues = &r->seq;
+    vkWaitSemaphores(g_vk.device, &wi, UINT64_MAX);
+    mr.memory = r->mem;
+    mr.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(g_vk.device, 1, &mr);
 }
 
 static void frame_stats(void)
@@ -1846,16 +1881,65 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t y, rowb;
 
+    /* Who needs the frame in guest memory, and how soon:
+     *  2  exactly this frame, now (RECOMP_VK_WRITEBACK=1, frame dumps): the
+     *     flip waits for the GPU;
+     *  1  the framebuffer window: frame N is copied out at its flip and
+     *     written into guest memory at flip N+1 -- into the buffer being
+     *     presented then, so the window shows every frame, one late, and
+     *     the flip never waits for the GPU;
+     *  0  nobody (headless, no dumps): no read-back at all.
+     * Nothing in the title is known to read its own front buffer.
+     * RECOMP_VK_READBACK=0|1|2 picks one regardless (testing). */
+    static int mode = -1;
+    Readback *r, *prev;
+
     if (!B.ok)
         return;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_VK_READBACK");
+        if (e && *e >= '0' && *e <= '2')
+            mode = *e - '0';
+        else if (getenv("RECOMP_VK_WRITEBACK") || getenv("RECOMP_FB_DUMP")
+                 || getenv("RECOMP_FB_DUMP_FLIPS"))
+            mode = 2;
+        else
+            mode = getenv("RECOMP_HEADLESS") ? 0 : 1;
+    }
     B.frame++;
-    if (!pitch || !readback(addr, bpp, &w, &h)) {
+    if (!pitch || mode == 0) {
         submit(0);
+        frame_stats();
         return;
     }
-    rowb = w * bpp;
-    for (y = 0; y < h; y++)
-        memcpy(mem + addr + (size_t)y * pitch, B.rbmap + (size_t)y * rowb, rowb);
+    if (mode == 2) {
+        if (!readback(addr, bpp, &w, &h)) {
+            submit(0);
+            return;
+        }
+        rowb = w * bpp;
+        for (y = 0; y < h; y++)
+            memcpy(mem + addr + (size_t)y * pitch, B.rb.map + (size_t)y * rowb, rowb);
+        frame_stats();
+        return;
+    }
+    r = &B.arb[B.arbi];
+    prev = &B.arb[B.arbi ^ 1];
+    if (readback_into(r, addr, bpp, &w, &h, 0)) {
+        r->pending = 1;
+        B.arbi ^= 1;
+    } else {
+        submit(0);
+    }
+    if (prev->pending) {
+        uint32_t pw = prev->w < w ? prev->w : w, ph = prev->h < h ? prev->h : h;
+        readback_finish(prev);
+        rowb = prev->w * bpp;
+        for (y = 0; y < ph; y++)
+            memcpy(mem + addr + (size_t)y * pitch, prev->map + (size_t)y * rowb,
+                   (size_t)pw * bpp);
+        prev->pending = 0;
+    }
     frame_stats();
 }
 
@@ -1915,7 +1999,7 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
         return;
     }
     for (y = 0; y < h; y++) {
-        const uint32_t *vk = (const uint32_t *)(B.rbmap + (size_t)y * w * 4);
+        const uint32_t *vk = (const uint32_t *)(B.rb.map + (size_t)y * w * 4);
         const uint32_t *sw = (const uint32_t *)(mem + addr + (size_t)y * pitch);
         for (x = 0; x < w; x++) {
             uint32_t a = vk[x], b = sw[x], d = 0, k;
@@ -1951,7 +2035,7 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
             if (vkp && swp && dfp) {
                 for (y = 0; y < h; y++)
                     for (x = 0; x < w; x++) {
-                        uint32_t a = ((const uint32_t *)(B.rbmap + (size_t)y * w * 4))[x];
+                        uint32_t a = ((const uint32_t *)(B.rb.map + (size_t)y * w * 4))[x];
                         uint32_t b = ((const uint32_t *)(mem + addr + (size_t)y * pitch))[x];
                         uint32_t d = 0, k;
                         for (k = 0; k < 24; k += 8) {
