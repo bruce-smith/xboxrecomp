@@ -83,6 +83,11 @@ typedef struct {
     VkImageView view;
     int dirty;                           /* written since the last barrier */
     uint32_t used;                       /* frame last used */
+    /* What the guest memory under the surface looked like when the GPU
+     * last wrote it (surf_sig): if it no longer does, the CPU has written
+     * there since, and a texture at this address reads guest memory. */
+    uint64_t sig;
+    uint32_t sig_frame, gbytes;
 } Surf;
 
 typedef struct {
@@ -162,6 +167,7 @@ static struct {
      * a flip alternates between when it does not wait. */
     Readback rb, arb[2];
     int arbi;
+    int compare_mode;                    /* RECOMP_VK_COMPARE */
     /* Stats. */
     uint32_t draws, tris, uploads, submits;
 } B;
@@ -523,8 +529,24 @@ static Surf *surf_get(uint32_t addr, int depth, uint32_t bpp, VkFormat fmt,
 }
 
 /* The colour surface a draw or clear targets. */
+/* 64 dwords sampled across the guest bytes under a surface. */
+static uint64_t surf_sig(const Surf *s)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint64_t h = 1469598103934665603ull;
+    uint32_t i, v, n = s->gbytes & ~3u;
+    if (n < 4)
+        return 0;
+    for (i = 0; i < 64; i++) {
+        memcpy(&v, mem + s->addr + ((uint64_t)n * i / 64 & ~3ull), 4);
+        h = (h ^ v) * 1099511628211ull;
+    }
+    return h;
+}
+
 static Surf *target_color(const Nv2aDrawState *st)
 {
+    Surf *s;
     uint32_t w, h;
     if (!st->color_addr || (st->bpp != 2 && st->bpp != 4))
         return NULL;
@@ -539,8 +561,16 @@ static Surf *target_color(const Nv2aDrawState *st)
     }
     if (!w || !h || w > 4096 || h > 4096)
         return NULL;
-    return surf_get(st->color_addr, 0, st->bpp, color_format(st->surface_format, st->bpp),
-                    w, h);
+    s = surf_get(st->color_addr, 0, st->bpp, color_format(st->surface_format, st->bpp),
+                 w, h);
+    /* The GPU writes it now: what guest memory holds under it is from
+     * before (taken once a frame). */
+    if (s && s->sig_frame != B.frame + 1) {
+        s->gbytes = st->swz_w ? w * h * st->bpp : st->pitch * h;
+        s->sig = surf_sig(s);
+        s->sig_frame = B.frame + 1;
+    }
+    return s;
 }
 
 static Surf *target_zeta(const Nv2aDrawState *st)
@@ -796,11 +826,31 @@ static VkImageView tex_view(const Nv2aTexState *t, int cube, uint32_t *iw, uint3
                                 s->w, s->h, s->bpp, (int)s->fmt, B.frame);
                     }
                 }
+                /* The CPU wrote the memory since the GPU last rendered here
+                 * (a freed render target reused for a texture): the texels
+                 * are guest memory's, not the old image's. Not in compare
+                 * mode, where the software renderer writes every target. */
+                if (s->sig_frame && !B.compare_mode && surf_sig(s) != s->sig) {
+                    static int said;
+                    if (said++ < 5)
+                        fprintf(stderr, "  [VK] %08X: the CPU rewrote a render target's memory;"
+                                " sampling it as a texture\n", s->addr);
+                    break;
+                }
                 if (s->dirty)
                     B.pending_barrier = 1;
                 *iw = s->w;
                 *ih = s->h;
                 return s->view;
+            }
+            /* A depth buffer sampled as a texture (shadow maps and the
+             * like) reads guest memory, which the GPU never writes: say so
+             * once, under the trace. */
+            if (s->img && s->depth && s->addr == t->offset) {
+                static int said;
+                if (!said++ && getenv("RECOMP_VK_RTT_TRACE"))
+                    fprintf(stderr, "[VKRTT] %08X: texture at a depth surface's address,"
+                            " read from guest memory (frame %u)\n", t->offset, B.frame);
             }
         }
     }
@@ -1876,6 +1926,16 @@ static void frame_stats(void)
     }
 }
 
+/* We wrote the surface at `addr` into guest memory ourselves: that is not
+ * the CPU rewriting it (surf_sig). */
+static void surf_resign(uint32_t addr)
+{
+    int i;
+    for (i = 0; i < VKB_SURFS; i++)
+        if (B.surf[i].img && !B.surf[i].depth && B.surf[i].addr == addr && B.surf[i].sig_frame)
+            B.surf[i].sig = surf_sig(&B.surf[i]);
+}
+
 static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -1920,6 +1980,7 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
         rowb = w * bpp;
         for (y = 0; y < h; y++)
             memcpy(mem + addr + (size_t)y * pitch, B.rb.map + (size_t)y * rowb, rowb);
+        surf_resign(addr);
         frame_stats();
         return;
     }
@@ -1939,6 +2000,7 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
             memcpy(mem + addr + (size_t)y * pitch, prev->map + (size_t)y * rowb,
                    (size_t)pw * bpp);
         prev->pending = 0;
+        surf_resign(addr);
     }
     frame_stats();
 }
@@ -2222,6 +2284,7 @@ static int backend_init(void)
         if (!VK_OK(vkCreateSemaphore(g_vk.device, &sci, NULL, &B.timeline)))
             return 0;
     }
+    B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL;
     B.mtx = vk_mutex_new();
     B.rep_event = vk_event_new();
     if (!B.mtx || !B.rep_event || !vk_thread_start(report_thread, NULL))

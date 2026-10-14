@@ -387,6 +387,33 @@ int main(void)
     expect("texel 1,0", 24, 8, 0xFF0000FFu, 0);
     expect("texel 1,1", 24, 24, 0xFF00FF00u, 0);
 
+    /* Render to texture, then the CPU reuses the memory: a target cleared to
+     * red is sampled as the GPU left it; once the CPU has rewritten its
+     * memory, the texture comes from guest memory (here the checker that
+     * nv2a_exec_texel returns) instead of the old image. */
+    {
+        static const float white[4] = {1, 1, 1, 1};
+        const uint32_t rt2 = 0x00280000u;
+        base_state(&s);
+        s.color_addr = rt2;
+        s.clear_color = 0xFFFF0000u;
+        be->clear(&s, 0xF0);
+        base_state(&s);
+        s.tex[0].offset = rt2;
+        s.tex[0].width = s.tex[0].height = 4;
+        s.tex[0].color = 0x06;
+        s.tex[0].valid = 1;
+        s.tex[0].normalized = 1;
+        s.tex[0].face_stride = 64;
+        rect(&s, 0, 0, 64, 64, 0.5f, white, 1.0f);
+        flip();
+        expect("render target sampled", 8, 8, 0xFFFF0000u, 0);
+        memset(g_mem + rt2, 0x5A, W * H * 4);
+        rect(&s, 0, 0, 64, 64, 0.5f, white, 1.0f);
+        flip();
+        expect("rewritten by the CPU", 8, 8, 0xFF00FF00u, 0);
+    }
+
     /* Culling: back faces with front = CCW; a clockwise (on screen) quad
      * is a back face on a y-down viewport... and a front one when y is up. */
     base_state(&s);
