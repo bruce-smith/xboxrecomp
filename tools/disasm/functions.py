@@ -146,6 +146,12 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A code pointer to a function start the passes above refused: right
+        # after another function's end, in a gap or inside a measured body.
+        if self._pass_pointer_after_end(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # A function that begins immediately after a ret, with no padding.
         if self._pass_gap_prologues(sections):
             self.functions.clear()
@@ -166,6 +172,132 @@ class FunctionDetector:
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _pass_pointer_after_end(self, sections: List[SectionInfo]) -> bool:
+        """A code pointer to a function that starts right after another one
+        ends, which the immediate and data-table passes refused.
+
+        Blinx 2 hit five of these one at a time as the game progressed, each an
+        "[ICALL] Failed to resolve" that stopped the run until the address was
+        seeded by hand: the mission summary's load callback 0x000EF540
+        (mov ecx, offset), the pause menu's 0x0016A870 (push offset), the
+        post-results handlers 0x001AE1E0 and 0x001B04E0 (a .data table), and
+        the Tom-Tom stage's 0x000AEC20 (mov [esi+6Ch], offset, right after a
+        jump table). Every one is in a gap, and every one was refused by the
+        body probe, not by the gap test: probes_as_returning_body stops after
+        64 instructions and at any unconditional jmp leaving its window, and
+        these reach their first ret only after 114 to 208 instructions, or
+        jump out to a shared helper first (0x000AEC20, at its 10th).
+
+        That probe is strict because an immediate alone is weak evidence. Here
+        the evidence is the pointer *and* where it lands:
+        - 16-byte aligned. MSVC aligns functions and not the code inside them;
+          switch case labels, also after a jmp and also listed in tables, are
+          what this keeps out;
+        - right after a function's end: the instruction before it ends there
+          and is a ret, an unconditional jmp or int3/nop padding, or the dword
+          before it is a jump-table entry pointing nearby;
+        - for an immediate, a push or mov: an address being stored or passed,
+          not an and/add/cmp constant that happens to fall in code;
+        - not itself padding, and a decodable function body from there
+          (probes_as_function_body, which follows the stream to a ret or jmp
+          with a budget sized for real functions).
+        A target inside another function's measured extent (one that
+        _find_function_end walked into) is split off as well, but only after
+        a ret or int3 (a jmp is ordinary control flow there and nop aligns
+        loop heads), when no branch in that body targets it, and on the
+        stricter returning-body probe with a larger budget: a split that is
+        wrong cuts a real function in two. A strcpy loop head at 0x002A9000
+        (nop-aligned, "jne 0x2A9000" right below) is what those keep out.
+        """
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+        code_names = {sec.name for sec in sections}
+
+        def in_code_section(addr: int) -> bool:
+            return any(lo <= addr < hi for lo, hi in code_ranges)
+
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def enclosing(addr: int) -> Optional[Tuple[int, int]]:
+            i = bisect.bisect_right(starts, addr) - 1
+            if i >= 0 and bounds[i][0] < addr < bounds[i][1]:
+                return bounds[i]
+            return None
+
+        targets = set()
+        for insn in self.engine.instructions.values():
+            # Only an address being stored or passed: "and ecx, 1FFE0h" is a
+            # mask, not a function pointer.
+            if insn.mnemonic.lower() not in ("push", "mov"):
+                continue
+            t = insn.imm_ref
+            if t is not None and (t & 15) == 0 and in_code_section(t):
+                targets.add(t)
+        for sec in self.image.sections:
+            if sec.name in code_names or sec.name not in DATA_SECTION_NAMES:
+                continue
+            data = self.image.get_section_data(sec)
+            for off in range(0, len(data) - 3, 4):
+                t = int.from_bytes(data[off:off + 4], "little")
+                if (t & 15) == 0 and in_code_section(t):
+                    targets.add(t)
+
+        def closes_function_before(t: int, strict: bool) -> bool:
+            for size in range(1, 16):
+                prev = self.engine.instructions.get(t - size)
+                if prev is not None and prev.end_address == t:
+                    if prev.is_ret or prev.mnemonic.lower() == "int3":
+                        return True
+                    # Inside a body, a jmp before t is ordinary control flow
+                    # and nop pads a loop head to alignment.
+                    return not strict and (
+                        (prev.is_jump and not prev.is_cond_jump)
+                        or prev.mnemonic.lower() == "nop")
+            return False
+
+        def branched_to_within(t: int, body: Tuple[int, int]) -> bool:
+            return any(insn.jump_target == t for insn in
+                       self.engine.get_instructions_in_range(body[0], body[1]))
+
+        def follows_jump_table(t: int) -> bool:
+            entry = self.image.read_u32_at_va(t - 4)
+            return (entry is not None and in_code_section(entry)
+                    and abs(entry - t) < 0x10000)
+
+        found = 0
+        for t in sorted(targets):
+            if t in self.functions or t in self._candidates:
+                continue
+            if self.engine.instruction_covering(t) is not None:
+                continue                    # the middle of a decoded instruction
+            body = enclosing(t)
+            if not (closes_function_before(t, body is not None)
+                    or follows_jump_table(t)):
+                continue
+            if t not in self.engine.instructions and not self.engine.decode_at(t):
+                continue
+            first = self.engine.instructions.get(t)
+            if first is None or first.mnemonic.lower() in ("int3", "nop"):
+                continue
+            if body is not None:
+                # Splitting a body needs more: nothing in it branches to t (a
+                # loop head or an internal label), and t returns on its own.
+                if branched_to_within(t, body):
+                    continue
+                if not self.engine.probes_as_returning_body(t, max_insns=1024):
+                    continue
+            elif not self.engine.probes_as_function_body(t):
+                continue
+            self._add_candidate(t, config.CONFIDENCE_PTR_AFTER_END,
+                                "pointer_after_end")
+            found += 1
+
+        if found:
+            print(f"  {found} function(s) named by a pointer right after"
+                  f" another's end")
+        return found > 0
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
