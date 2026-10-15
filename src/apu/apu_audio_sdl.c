@@ -30,6 +30,8 @@ int xa2_init(void)
 
     if (s_dev)
         return 1;
+    /* SDL would turn SIGINT/SIGTERM into a quit event nobody reads. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
         return 0;

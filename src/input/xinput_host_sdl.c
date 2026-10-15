@@ -26,6 +26,14 @@ static int sdl_ready(void)
 {
     static int state;          /* 0 untried, 1 up, -1 failed */
     if (state == 0) {
+        /* Positions, as XInput reports them: the bottom face button is A on
+         * every pad, Nintendo layouts included (SDL2 maps those by label by
+         * default). And the pad keeps working while another window has the
+         * focus, as XInput does. */
+        SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+        /* SDL would turn SIGINT/SIGTERM into a quit event nobody reads. */
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
         state = (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) ? 1 : -1;
         if (state > 0)
             s_lock = SDL_CreateMutex();

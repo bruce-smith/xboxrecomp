@@ -13,8 +13,12 @@
  *   - closing the window ends the process;
  *   - RECOMP_FB_DUMP / RECOMP_FB_WINDOW_DUMP_EVERY write BMPs of what is shown.
  *
+ *   - fullscreen from the start under gamescope (Steam Deck Game Mode), or
+ *     with RECOMP_FB_FULLSCREEN=1.
+ *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#define _GNU_SOURCE                   /* strcasestr */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -252,6 +256,24 @@ static void handle_key(SDL_Window *win, const SDL_KeyboardEvent *k, int *linear)
     }
 }
 
+/* Fullscreen from the start: RECOMP_FB_FULLSCREEN=1 asks, =0 refuses; unset,
+ * it is on under gamescope -- a Steam Deck in Game Mode, or Steam's Big
+ * Picture session -- where a window is shown fullscreen anyway and the
+ * framebuffer should fill the panel (1280x800 on the Deck, letterboxed to
+ * 4:3). */
+static int start_fullscreen(void)
+{
+    const char *e = getenv("RECOMP_FB_FULLSCREEN");
+    const char *de = getenv("XDG_CURRENT_DESKTOP");
+
+    if (e && *e)
+        return *e != '0';
+    return getenv("GAMESCOPE_WAYLAND_DISPLAY") != NULL
+        || (getenv("SteamDeck") && strcmp(getenv("SteamDeck"), "1") == 0
+            && getenv("SteamGamepadUI") != NULL)
+        || (de && strcasestr(de, "gamescope") != NULL);
+}
+
 static int fb_thread(void *unused)
 {
     SDL_Window *win;
@@ -265,6 +287,9 @@ static int fb_thread(void *unused)
 
     (void)unused;
     linear = (flt && strcasecmp(flt, "linear") == 0) ? 1 : 0;
+    /* Ctrl+C and SIGTERM end the process, as without SDL; closing the window
+     * is the way to quit from the desktop. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "  [FBWIN] SDL video unavailable: %s\n", SDL_GetError());
         s_fb_running = 0;
@@ -282,7 +307,8 @@ static int fb_thread(void *unused)
     }
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                            (int)(s_fb_width * (uint32_t)k), (int)(s_fb_height * (uint32_t)k),
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN);
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN
+                           | (start_fullscreen() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     /* No vsync: the loop paces itself every 16 ms, as the GDI window does. */
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : NULL;
     if (!ren && win)
