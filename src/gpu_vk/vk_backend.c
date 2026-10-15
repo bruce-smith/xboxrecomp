@@ -174,6 +174,8 @@ static struct {
     Readback rb, arb[2];
     int arbi;
     int compare_mode;                    /* RECOMP_VK_COMPARE */
+    VkCommandBuffer sink;                /* after a loss: recorded, never submitted */
+    int sink_begun;
     /* Supersampling: every surface image is `scale` times the guest's size
      * (1-4); a requested change applies at the next flip. */
     uint32_t scale, scale_req;
@@ -261,10 +263,26 @@ static void mark_lost(const char *why)
     g_vk.lost = 1;
 }
 
+/* How long a wait may take before the device counts as lost, in 100 ms
+ * steps: RECOMP_VK_LOST_MS, else 2 s on a GPU and 60 s on a CPU
+ * implementation (llvmpipe, SwiftShader), which can take seconds for one
+ * heavy frame without anything being wrong. */
+static int wait_steps(void)
+{
+    static int steps;
+    if (!steps) {
+        const char *e = getenv("RECOMP_VK_LOST_MS");
+        int ms = e ? atoi(e)
+               : g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 60000 : 2000;
+        steps = ms < 100 ? 1 : ms / 100;
+    }
+    return steps;
+}
+
 static int fence_wait(VkFence f)
 {
     int i;
-    for (i = 0; i < 20 && !g_vk.lost; i++) {
+    for (i = 0; i < wait_steps() && !g_vk.lost; i++) {
         VkResult r = vkWaitForFences(g_vk.device, 1, &f, VK_TRUE, 100000000ull);
         if (r == VK_SUCCESS)
             return 1;
@@ -274,7 +292,7 @@ static int fence_wait(VkFence f)
         }
     }
     if (!g_vk.lost)
-        mark_lost("a fence did not signal in 2 s");
+        mark_lost("a fence did not signal in time (RECOMP_VK_LOST_MS)");
     return 0;
 }
 
@@ -285,7 +303,7 @@ static int timeline_wait(uint64_t value)
     wi.semaphoreCount = 1;
     wi.pSemaphores = &B.timeline;
     wi.pValues = &value;
-    for (i = 0; i < 20 && !g_vk.lost; i++) {
+    for (i = 0; i < wait_steps() && !g_vk.lost; i++) {
         VkResult r = vkWaitSemaphores(g_vk.device, &wi, 100000000ull);
         if (r == VK_SUCCESS)
             return 1;
@@ -295,7 +313,7 @@ static int timeline_wait(uint64_t value)
         }
     }
     if (!g_vk.lost)
-        mark_lost("the GPU did not finish in 2 s");
+        mark_lost("the GPU did not finish in time (RECOMP_VK_LOST_MS)");
     return 0;
 }
 
@@ -327,12 +345,28 @@ static void slot_complete(Slot *s)
     vk_mutex_unlock(B.mtx);
 }
 
+/* After a loss nothing the device may still be executing is touched again
+ * (a "lost" device may only be late: llvmpipe went on running the
+ * submission and crashed on a reset descriptor pool). Commands recorded
+ * from then on go to this command buffer, which is never submitted. */
+static VkCommandBuffer sink_cb(void)
+{
+    if (!B.sink_begun) {
+        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(B.sink, &bi);
+        B.sink_begun = 1;
+    }
+    return B.sink;
+}
+
 static void slot_begin(void)
 {
     Slot *s = &B.slot[B.cur];
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 
     slot_complete(s);
+    if (g_vk.lost)
+        return;                           /* the slot may still be in use */
     vkResetFences(g_vk.device, 1, &s->fence);
     vkResetCommandBuffer(s->cb, 0);
     vkResetDescriptorPool(g_vk.device, s->dpool, 0);
@@ -348,8 +382,10 @@ static void slot_begin(void)
 
 static VkCommandBuffer cmd(void)
 {
-    if (!B.recording)
+    if (!B.recording && !g_vk.lost)
         slot_begin();
+    if (g_vk.lost && !B.recording)
+        return sink_cb();
     return B.slot[B.cur].cb;
 }
 
@@ -501,6 +537,10 @@ static VkFormat color_format(uint32_t surface_format, uint32_t bpp)
 
 static void surf_destroy(Surf *s)
 {
+    if (g_vk.lost) {                      /* may still be in use: leaked */
+        memset(s, 0, sizeof *s);
+        return;
+    }
     if (s->view) vkDestroyImageView(g_vk.device, s->view, NULL);
     if (s->img) vkDestroyImage(g_vk.device, s->img, NULL);
     if (s->mem) vkFreeMemory(g_vk.device, s->mem, NULL);
@@ -739,6 +779,10 @@ static uint64_t tex_hash(const Nv2aTexState *t)
 
 static void tex_destroy(Tex *x)
 {
+    if (g_vk.lost) {
+        memset(x, 0, sizeof *x);
+        return;
+    }
     if (x->view) vkDestroyImageView(g_vk.device, x->view, NULL);
     if (x->img) vkDestroyImage(g_vk.device, x->img, NULL);
     if (x->mem) vkFreeMemory(g_vk.device, x->mem, NULL);
@@ -2118,7 +2162,7 @@ static VkImage downsampled(Surf *s, uint32_t w, uint32_t h)
     int32_t scale = (int32_t)s->sc;
     VkResult r_;
 
-    if (s->sc <= 1 || !down_init())
+    if (s->sc <= 1 || g_vk.lost || !down_init())
         return s->img;
     if (!B.down || B.down_w < w || B.down_h < h || B.down_fmt != s->fmt) {
         VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -2242,6 +2286,8 @@ static int readback_into(Readback *r, uint32_t addr, uint32_t bpp, uint32_t *pw,
     if (h > s->h) h = s->h;
     need = (VkDeviceSize)w * h * bpp;
     if (need > r->size) {
+        if (g_vk.lost)
+            return 0;
         wait_idle();
         if (r->buf) {
             vkDestroyBuffer(g_vk.device, r->buf, NULL);
@@ -2588,6 +2634,8 @@ static VkImage fx_pass(VkImageView src, uint32_t w, uint32_t h)
     }
     if (FX.ready < 0)
         return VK_NULL_HANDLE;
+    if (g_vk.lost)
+        return VK_NULL_HANDLE;
     if (!FX.img || FX.w != w || FX.h != h) {
         VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -2806,6 +2854,8 @@ static VkImage area_resize(Surf *s, uint32_t w, uint32_t h, uint32_t dw, uint32_
         AR.ready = 1;
     }
     if (AR.ready < 0)
+        return VK_NULL_HANDLE;
+    if (g_vk.lost)
         return VK_NULL_HANDLE;
     if (!AR.img || AR.w != dw || AR.h != dh) {
         VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -3257,6 +3307,8 @@ static int backend_init(void)
     dpi.pPoolSizes = ps;
     qpi.queryType = VK_QUERY_TYPE_OCCLUSION;
     qpi.queryCount = VKB_QUERIES;
+    if (!VK_OK(vkAllocateCommandBuffers(g_vk.device, &ai, &B.sink)))
+        return 0;
     for (i = 0; i < VKB_SLOTS; i++) {
         Slot *s = &B.slot[i];
         if (!VK_OK(vkAllocateCommandBuffers(g_vk.device, &ai, &s->cb))
