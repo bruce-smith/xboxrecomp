@@ -33,6 +33,9 @@
 #include "vk_psh.h"
 #include "vk_vsh.h"
 #include "xbox_vk.h"
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+#include "xbox_ui.h"                     /* xbox_setting_* */
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_SchedMode(void);          /* kernel: 0 off, 1 record, 2 replay */
@@ -2324,6 +2327,57 @@ static void frame_stats(void)
 
 static volatile uint32_t s_post_aa_req, s_post_aa;
 
+/* The menu's Graphics options (src/ui settings: shown in the menu, kept in
+ * blinx2_settings.ini, an environment variable wins), or the environment
+ * alone where the settings store is not linked (standalone tests). Values
+ * are option indices: supersampling {1, 3, 5}, AA {off, fxaa}. */
+static const char *const k_scale_names[] = { "1", "3", "5" };
+static const char *const k_aa_names[] = { "off", "fxaa" };
+static int s_set_scale = -1, s_set_aa = -1;  /* last values read */
+
+static uint32_t odd_scale(uint32_t sc);
+
+static void settings_declare(void)
+{
+    int i, a;
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+    i = xbox_setting_choice("graphics", "vk_scale", "Supersampling (Vulkan)", k_scale_names,
+                            3, 0, "RECOMP_VK_SCALE", 0);
+    a = xbox_setting_choice("graphics", "vk_aa", "Anti-aliasing (Vulkan)", k_aa_names,
+                            2, 0, "RECOMP_VK_AA", 0);
+#else
+    const char *e = getenv("RECOMP_VK_SCALE");
+    int sc = e ? atoi(e) : 1;
+    i = (int)(odd_scale(sc < 1 ? 1u : (uint32_t)sc) / 2);
+    e = getenv("RECOMP_VK_AA");
+    a = e && !strcmp(e, "fxaa");
+#endif
+    s_set_scale = i < 0 ? 0 : i > 2 ? 2 : i;
+    s_set_aa = a != 0;
+    B.scale = B.scale_req = 1u + 2u * (uint32_t)s_set_scale;
+    s_post_aa = s_post_aa_req = (uint32_t)s_set_aa;
+    if (B.scale > 1 || s_post_aa)
+        fprintf(stderr, "  [VK] supersampling %ux, FXAA %s\n", B.scale, s_post_aa ? "on" : "off");
+}
+
+/* At each flip: a value the menu changed becomes a request (edge-triggered,
+ * so xbox_vk_settings_set still works where nothing changes in the menu). */
+static void settings_poll(void)
+{
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+    int i = xbox_setting_get("graphics", "vk_scale", s_set_scale);
+    int a = xbox_setting_get("graphics", "vk_aa", s_set_aa);
+    if (i != s_set_scale && i >= 0 && i <= 2) {
+        s_set_scale = i;
+        B.scale_req = 1u + 2u * (uint32_t)i;
+    }
+    if (a != s_set_aa) {
+        s_set_aa = a;
+        s_post_aa_req = a != 0;
+    }
+#endif
+}
+
 /* Render scales are odd, 1 to 5: an even request goes to the next odd one. */
 static uint32_t odd_scale(uint32_t sc)
 {
@@ -2342,6 +2396,7 @@ static void apply_settings(void)
 {
     Surf old[VKB_SURFS];
     int i, n = 0;
+    settings_poll();
     if (s_post_aa != s_post_aa_req) {
         s_post_aa = s_post_aa_req;
         fprintf(stderr, "  [VK] post-process AA: %s\n", s_post_aa ? "FXAA" : "off");
@@ -3024,13 +3079,7 @@ static int backend_init(void)
             return 0;
     }
     B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL;
-    {
-        const char *e = getenv("RECOMP_VK_SCALE");
-        int sc = e ? atoi(e) : 1;
-        B.scale = B.scale_req = odd_scale(sc < 1 ? 1u : (uint32_t)sc);
-        e = getenv("RECOMP_VK_AA");
-        s_post_aa = s_post_aa_req = e && !strcmp(e, "fxaa");
-    }
+    settings_declare();
     B.mtx = vk_mutex_new();
     B.rep_event = vk_event_new();
     if (!B.mtx || !B.rep_event || !make_white())

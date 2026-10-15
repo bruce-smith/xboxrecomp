@@ -66,6 +66,12 @@ target_include_directories(xbox_gpu_vk
 # glslang's C interface; the backend also calls back into the executor
 # (nv2a_exec_texel, guest memory), which links it in turn.
 target_link_libraries(xbox_gpu_vk PRIVATE glslang glslang-default-resource-limits)
+# The in-game menu's settings store (src/ui): the supersampling and AA
+# options show in its Graphics tab. Absent in the standalone tests.
+if(TARGET xbox_settings)
+    target_link_libraries(xbox_gpu_vk PRIVATE xbox_settings)
+    target_compile_definitions(xbox_gpu_vk PRIVATE XBOXRECOMP_HAVE_SETTINGS=1)
+endif()
 target_compile_definitions(xbox_gpu_vk PRIVATE VK_NO_PROTOTYPES)
 # The backend's internals (vk_internal.h, volk, the Vulkan headers), for the
 # standalone tests in tests/gpu_vk_* that drive Vulkan themselves.
