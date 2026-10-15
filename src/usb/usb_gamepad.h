@@ -45,4 +45,11 @@ int usb_gamepad_configured(int pad);
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4
 
+/* Network play (src/net): when set, fn supplies each pad's 18 state bytes
+ * (buttons, analog buttons, sticks) instead of the host -- the lockstep
+ * input of that port's player. usb_gamepad_sample_local reads this
+ * machine's own player (the port-1 bindings: host pad, keyboard, script). */
+void usb_gamepad_set_override(int (*fn)(int pad, uint8_t *state18));
+void usb_gamepad_sample_local(uint8_t *state18);
+
 #endif /* XBOX_USB_GAMEPAD_H */

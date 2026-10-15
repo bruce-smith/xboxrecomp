@@ -56,6 +56,13 @@ add_subdirectory(src/ui)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Network play: lockstep input over UDP (RECOMP_NET)
+if(WIN32)
+    add_library(xbox_net STATIC src/net/netplay.c)
+    target_include_directories(xbox_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
+    target_link_libraries(xbox_net PUBLIC platform xbox_usb ws2_32)
+endif()
+
 # GPU: Vulkan backend (RECOMP_VK_PRESENT / RECOMP_GPU=vulkan). Fetches
 # Vulkan-Headers, volk and glslang at configure time (src/gpu_vk); the loader
 # is opened at run time, so the exe still starts (software path) where
@@ -88,5 +95,8 @@ target_link_libraries(xboxrecomp INTERFACE
 )
 if(TARGET xbox_ui)
     target_link_libraries(xboxrecomp INTERFACE xbox_ui)
+endif()
+if(TARGET xbox_net)
+    target_link_libraries(xboxrecomp INTERFACE xbox_net)
 endif()
 

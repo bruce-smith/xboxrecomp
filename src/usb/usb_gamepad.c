@@ -600,11 +600,33 @@ static int usb_gamepad_report_live(int pad, uint8_t *out, int max);
  * keyboard or script said is recorded -- one value when it is the same as
  * the last report, the 18 state bytes when it changed -- and a replay hands
  * back the recorded report whatever the host has plugged in. */
+static int (*s_pad_override)(int pad, uint8_t *state18);
+
+void usb_gamepad_set_override(int (*fn)(int pad, uint8_t *state18))
+{
+    s_pad_override = fn;
+}
+
+void usb_gamepad_sample_local(uint8_t *state18)
+{
+    uint8_t out[20];
+    usb_gamepad_report_live(0, out, sizeof out);
+    memcpy(state18, out + 2, 18);
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     static uint8_t last[4][18];
     uint64_t v[3] = { 0, 0, 0 };
-    int n = usb_gamepad_report_live(pad, out, max), changed;
+    int n, changed;
+
+    if (s_pad_override && max >= 20) {          /* a network game */
+        memset(out, 0, 20);
+        out[1] = 20;
+        s_pad_override(pad & 3, out + 2);
+        return 20;
+    }
+    n = usb_gamepad_report_live(pad, out, max);
 
     if (n != 20 || !xbox_SchedMode())
         return n;
