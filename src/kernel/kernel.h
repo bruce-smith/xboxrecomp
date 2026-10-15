@@ -849,7 +849,6 @@ uint64_t xbox_SchedValue(int kind, uint64_t live);
 void     xbox_SchedLoopCheck(void);             /* RECOMP_LOOP_HEAD, now and then */
 void     xbox_SchedFlush(void);
 void     xbox_SchedClose(void);                 /* last run + flush, at exit */
-#ifdef _WIN32
 DWORD    xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
                           DWORD ms, DWORD timeout_code);
 void     xbox_SchedEnterCS(CRITICAL_SECTION *cs);
@@ -862,7 +861,6 @@ int      xbox_SchedWaitUntil(int (*done)(void *ctx), void *ctx, DWORD ms);
 void     xbox_SchedThreadStarting(void);
 void     xbox_SchedThreadEnding(DWORD code);    /* while it holds the CPU */
 int      xbox_SchedThreadEnded(HANDLE h, DWORD *code);
-#endif
 /* Called on the DPC's own thread when one invocation of a DPC has made 1000,
  * 10000 and 100000 KeQuerySystemTime calls -- a loop that reads the clock
  * once per pass and never finds what it waits for. The game registers it to

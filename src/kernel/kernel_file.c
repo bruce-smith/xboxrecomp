@@ -67,6 +67,18 @@ uint32_t xbox_LastFileError(void)
     return g_xbox_last_file_error;
 }
 
+/* File times are host time -- a cache file the last run wrote, a copy this
+ * run made -- so under a guest-CPU schedule they are recorded, and a replay
+ * hands back the recorded ones (sched.c). */
+static void sched_file_times(LARGE_INTEGER *c, LARGE_INTEGER *a, LARGE_INTEGER *w)
+{
+    if (!xbox_SchedMode())
+        return;
+    c->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)c->QuadPart);
+    a->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)a->QuadPart);
+    w->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)w->QuadPart);
+}
+
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
@@ -133,19 +145,6 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
         return count != 0;
     }
     return xbox_translate_path(xbox_path, win_path, buf_size);
-}
-
-
-/* File times are host time -- a cache file the last run wrote, a copy this
- * run made -- so under a guest-CPU schedule they are recorded, and a replay
- * hands back the recorded ones (sched.c). */
-static void sched_file_times(LARGE_INTEGER *c, LARGE_INTEGER *a, LARGE_INTEGER *w)
-{
-    if (!xbox_SchedMode())
-        return;
-    c->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)c->QuadPart);
-    a->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)a->QuadPart);
-    w->QuadPart = (LONGLONG)xbox_SchedValue(XBOX_SCHED_FILETIME, (uint64_t)w->QuadPart);
 }
 
 NTSTATUS __stdcall xbox_NtCreateFile(

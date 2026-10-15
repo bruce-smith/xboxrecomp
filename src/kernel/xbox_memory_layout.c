@@ -12,7 +12,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
-#include <intrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>                    /* _ReturnAddress */
+#endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"

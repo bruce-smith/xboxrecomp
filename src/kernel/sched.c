@@ -51,7 +51,9 @@
  *        from the previous value of that agent and kind)
  * Off by default; off, every entry point here is a test and a return.
  */
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -59,10 +61,12 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 
+#if defined(_WIN32)
 #include <intrin.h>                    /* _ReturnAddress */
 #include <dbghelp.h>                   /* the stuck report names host code */
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "synchronization.lib")   /* WaitOnAddress */
+#endif
 
 extern RECOMP_TLS uint32_t g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
