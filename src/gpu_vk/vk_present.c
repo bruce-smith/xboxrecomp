@@ -13,8 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "vk_internal.h"
 #include "xbox_vk.h"
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+#include "xbox_ui.h"                     /* xbox_setting_* */
+#endif
 
 #define VKP_FRAMES 2        /* frames in flight */
 #define VKP_IMAGES 8
@@ -135,6 +139,9 @@ static int chain_build(void)
     return 1;
 }
 
+static void cap_declare(void);
+static volatile uint32_t s_cap_hz;   /* presentation frame-rate cap, Hz; 0 none */
+
 int xbox_vk_present_init(void *native_window)
 {
     VkSurfaceFormatKHR fmts[64];
@@ -212,8 +219,9 @@ int xbox_vk_present_init(void *native_window)
             || !VK_OK(vkCreateSemaphore(g_vk.device, &sci, NULL, &s.f[i].acquired)))
             return 0;
     }
-    fprintf(stderr, "  [VK] presenting through Vulkan (format %d, present mode %d)\n",
-            (int)s.fmt, (int)s.mode);
+    cap_declare();
+    fprintf(stderr, "  [VK] presenting through Vulkan (format %d, present mode %d, cap %u)\n",
+            (int)s.fmt, (int)s.mode, (unsigned)s_cap_hz);
     fflush(stderr);
     s.ok = 1;
     return 1;
@@ -937,6 +945,64 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
     return 1;
 }
 
+/* Frame-rate cap for presentation (vk_present_set_cap; RECOMP_VK_FPS_CAP):
+ * a frame that comes less than 0.8 of the cap's interval after the last one
+ * shown is not shown. Blinx 2 draws its title screens at 60 fps and plays at
+ * 30; a 30 cap gives a frame-generating driver (Smooth Motion, AFMF) one
+ * steady rate to double, and leaves 30 fps play with its jitter alone. */
+static double s_last_shown;
+
+static double now_s(void)
+{
+    struct timespec t;
+    timespec_get(&t, TIME_UTC);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+/* The cap's setting: the menu's graphics/vk_fps_cap {off, 30, 60}
+ * (RECOMP_VK_FPS_CAP wins), or the variable alone without the settings store
+ * (standalone tests). Declared when presentation starts, read each present. */
+static const char *const k_cap_names[] = { "off", "30", "60" };
+static const uint32_t k_cap_hz[] = { 0, 30, 60 };
+
+static void cap_declare(void)
+{
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+    int i = xbox_setting_choice("graphics", "vk_fps_cap", "Frame-rate cap (Vulkan presentation)",
+                                k_cap_names, 3, 0, "RECOMP_VK_FPS_CAP", 0);
+    s_cap_hz = k_cap_hz[i < 0 || i > 2 ? 0 : i];
+#else
+    const char *e = getenv("RECOMP_VK_FPS_CAP");
+    s_cap_hz = e ? (uint32_t)atoi(e) : 0;
+#endif
+}
+
+static int capped(void)
+{
+    uint32_t hz;
+    double t;
+#if defined(XBOXRECOMP_HAVE_SETTINGS)
+    {
+        int i = xbox_setting_get("graphics", "vk_fps_cap", -1);
+        if (i >= 0 && i <= 2)
+            s_cap_hz = k_cap_hz[i];
+    }
+#endif
+    hz = s_cap_hz;
+    if (!hz)
+        return 0;
+    t = now_s();
+    if (s_last_shown > 0.0 && t - s_last_shown < 0.8 / (double)hz)
+        return 1;
+    s_last_shown = t;
+    return 0;
+}
+
+void vk_present_set_cap(uint32_t hz)
+{
+    s_cap_hz = hz;
+}
+
 static void present_lock(void)
 {
     if (!s_mtx) {
@@ -954,6 +1020,8 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
     s_linear = linear;                  /* F9 applies to the renderer's frames too */
     if (s_backend_presents)
         return 1;                       /* the renderer shows its own frames */
+    if (capped())
+        return 1;
     present_lock();
     r = present(px, VK_NULL_HANDLE, w, h, linear);
     vk_mutex_unlock(s_mtx);
@@ -978,6 +1046,8 @@ int vk_present_image(VkImage img, uint32_t w, uint32_t h)
     if (!s.ok)
         return 0;
     s_backend_presents = 1;
+    if (capped())
+        return 1;
     present_lock();
     r = present(NULL, img, w, h, s_linear);
     vk_mutex_unlock(s_mtx);

@@ -552,6 +552,16 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     SetWindowTextW(hwnd, s_title);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
+    /* RECOMP_FB_FULLSCREEN=1 (the menu's "Start in fullscreen"): borderless
+     * fullscreen from the start, as F11 / Alt+Enter toggle it. On a flip-model
+     * Vulkan swapchain (RECOMP_VK_PRESENT) a window covering the monitor gets
+     * independent flip, the closest Windows comes to exclusive fullscreen
+     * today, and what frame-generating drivers want. */
+    {
+        const char *fs = getenv("RECOMP_FB_FULLSCREEN");
+        if (fs && *fs && *fs != '0')
+            fb_toggle_fullscreen(hwnd);
+    }
     hdc = GetDC(hwnd);
 #if defined(XBOXRECOMP_HAVE_VULKAN)
     if (getenv("RECOMP_VK_PRESENT")) {
