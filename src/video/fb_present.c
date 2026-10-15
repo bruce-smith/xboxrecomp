@@ -25,6 +25,9 @@
 #if defined(XBOXRECOMP_HAVE_VULKAN)
 #include "xbox_vk.h"
 #endif
+#if defined(XBOXRECOMP_HAVE_UI)
+#include "xbox_ui.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -234,8 +237,101 @@ static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px
     }
 }
 
+/* The in-game menu (src/ui), when it is open: the frame scaled to the
+ * client area as fb_blit would, dimmed, with the menu's overlay on top, at
+ * the window's own resolution so the text is sharp. Returns 0 when the menu
+ * is closed and the frame should go out as usual. */
+static int fb_show_menu(HWND hwnd, HDC hdc, const uint32_t *px)
+{
+#if defined(XBOXRECOMP_HAVE_UI)
+    static uint32_t *comp;
+    static int comp_n;
+    const uint32_t *ov;
+    RECT c;
+    int cw, ch, ow, oh, dw, dh, dx, dy, x, y;
+
+    GetClientRect(hwnd, &c);
+    cw = c.right - c.left;
+    ch = c.bottom - c.top;
+    if (!xbox_ui_render(hwnd, cw, ch) || !xbox_ui_overlay(&ov, &ow, &oh, NULL)
+        || ow != cw || oh != ch)
+        return 0;
+    if (comp_n < cw * ch) {
+        free(comp);
+        comp = (uint32_t *)malloc((size_t)cw * ch * 4);
+        comp_n = comp ? cw * ch : 0;
+        if (!comp)
+            return 0;
+    }
+    if ((long long)cw * s_fb_height >= (long long)ch * s_fb_width) {
+        dh = ch;
+        dw = (int)((long long)ch * s_fb_width / s_fb_height);
+    } else {
+        dw = cw;
+        dh = (int)((long long)cw * s_fb_height / s_fb_width);
+    }
+    dx = (cw - dw) / 2;
+    dy = (ch - dh) / 2;
+    for (y = 0; y < ch; y++) {
+        uint32_t *row = comp + (size_t)y * cw;
+        const uint32_t *orow = ov + (size_t)y * cw;
+        int sy = y - dy;
+        const uint32_t *srow = (sy >= 0 && sy < dh)
+            ? px + (size_t)((long long)sy * s_fb_height / dh) * s_fb_width : NULL;
+        for (x = 0; x < cw; x++) {
+            uint32_t o = orow[x], a = o >> 24, g = 0, ia;
+            int sx = x - dx;
+            if (srow && sx >= 0 && sx < dw)
+                g = (srow[(long long)sx * s_fb_width / dw] >> 1) & 0x7F7F7Fu;
+            if (a == 255) {
+                row[x] = o & 0xFFFFFFu;
+                continue;
+            }
+            ia = 255 - a;
+            row[x] = ((((g >> 16) & 0xFF) * ia / 255 + ((o >> 16) & 0xFF)) << 16)
+                   | ((((g >> 8) & 0xFF) * ia / 255 + ((o >> 8) & 0xFF)) << 8)
+                   | ((g & 0xFF) * ia / 255 + (o & 0xFF));
+        }
+    }
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk) {
+        xbox_vk_present_frame(comp, (uint32_t)cw, (uint32_t)ch, 0);
+        return 1;
+    }
+#endif
+    {
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = cw;
+        bi.bmiHeader.biHeight = -ch;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        SetDIBitsToDevice(hdc, 0, 0, (DWORD)cw, (DWORD)ch, 0, 0, 0, (UINT)ch,
+                          comp, &bi, DIB_RGB_COLORS);
+    }
+    return 1;
+#else
+    (void)hwnd; (void)hdc; (void)px;
+    return 0;
+#endif
+}
+
+static void fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px)
+{
+    if (!fb_show_menu(hwnd, hdc, px))
+        fb_blit(hwnd, hdc, bi, px);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+#if defined(XBOXRECOMP_HAVE_UI)
+    /* Escape, and everything while the menu is open, is the menu's. */
+    if (m != WM_CLOSE && m != WM_DESTROY
+        && xbox_ui_wndproc(h, m, (uintptr_t)w, (intptr_t)l))
+        return 0;
+#endif
     switch (m) {
     case WM_CLOSE:
         /* The window is the game: closing it ends the process. It used to
@@ -484,6 +580,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+#if defined(XBOXRECOMP_HAVE_UI)
+        /* Keys held when the menu opened are released, for the game. */
+        if (xbox_ui_menu_open())
+            memset((void *)s_key_down, 0, sizeof s_key_down);
+#endif
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
@@ -492,14 +593,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            fb_blit(hwnd, hdc, &bi, s_rgb);
+            fb_show(hwnd, hdc, &bi, s_rgb);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            fb_blit(hwnd, hdc, &bi, s_rgb);
+            fb_show(hwnd, hdc, &bi, s_rgb);
         }
         {
             /* One dump a few seconds in, so the title has had time to render

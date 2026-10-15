@@ -50,6 +50,9 @@ add_subdirectory(src/nv2a)
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)
 
+# Settings (ini next to the exe) and the in-game menu (Escape; Dear ImGui)
+add_subdirectory(src/ui)
+
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
@@ -81,5 +84,9 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_settings
 )
+if(TARGET xbox_ui)
+    target_link_libraries(xboxrecomp INTERFACE xbox_ui)
+endif()
 
