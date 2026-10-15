@@ -16,7 +16,11 @@ Godot.
    py -3 tools/capture/capture2gltf.py <dir> scene.glb
    ```
 
-   It needs numpy and Pillow.
+   It needs numpy and Pillow. Options:
+   - `--frame N`: one captured frame only;
+   - `--skinned-only`: only skinned meshes, posed as in that frame. With
+     `--frame` this exports the player character on its own (in Blinx 2,
+     your custom character).
 
 What you get:
 

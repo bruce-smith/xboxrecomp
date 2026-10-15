@@ -226,9 +226,15 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--max-error", type=float, default=2e-3,
                     help="largest relative error for a one-matrix fit")
+    ap.add_argument("--frame", type=int, help="only this captured frame (1, 2, ...)")
+    ap.add_argument("--skinned-only", action="store_true",
+                    help="only draws one rigid matrix does not explain: skinned meshes "
+                         "such as the player character, as posed in that frame")
     args = ap.parse_args()
 
     draws = load(args.capdir)
+    if args.frame is not None:
+        draws = [d for d in draws if d["frame"] == args.frame]
     surfs = {int(d["surf"], 16) & 0x0FFFFFFF for d in draws}
     frames = sorted({d["frame"] for d in draws})
     print(f"{len(draws)} draws in {len(frames)} frames")
@@ -308,6 +314,9 @@ def main():
         t = xform[d["frame"]]
         world = t @ d["M"] if d["good"] else None
         trs = to_trs(world, d["v0"][:, :3]) if world is not None else None
+        skinned = d["M"] is not None and d["rank"] == 4 and d["err"] >= args.max_error
+        if args.skinned_only and not skinned:
+            continue
         if trs is not None:
             pos = d["v0"][:, :3]
         else:
