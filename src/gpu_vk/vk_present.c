@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include "vk_internal.h"
 #include "xbox_vk.h"
 #if defined(XBOXRECOMP_HAVE_SETTINGS)
@@ -302,7 +303,22 @@ static volatile int s_linear;
  * scaling and AA, at window resolution. */
 
 typedef int (*UiPull)(const uint32_t **px, int *w, int *h, uint32_t *serial);
+#if defined(XBOXRECOMP_HAVE_UI)
+/* P5's menu: on 1 it holds a shared lock on the pixels until
+ * xbox_ui_overlay_release(), which ui_layer calls right after its copy. */
+static UiPull s_ui_pull = xbox_ui_overlay;
+#else
 static UiPull s_ui_pull;
+#endif
+
+static void ui_release(int *held)
+{
+#if defined(XBOXRECOMP_HAVE_UI)
+    if (*held)
+        xbox_ui_overlay_release();
+#endif
+    *held = 0;
+}
 
 /* RECOMP_VK_UI_TEST=1: a fixed translucent panel instead of the menu
  * (testing the composite with RECOMP_VK_PRESENT_DUMP). */
@@ -543,15 +559,19 @@ static VkImageLayout ui_layer(VkCommandBuffer cb, uint32_t idx, VkImageLayout cu
     VkViewport vp;
     VkRect2D sc;
     float size[2];
+    int held = 0;
 
     if (test < 0)
         test = getenv("RECOMP_VK_UI_TEST") != NULL;
     if (test)
         pull = ui_test;
-    if (!pull || !s.view[idx] || !pull(&px, &w, &h, &serial) || !px || w <= 0 || h <= 0)
+    if (!pull || !s.view[idx] || !pull(&px, &w, &h, &serial))
         return cur;
-    if (!ui_init() || !ui_texture(w, h) || !(p = ui_pipeline()))
+    held = pull != ui_test;              /* the menu's pixels are locked */
+    if (!px || w <= 0 || h <= 0 || !ui_init() || !ui_texture(w, h) || !(p = ui_pipeline())) {
+        ui_release(&held);
         return cur;
+    }
     if (U.fresh || serial != U.serial) {
         VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
         VkBufferImageCopy c;
@@ -566,11 +586,13 @@ static VkImageLayout ui_layer(VkCommandBuffer cb, uint32_t idx, VkImageLayout cu
                                   &U.st[s.fi].buf, &U.st[s.fi].mem, &U.st[s.fi].map)) {
                 U.st[s.fi].buf = VK_NULL_HANDLE;
                 U.st[s.fi].size = 0;
+                ui_release(&held);
                 return cur;
             }
             U.st[s.fi].size = bytes;
         }
         memcpy(U.st[s.fi].map, px, (size_t)bytes);
+        ui_release(&held);
         barrier(cb, U.img, U.fresh ? VK_IMAGE_LAYOUT_UNDEFINED
                                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
@@ -591,6 +613,7 @@ static VkImageLayout ui_layer(VkCommandBuffer cb, uint32_t idx, VkImageLayout cu
         U.serial = serial;
         U.fresh = 0;
     }
+    ui_release(&held);                    /* no new pixels to copy */
     barrier(cb, s.img[idx], cur, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -633,13 +656,22 @@ static void *s_dump_map;
 
 static int dump_record(VkCommandBuffer cb, VkImage img)
 {
-    static long at = -2;
+    static long at[16];
+    static int nat = -1;
     VkBufferImageCopy c;
-    if (at == -2) {
+    int k, hit = 0;
+    if (nat < 0) {                     /* "n" or "n1,n2,..." */
         const char *e = getenv("RECOMP_VK_PRESENT_DUMP");
-        at = e ? atol(e) : -1;
+        nat = 0;
+        while (e && *e && nat < 16) {
+            char *end;
+            at[nat++] = strtol(e, &end, 10);
+            e = *end == ',' ? end + 1 : NULL;
+        }
     }
-    if (at < 0 || (long)s_frame_no != at)
+    for (k = 0; k < nat; k++)
+        hit |= (long)s_frame_no == at[k];
+    if (!hit)
         return 0;
     if (!s_dump_buf
         && !vk_buffer_create((VkDeviceSize)s.extent.width * s.extent.height * 4,
@@ -699,6 +731,29 @@ static void dump_write(uint32_t w, uint32_t h)
     fprintf(stderr, "  [VK] present %llu written to %s\n", (unsigned long long)s_frame_no, path);
 }
 
+/* Present intervals since the last [VKPACE] line (RECOMP_VK_STATS). */
+static unsigned s_iv_n, s_iv_late;
+static double s_iv_sum, s_iv_sq, s_iv_min = 1e9, s_iv_max, s_iv_last;
+
+static void pace_note(void)
+{
+    struct timespec ts;
+    double t, d;
+    timespec_get(&ts, TIME_UTC);
+    t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (s_iv_last > 0.0) {
+        d = t - s_iv_last;
+        if (s_iv_n && d > 1.5 * s_iv_sum / s_iv_n)
+            s_iv_late++;
+        s_iv_n++;
+        s_iv_sum += d;
+        s_iv_sq += d * d;
+        if (d < s_iv_min) s_iv_min = d;
+        if (d > s_iv_max) s_iv_max = d;
+    }
+    s_iv_last = t;
+}
+
 /* Show a frame: `px` (w x h, 0x00RRGGBB, uploaded) or the device image
  * `img` (in GENERAL layout, its top-left w x h), scaled to the window with
  * its aspect kept and black bars, the overlay over it, presented. */
@@ -729,10 +784,21 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
             stats = getenv("RECOMP_VK_STATS") != NULL;
         for (i = 0; i < 7; i++)
             calls += s_drop[i];
-        if (stats && calls && calls % 600 == 0)
+        if (stats && calls && calls % 600 == 0) {
             fprintf(stderr, "[VKPRESENT] %u shown; dropped: %u not ready, %u caps, %u minimised,"
                     " %u rebuild, %u out of date, %u source, %u staging\n", s_shown,
                     s_drop[0], s_drop[1], s_drop[2], s_drop[3], s_drop[4], s_drop[5], s_drop[6]);
+            /* Pacing: what a frame-generating driver sees between frames. */
+            if (s_iv_n)
+                fprintf(stderr, "[VKPACE] last %u intervals: min %.1f ms, mean %.1f ms,"
+                        " max %.1f ms, sd %.1f ms; %u over 1.5x the mean\n", s_iv_n,
+                        s_iv_min * 1e3, s_iv_sum / s_iv_n * 1e3, s_iv_max * 1e3,
+                        sqrt(s_iv_sq / s_iv_n - (s_iv_sum / s_iv_n) * (s_iv_sum / s_iv_n)) * 1e3,
+                        s_iv_late);
+            s_iv_n = s_iv_late = 0;
+            s_iv_sum = s_iv_sq = s_iv_max = 0.0;
+            s_iv_min = 1e9;
+        }
     }
     if (!s.ok || (!px && !img) || !w || !h)
         return drop(0);
@@ -942,6 +1008,7 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
     }
     s_shown++;
     s_frame_no++;
+    pace_note();
     return 1;
 }
 

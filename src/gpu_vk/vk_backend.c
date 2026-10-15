@@ -2677,6 +2677,233 @@ static VkImage fx_pass(VkImageView src, uint32_t w, uint32_t h)
     return FX.img;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Area-filtered resize of a supersampled frame to the window's size: each
+ * window pixel averages its whole footprint in the image (N x N bilinear
+ * taps, N = 2 * ceil(ratio), at most 8). A plain bilinear blit from 1920 to
+ * 1280 lines (3x in a 2x window) skips texels and turns thin lines -- the
+ * rain -- into dots. */
+
+static const char k_area_fs[] =
+"#version 450\n"
+"layout(set=0, binding=0) uniform sampler2D src;\n"
+"layout(push_constant) uniform P { vec2 region; vec2 dst; } pc;\n"
+"layout(location=0) out vec4 o;\n"
+"void main() {\n"
+"    vec2 tex = vec2(textureSize(src, 0));\n"
+"    vec2 r = pc.region / pc.dst;\n"
+"    vec2 x0 = (gl_FragCoord.xy - 0.5) * r;\n"
+"    int n = int(min(8.0, 2.0 * ceil(max(r.x, r.y))));\n"
+"    vec4 a = vec4(0.0);\n"
+"    for (int j = 0; j < n; j++)\n"
+"        for (int i = 0; i < n; i++)\n"
+"            a += texture(src, (x0 + (vec2(i, j) + 0.5) / float(n) * r) / tex);\n"
+"    o = a / float(n * n);\n"
+"}\n";
+
+static struct {
+    int ready;
+    VkPipelineLayout layout;
+    VkPipeline p;
+    VkSampler smp;
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    uint32_t w, h;
+} AR;
+
+/* The w x h guest-pixel frame of colour surface s, area-resized to dw x dh
+ * (B8G8R8A8, GENERAL layout), or VK_NULL_HANDLE. */
+static VkImage area_resize(Surf *s, uint32_t w, uint32_t h, uint32_t dw, uint32_t dh,
+                           VkImageView *out_view)
+{
+    VkDescriptorSet set;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkDescriptorImageInfo ii;
+    VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    VkViewport vp;
+    VkRect2D sc;
+    VkCommandBuffer cb;
+    float pc[4];
+    VkResult r_;
+    static const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+
+    if (!down_init())
+        return VK_NULL_HANDLE;
+    if (!AR.ready) {
+        VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        VkPushConstantRange pr;
+        VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        VkPipelineShaderStageCreateInfo ss[2];
+        VkPipelineVertexInputStateCreateInfo vis = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        VkPipelineInputAssemblyStateCreateInfo ias = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        VkPipelineColorBlendAttachmentState cba;
+        VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        VkDynamicState dyn_s[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dyn = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        VkPipelineRenderingCreateInfo prc = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        VkShaderModule fs;
+        AR.ready = -1;
+        pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pr.offset = 0;
+        pr.size = 16;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &D.dsl;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pr;
+        fs = vk_shader_module(1, k_area_fs);
+        {
+            VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+            sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+            sci.addressModeU = sci.addressModeV = sci.addressModeW =
+                VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            if (!VK_OK(vkCreateSampler(g_vk.device, &sci, NULL, &AR.smp)))
+                return VK_NULL_HANDLE;
+        }
+        if (!fs || !VK_OK(vkCreatePipelineLayout(g_vk.device, &pli, NULL, &AR.layout)))
+            return VK_NULL_HANDLE;
+        memset(ss, 0, sizeof ss);
+        ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        ss[0].module = D.vs;
+        ss[0].pName = "main";
+        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        ss[1].module = fs;
+        ss[1].pName = "main";
+        ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        vps.viewportCount = vps.scissorCount = 1;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        memset(&cba, 0, sizeof cba);
+        cba.colorWriteMask = 0xF;
+        cbs.attachmentCount = 1;
+        cbs.pAttachments = &cba;
+        dyn.dynamicStateCount = 2;
+        dyn.pDynamicStates = dyn_s;
+        prc.colorAttachmentCount = 1;
+        prc.pColorAttachmentFormats = &fmt;
+        ci.pNext = &prc;
+        ci.stageCount = 2;
+        ci.pStages = ss;
+        ci.pVertexInputState = &vis;
+        ci.pInputAssemblyState = &ias;
+        ci.pViewportState = &vps;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &cbs;
+        ci.pDynamicState = &dyn;
+        ci.layout = AR.layout;
+        if (!VK_OK(vkCreateGraphicsPipelines(g_vk.device, B.pcache, 1, &ci, NULL, &AR.p)))
+            return VK_NULL_HANDLE;
+        AR.ready = 1;
+    }
+    if (AR.ready < 0)
+        return VK_NULL_HANDLE;
+    if (!AR.img || AR.w != dw || AR.h != dh) {
+        VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        if (AR.img) {
+            wait_idle();
+            vkDestroyImageView(g_vk.device, AR.view, NULL);
+            vkDestroyImage(g_vk.device, AR.img, NULL);
+            vkFreeMemory(g_vk.device, AR.mem, NULL);
+            AR.img = VK_NULL_HANDLE;
+        }
+        if (!vk_image_create(dw, dh, fmt, VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                             | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                             | VK_IMAGE_USAGE_SAMPLED_BIT, &AR.img, &AR.mem))
+            return VK_NULL_HANDLE;
+        vi.image = AR.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = fmt;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (!VK_OK(vkCreateImageView(g_vk.device, &vi, NULL, &AR.view)))
+            return VK_NULL_HANDLE;
+        AR.w = dw;
+        AR.h = dh;
+        end_rendering();
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.image = AR.img;
+        ib.subresourceRange = vi.subresourceRange;
+        vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL,
+                             0, NULL, 1, &ib);
+    }
+    end_rendering();
+    full_barrier();
+    cb = cmd();
+    ai.descriptorPool = B.slot[B.cur].dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &D.dsl;
+    if (vkAllocateDescriptorSets(g_vk.device, &ai, &set) != VK_SUCCESS) {
+        submit(0);
+        cb = cmd();
+        full_barrier();
+        ai.descriptorPool = B.slot[B.cur].dpool;
+        if (!VK_OK(vkAllocateDescriptorSets(g_vk.device, &ai, &set)))
+            return VK_NULL_HANDLE;
+    }
+    ii.sampler = AR.smp;
+    ii.imageView = s->view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    wr.dstSet = set;
+    wr.dstBinding = 0;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &ii;
+    vkUpdateDescriptorSets(g_vk.device, 1, &wr, 0, NULL);
+    ca.imageView = AR.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.renderArea.extent.width = dw;
+    ri.renderArea.extent.height = dh;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, AR.p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, AR.layout, 0, 1, &set, 0, NULL);
+    pc[0] = (float)(w * s->sc);
+    pc[1] = (float)(h * s->sc);
+    pc[2] = (float)dw;
+    pc[3] = (float)dh;
+    vkCmdPushConstants(cb, AR.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)dw;
+    vp.height = (float)dh;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = dw;
+    sc.extent.height = dh;
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    B.pending_barrier = 1;
+    *out_view = AR.view;
+    return AR.img;
+}
+
 /* The finished frame (the colour surface at `addr`, its top-left w x h) to
  * the window's Vulkan swapchain, when there is one. */
 static void flip_present(uint32_t addr, uint32_t w, uint32_t h)
@@ -2688,17 +2915,31 @@ static void flip_present(uint32_t addr, uint32_t w, uint32_t h)
         Surf *s = &B.surf[i];
         if (s->img && !s->depth && s->addr == addr) {
             uint32_t fw = w < s->w ? w : s->w, fh = h < s->h ? h : s->h, ww, wh;
-            /* Supersampled, in a window under 2/3 of the image's height: the
-             * box-filtered native frame (a blit that far down would alias
-             * again); otherwise the full image. */
             VkImage img = s->img;
             VkImageView view = s->view;
             uint32_t pw = fw * s->sc, ph = fh * s->sc;
-            if (s->sc > 1 && vk_present_extent(&ww, &wh) && wh * 3 < ph * 2) {
-                img = downsampled(s, fw, fh);
-                view = img == B.down ? D.view : s->view;
-                pw = fw;
-                ph = fh;
+            /* Supersampled, in a window that shows the frame smaller than
+             * the image: area-filtered to exactly the size it is shown at
+             * (a blit would skip texels); otherwise the full image. */
+            if (s->sc > 1 && vk_present_extent(&ww, &wh)) {
+                uint32_t dw, dh;
+                if ((uint64_t)ww * ph >= (uint64_t)wh * pw) {
+                    dh = wh;
+                    dw = (uint32_t)((uint64_t)wh * pw / ph);
+                } else {
+                    dw = ww;
+                    dh = (uint32_t)((uint64_t)ww * ph / pw);
+                }
+                if (dw && dh && dh < ph) {
+                    VkImageView v;
+                    VkImage r = area_resize(s, fw, fh, dw, dh, &v);
+                    if (r) {
+                        img = r;
+                        view = v;
+                        pw = dw;
+                        ph = dh;
+                    }
+                }
             }
             if (s_post_aa) {                /* FXAA, display only */
                 VkImage fx = fx_pass(view, pw, ph);

@@ -72,6 +72,11 @@ if(TARGET xbox_settings)
     target_link_libraries(xbox_gpu_vk PRIVATE xbox_settings)
     target_compile_definitions(xbox_gpu_vk PRIVATE XBOXRECOMP_HAVE_SETTINGS=1)
 endif()
+# The menu's overlay, drawn over the renderer's own image (vk_present.c).
+if(TARGET xbox_ui)
+    target_link_libraries(xbox_gpu_vk PRIVATE xbox_ui)
+    target_compile_definitions(xbox_gpu_vk PRIVATE XBOXRECOMP_HAVE_UI=1)
+endif()
 target_compile_definitions(xbox_gpu_vk PRIVATE VK_NO_PROTOTYPES)
 # The backend's internals (vk_internal.h, volk, the Vulkan headers), for the
 # standalone tests in tests/gpu_vk_* that drive Vulkan themselves.
