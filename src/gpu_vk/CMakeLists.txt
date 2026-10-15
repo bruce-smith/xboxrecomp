@@ -53,6 +53,9 @@ if(WIN32)
     # loads it, the surface file calls it, nothing else sees <windows.h>.
     set_source_files_properties(${xbr_volk_SOURCE_DIR}/volk.c vk_platform_win32.c
         PROPERTIES COMPILE_DEFINITIONS VK_USE_PLATFORM_WIN32_KHR)
+else()
+    # POSIX: pthreads; offscreen only for now (no window-system surface).
+    list(APPEND GPU_VK_SOURCES vk_platform_posix.c)
 endif()
 
 add_library(xbox_gpu_vk STATIC ${GPU_VK_SOURCES})
