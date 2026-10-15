@@ -5267,6 +5267,192 @@ static void backend_draw(void)
     note_drawn();
 }
 
+/* RECOMP_CAPTURE=<dir>: capture frames for asset export (tools/capture).
+ *
+ * While <dir>\capture.flag exists, every RECOMP_CAPTURE_EVERY-th flip (default
+ * 1) is captured. Per draw that runs a vertex program on a surface at least
+ * RECOMP_CAPTURE_MINW wide (default 640: the screen, not render targets):
+ *   draws.jsonl  one line: frame, primitive, state, textures, data offset;
+ *   draws.bin    per vertex of the draw (in index order, deduplicated):
+ *                index, input v0 xyzw, output position xyzw (screen + w),
+ *                colour d0 rgba, texture coordinates t0..t3 strq;
+ *                then the draw's indices as local vertex numbers (u32);
+ *   tex_<offset>_<fmt>_<w>x<h>.argb  level 0 of each texture, ARGB8888.
+ * Everything comes from the decoded state on the executor, before the draw
+ * goes to a renderer, so it works with Vulkan and with software. Each
+ * captured draw runs its vertex program here a second time; nothing else
+ * changes. */
+static struct {
+    const char *dir;
+    int every, minw, on;
+    uint32_t frame, draws;
+    FILE *meta, *bin;
+    uint32_t texs[2048][4];             /* offset, color, w, h dumped */
+    int ntex;
+} s_cap;
+
+static void capture_init(void)
+{
+    static int done;
+    const char *e;
+    if (done)
+        return;
+    done = 1;
+    s_cap.dir = getenv("RECOMP_CAPTURE");
+    e = getenv("RECOMP_CAPTURE_EVERY");
+    s_cap.every = e ? atoi(e) : 1;
+    if (s_cap.every < 1)
+        s_cap.every = 1;
+    e = getenv("RECOMP_CAPTURE_MINW");
+    s_cap.minw = e ? atoi(e) : 640;
+    if (s_cap.dir) {
+        fprintf(stderr, "[CAPTURE] armed: %s (capture.flag starts it)%c", s_cap.dir, 10);
+        fflush(stderr);
+    }
+}
+
+static void capture_flip(void)
+{
+    char path[512];
+    FILE *f;
+    capture_init();
+    if (!s_cap.dir)
+        return;
+    snprintf(path, sizeof path, "%s/capture.flag", s_cap.dir);
+    f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    if (f && !s_cap.meta) {
+        snprintf(path, sizeof path, "%s/draws.jsonl", s_cap.dir);
+        s_cap.meta = fopen(path, "ab");
+        snprintf(path, sizeof path, "%s/draws.bin", s_cap.dir);
+        s_cap.bin = fopen(path, "ab");
+        if (!s_cap.meta || !s_cap.bin) {
+            if (s_cap.meta) fclose(s_cap.meta);
+            if (s_cap.bin) fclose(s_cap.bin);
+            s_cap.meta = s_cap.bin = NULL;
+            return;
+        }
+        fprintf(stderr, "[CAPTURE] started, into %s%c", s_cap.dir, 10);
+        fflush(stderr);
+    } else if (!f && s_cap.meta) {
+        fclose(s_cap.meta);
+        fclose(s_cap.bin);
+        s_cap.meta = s_cap.bin = NULL;
+        fprintf(stderr, "[CAPTURE] stopped: %u draws%c", s_cap.draws, 10);
+    }
+    if (s_cap.meta) {                        /* whole frames, if the game is closed */
+        fflush(s_cap.bin);
+        fflush(s_cap.meta);
+    }
+    s_cap.on = s_cap.meta && (s_gpu.flips % (uint32_t)s_cap.every) == 0;
+    if (s_cap.on)
+        s_cap.frame++;
+}
+
+static void capture_texture(const Texture *t)
+{
+    char path[512];
+    FILE *f;
+    uint32_t *px, x, y, n = t->width * t->height;
+    int i;
+    for (i = 0; i < s_cap.ntex; i++)
+        if (s_cap.texs[i][0] == t->offset && s_cap.texs[i][1] == t->color
+            && s_cap.texs[i][2] == t->width && s_cap.texs[i][3] == t->height)
+            return;
+    if (s_cap.ntex == 2048 || !n || n > 4096u * 4096u)
+        return;
+    s_cap.texs[s_cap.ntex][0] = t->offset; s_cap.texs[s_cap.ntex][1] = t->color;
+    s_cap.texs[s_cap.ntex][2] = t->width;  s_cap.texs[s_cap.ntex][3] = t->height;
+    s_cap.ntex++;
+    snprintf(path, sizeof path, "%s/tex_%08X_%02X_%ux%u.argb", s_cap.dir,
+             t->offset, t->color, t->width, t->height);
+    f = fopen(path, "rb");
+    if (f) {                                 /* from an earlier capture */
+        fclose(f);
+        return;
+    }
+    px = (uint32_t *)malloc((size_t)n * 4);
+    if (!px)
+        return;
+    for (y = 0; y < t->height; y++)
+        for (x = 0; x < t->width; x++)
+            if (!sample_tex(t, 0, x, y, &px[y * t->width + x]))
+                px[y * t->width + x] = 0;
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite(px, 4, n, f);
+        fclose(f);
+    }
+    free(px);
+}
+
+static void capture_draw(void)
+{
+    static int32_t local[65536];
+    static uint32_t verts[NV_MAX_INDICES];
+    uint32_t n = s_gpu.idx_count, nv = 0, i, a;
+    long off;
+    int st;
+    const float *k = nv2a_vsh_constant(58), *o = nv2a_vsh_constant(59);
+
+    if (!s_cap.on || (s_gpu.xf_mode & 3) != 2 || n < 3
+        || s_gpu.clip_w < (uint32_t)s_cap.minw)
+        return;
+    for (i = 0; i < n; i++)
+        local[s_gpu.idx[i]] = -1;
+    for (i = 0; i < n; i++)
+        if (local[s_gpu.idx[i]] < 0) {
+            local[s_gpu.idx[i]] = (int32_t)nv;
+            verts[nv++] = s_gpu.idx[i];
+        }
+    off = ftell(s_cap.bin);
+    for (i = 0; i < nv; i++) {
+        float in[NV2A_VSH_INPUTS][4], rec[1 + 4 + 4 + 4 + 16];
+        Nv2aVshOutput out;
+        for (a = 0; a < NV2A_VSH_INPUTS; a++)
+            fetch_input(a, verts[i], in[a]);
+        memset(&out, 0, sizeof out);
+        nv2a_vsh_run((const float (*)[4])in, &out);
+        rec[0] = (float)verts[i];
+        memcpy(rec + 1, in[0], 16);
+        memcpy(rec + 5, out.pos, 16);
+        memcpy(rec + 9, out.d0, 16);
+        memcpy(rec + 13, out.tex, 64);
+        fwrite(rec, sizeof rec, 1, s_cap.bin);
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t l = (uint32_t)local[s_gpu.idx[i]];
+        fwrite(&l, 4, 1, s_cap.bin);
+    }
+    fprintf(s_cap.meta, "{\"frame\":%u,\"flip\":%u,\"draw\":%u,\"prim\":%u,\"nidx\":%u,"
+            "\"nvert\":%u,\"off\":%ld,\"surf\":\"%08X\",\"vb\":\"%08X\",\"stride\":%u,"
+            "\"k\":[%g,%g,%g],\"o\":[%g,%g,%g],\"blend\":[%u,%u,%u,%u],"
+            "\"alpha\":[%u,%u,%u],\"depth\":[%u,%u,%u],\"cull\":[%u,%u,%u],"
+            "\"stages\":%u,\"tex\":[",
+            s_cap.frame, s_gpu.flips, s_cap.draws, s_gpu.prim, n, nv, off,
+            s_gpu.color_offset, s_gpu.attr[0].offset, s_gpu.attr[0].stride,
+            k[0], k[1], k[2], o[0], o[1], o[2],
+            s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+            s_gpu.blend_equation, s_gpu.alpha_test, s_gpu.alpha_func,
+            s_gpu.alpha_ref, s_gpu.depth_test, s_gpu.depth_func,
+            s_gpu.depth_mask, s_gpu.cull_enable, s_gpu.cull_face,
+            s_gpu.front_face, s_gpu.rc_seen ? s_gpu.rc.stage_program : 1u);
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &s_gpu.texs[st];
+        int used = t->valid && (s_gpu.rc_seen
+                                ? ((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) != 0
+                                : st == 0);
+        if (used)
+            capture_texture(t);
+        fprintf(s_cap.meta, "%s{\"on\":%d,\"off\":\"%08X\",\"fmt\":%u,\"w\":%u,\"h\":%u,"
+                "\"swz\":%d}", st ? "," : "", used, t->offset, t->color, t->width,
+                t->height, used && tex_size_from_format(t->color) ? 1 : 0);
+    }
+    fprintf(s_cap.meta, "]}%c", 10);
+    s_cap.draws++;
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -5274,6 +5460,8 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    if (s_cap.on)
+        capture_draw();
     if (s_backend) {
         backend_draw();
         if (!s_backend_compare)
@@ -6535,6 +6723,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_pxchk_file = pc;
             }
             pixel_check_flip();
+            capture_flip();
         }
         fsum_flip();
         g_watch_flip = s_gpu.flips;
