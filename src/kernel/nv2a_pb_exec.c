@@ -3169,7 +3169,6 @@ static void rq_count(const XfCount *c)
     stats_fold(c->written, c->written_max);
 }
 
-#if defined(_WIN32)
 /* The pool works on a pipeline of batches rather than one at a time.
  *
  * Each band of NV_BAND rows takes the submitted batches strictly in order --
@@ -3251,7 +3250,7 @@ static struct {
     volatile LONG64 kicks, barriers, tris;
 } s_rqst;
 static int s_rqst_print = -1;
-static __declspec(thread) int t_blk_why;    /* 1 geometry, 2 barrier */
+static NV_TLS int t_blk_why;    /* 1 geometry, 2 barrier */
 
 static int rqst_on(void)
 {
@@ -3653,17 +3652,6 @@ void nv2a_pb_exec_dump_state(void)
     fprintf(stderr, "  [RQ] %d of %d bands owe work, %d busy\n",
             owed, s_pool.nbands, busy);
 }
-#else
-void nv2a_pb_exec_perf(double *wk_idle, double *wk_blocked, double *exec_wait)
-{
-    *wk_idle = *wk_blocked = *exec_wait = 0;
-}
-void nv2a_pb_exec_dump_state(void) { }
-void *nv2a_pb_exec_raster_thread(int k) { (void)k; return NULL; }
-static int raster_pool_size(void) { return 1; }
-static void rq_wait(void) { }
-static int rq_in_flight(void) { return 0; }
-#endif
 
 /* For the [PERF] line: draw calls and pixels written so far (pixels are
  * folded in at drains, so per second they lag by at most a frame). */
@@ -3684,7 +3672,6 @@ static void rq_kick(void)
     if (b->n) {
         s_gpu.rq_tris += (uint64_t)b->n;
         s_gpu.rq_px += (uint64_t)b->px;
-#if defined(_WIN32)
         if (raster_pool_size() > 1) {
             int slot = s_rq_fill;
             /* The slot's new number before its new range: a band that fell
@@ -3729,7 +3716,6 @@ static void rq_kick(void)
             rq_wait_until(NV_RQ_DEPTH - 1);
             s_rq_fill = s_pool.head % NV_RQ_DEPTH;
         } else
-#endif
         {
             XfCount c = {0, 0, 0, 0, 0, 0};
             xf_rows_queue(b->tri, b->n, &c);
@@ -3770,9 +3756,7 @@ static void rq_sync_at(int line)
     uint64_t n;
     uint32_t mx;
     int i = 24;
-#if defined(_WIN32)
     LARGE_INTEGER t0, t1, f;
-#endif
     if (rq_in_flight() || (s_rq[s_rq_fill] && s_rq[s_rq_fill]->n)) {
         for (i = 0; i < 24 && s_sync_sites[i].line && s_sync_sites[i].line != line; i++)
             ;
@@ -3781,20 +3765,16 @@ static void rq_sync_at(int line)
             s_sync_sites[i].n++;
         }
     }
-#if defined(_WIN32)
     if (i < 24)
         QueryPerformanceCounter(&t0);
-#endif
     rq_kick();
     rq_wait();
-#if defined(_WIN32)
     if (i < 24) {
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&f);
         s_sync_sites[i].ms += 1e3 * (double)(t1.QuadPart - t0.QuadPart)
                             / (double)f.QuadPart;
     }
-#endif
     stats_take(&n, &mx);              /* the executor's own direct drawing */
     stats_fold(n, mx);
 }
@@ -3896,14 +3876,12 @@ static void rq_note_surface(RasterBatch *b, uint32_t lo, uint32_t hi,
 /* The latest barrier batch (async): every band waits there for every
  * batch before it, so batches before it are already ordered ahead of
  * anything queued from then on and need no further barrier. */
-#if defined(_WIN32)
 static LONG s_rq_bar_seq;
 
 static LONG rq_unordered_from(void)
 {
     return s_rq_bar_seq > s_pool.tail ? s_rq_bar_seq : s_pool.tail;
 }
-#endif
 
 /* Does anything queued -- filling or still being drawn -- write [lo, hi)? */
 static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
@@ -3912,7 +3890,6 @@ static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
     lo = rq_phys(lo);
     if (s_rq[s_rq_fill] && rq_surf_overlaps(s_rq[s_rq_fill], lo, hi))
         return 2;
-#if defined(_WIN32)
     {
         LONG seq;
         rq_reap();
@@ -3921,7 +3898,6 @@ static int rq_queue_overlaps(uint32_t lo, uint32_t hi)
                 && rq_surf_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
                 return 1;
     }
-#endif
     return 0;
 }
 
@@ -3933,7 +3909,6 @@ static int rq_queue_relayout(uint32_t lo, uint32_t hi, uint32_t lay)
     lo = rq_phys(lo);
     if (s_rq[s_rq_fill] && rq_surf_relayout(s_rq[s_rq_fill], lo, hi, lay))
         return 2;
-#if defined(_WIN32)
     {
         LONG seq;
         rq_reap();
@@ -3942,7 +3917,6 @@ static int rq_queue_relayout(uint32_t lo, uint32_t hi, uint32_t lay)
                 && rq_surf_relayout(s_rq[seq % NV_RQ_DEPTH], lo, hi, lay))
                 return 1;
     }
-#endif
     return 0;
 }
 
@@ -4006,9 +3980,7 @@ static int rq_barrier(int k)
     if (k == 2)
         rq_kick();
     s_rq[s_rq_fill]->barrier = 1;
-#if defined(_WIN32)
     s_rq_bar_seq = s_pool.head;           /* the number it is kicked with */
-#endif
     return 1;
 }
 
@@ -4176,7 +4148,6 @@ static int rq_queue_samples(uint32_t lo, uint32_t hi)
     lo = rq_phys(lo);
     if (s_rq[s_rq_fill] && rq_tex_overlaps(s_rq[s_rq_fill], lo, hi))
         return 2;
-#if defined(_WIN32)
     {
         LONG seq;
         rq_reap();
@@ -4185,7 +4156,6 @@ static int rq_queue_samples(uint32_t lo, uint32_t hi)
                 && rq_tex_overlaps(s_rq[seq % NV_RQ_DEPTH], lo, hi))
                 return 1;
     }
-#endif
     return 0;
 }
 
@@ -4855,7 +4825,6 @@ static void raster_batch_program(void)
 
     /* RECOMP_VSH_TIME=1: fetch + vertex-program time per vertex, every 10 s,
      * for A/B runs of the interpreter. */
-#if defined(_WIN32)
     static int vtime = -1;
     static uint64_t fticks, batches;
     LARGE_INTEGER vt0, vf0, vf1;
@@ -4863,7 +4832,6 @@ static void raster_batch_program(void)
         vtime = getenv("RECOMP_VSH_TIME") != NULL;
     if (vtime)
         QueryPerformanceCounter(&vt0);
-#endif
     /* Four at a time (nv2a_vsh_run4, bit-identical to one at a time): the
      * vertex program was a third of the executor in Blinx 2's hub. A short
      * tail repeats its last vertex to fill the lanes. */
@@ -4873,10 +4841,8 @@ static void raster_batch_program(void)
         const float (*ip[4])[4];
         Nv2aVshOutput *op[4];
         uint32_t l, a;
-#if defined(_WIN32)
         if (vtime)
             QueryPerformanceCounter(&vf0);
-#endif
         for (l = 0; l < 4; l++) {
             uint32_t j = i + l < n ? i + l : n - 1;
             for (a = 0; a < NV2A_VSH_INPUTS; a++)
@@ -4884,16 +4850,13 @@ static void raster_batch_program(void)
             ip[l] = (const float (*)[4])in[l];
             op[l] = i + l < n ? &s_xf[i + l] : &tail[l];
         }
-#if defined(_WIN32)
         if (vtime) {
             QueryPerformanceCounter(&vf1);
             fticks += (uint64_t)(vf1.QuadPart - vf0.QuadPart);
         }
-#endif
         if (!nv2a_vsh_run4(ip, op))
             return;                                    /* no program loaded */
     }
-#if defined(_WIN32)
     if (vtime) {
         static uint64_t ticks, verts;
         static DWORD last;
@@ -4916,7 +4879,6 @@ static void raster_batch_program(void)
             last = GetTickCount();
         }
     }
-#endif
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -6604,7 +6566,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_INCREMENT_WRITE:
         rq_sync();                       /* the frame is finished */
-#if defined(_WIN32)
         if (s_rqst_print < 0)
             s_rqst_print = getenv("RECOMP_RQ_STATS") != NULL;
         if (s_rqst_print && s_gpu.flips % 60 == 59) {
@@ -6625,7 +6586,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             i0 = s_rqst.idle_us; w0 = s_rqst.wait_us;
             s_rqst.kicks = s_rqst.barriers = s_rqst.tris = 0;
         }
-#endif
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
