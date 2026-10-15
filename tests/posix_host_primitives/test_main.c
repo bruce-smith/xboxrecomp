@@ -256,6 +256,77 @@ static void test_waits(void)
     CloseHandle(t);
 }
 
+/* A sampler: another thread stopped and restarted every millisecond while it
+ * takes locks, waits on events, sleeps and allocates -- it must keep going. */
+static CRITICAL_SECTION s_cs;
+static HANDLE s_ev;
+static volatile LONG s_busy_iter, s_busy_stop;
+
+static DWORD WINAPI busy(LPVOID p)
+{
+    (void)p;
+    while (!s_busy_stop) {
+        void *m;
+        EnterCriticalSection(&s_cs);
+        m = malloc(64 + (s_busy_iter & 255));
+        LeaveCriticalSection(&s_cs);
+        free(m);
+        SetEvent(s_ev);
+        WaitForSingleObject(s_ev, 1);
+        if ((s_busy_iter & 63) == 0)
+            Sleep(1);
+        InterlockedIncrement(&s_busy_iter);
+    }
+    return 0;
+}
+
+static DWORD WINAPI cs_partner(LPVOID p)
+{
+    (void)p;
+    while (!s_busy_stop) {
+        EnterCriticalSection(&s_cs);
+        LeaveCriticalSection(&s_cs);
+        Sleep(0);
+    }
+    return 0;
+}
+
+static void test_suspend_stress(void)
+{
+    HANDLE t, u;
+    DWORD t0;
+    LONG last = -1;
+    int stuck = 0, rounds = 0, ctx_ok = 0;
+    CONTEXT ctx;
+
+    InitializeCriticalSection(&s_cs);
+    s_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    t = CreateThread(NULL, 0, busy, NULL, 0, NULL);
+    u = CreateThread(NULL, 0, cs_partner, NULL, 0, NULL);
+    t0 = GetTickCount();
+    while (GetTickCount() - t0 < 3000) {
+        Sleep(1);
+        if (SuspendThread(t) == (DWORD)-1)
+            break;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        ctx_ok += GetThreadContext(t, &ctx) ? 1 : 0;
+        ResumeThread(t);
+        rounds++;
+        if ((rounds & 127) == 0) {
+            stuck = (s_busy_iter == last) ? stuck + 1 : 0;
+            last = s_busy_iter;
+            if (stuck > 5)
+                break;
+        }
+    }
+    s_busy_stop = 1;
+    check(stuck <= 5 && WaitForSingleObject(t, 3000) == WAIT_OBJECT_0
+          && WaitForSingleObject(u, 3000) == WAIT_OBJECT_0 && ctx_ok == rounds,
+          "suspend_stress: 1 ms suspend/resume of a busy thread for 3 s");
+    printf("    (%d rounds, %ld iterations)\n", rounds, (long)s_busy_iter);
+}
+
 static void test_interlocked(void)
 {
     volatile LONGLONG q = 5;
@@ -275,6 +346,7 @@ int main(void)
     test_veh();
     test_suspend();
     test_suspend_main();
+    test_suspend_stress();
     test_waits();
     test_interlocked();
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures,
