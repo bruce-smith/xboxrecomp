@@ -5,9 +5,9 @@
  * guest-visible: the method state, D3D's fences (semaphore releases), the GPU
  * position in PGRAPH 0x400B10, NOTIFY interrupts, the flip counter and the
  * vblank. What it does with a draw, a clear, a visibility report or a flip is
- * either its own software rasteriser (the default, and the reference) or,
- * with RECOMP_GPU=vulkan, a backend that implements this interface
- * (src/gpu_vk).
+ * either a backend that implements this interface (src/gpu_vk, the default
+ * where it comes up) or its own software rasteriser (RECOMP_GPU=software,
+ * and the reference).
  *
  * Everything here is plain data: guest addresses already resolved through
  * dma_resolve (so the 0x8xxxxxxx contiguous alias and the RAM tag are gone),

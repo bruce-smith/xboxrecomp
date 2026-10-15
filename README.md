@@ -13,8 +13,15 @@
 >
 > Main changes in this fork (on top of upstream as of October 2026):
 >
+> - **Vulkan GPU renderer** (`src/gpu_vk`), the default: the executor hands
+>   draws, clears, visibility reports and flips to it. It runs vertex
+>   programs and register combiners as GPU shaders. If Vulkan is unusable or
+>   the GPU is lost mid-run, the software renderer below takes over by
+>   itself. `RECOMP_GPU=software` selects that renderer, which stays the
+>   reference. `RECOMP_VK_COMPARE=1` diffs every frame against it.
 > - **NV2A pushbuffer executor** (`src/kernel/nv2a_pb_exec.c`): the game's
->   pushbuffer is executed and rasterised in software.
+>   pushbuffer is executed, and with `RECOMP_GPU=software` rasterised in
+>   software.
 >   - Rasterisation is deferred onto a pool of worker threads, in bands of
 >     rows, with four-pixel SSE shading and vertex programs run four
 >     vertices at a time.
@@ -48,6 +55,9 @@
 >   - `--loop-heads`/`--yield-points` (loop heads and device waits become
 >     schedule points for the replay);
 >   - the data-pointer scan covers only conventional data sections;
+>   - functions named only by a code pointer (a callback being installed, a
+>     table entry) right after another function's end are found
+>     (`_pass_pointer_after_end`);
 >   - unresolved-call stubs log their first call.
 >
 > How to build and run Blinx 2 with it is in the

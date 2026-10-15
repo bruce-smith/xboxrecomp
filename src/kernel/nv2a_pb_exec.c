@@ -5021,11 +5021,13 @@ static void raster_batch_program(void)
 
 /* ── GPU backend (nv2a_backend.h) ─────────────────────────────────────────
  *
- * RECOMP_GPU=vulkan hands draws, clears, visibility reports and flips to a
- * backend instead of the software rasteriser. Everything else here --
- * decoding, fences, the GPU position, NOTIFY, flips counted, the vblank --
- * stays as it is, so the guest sees the same GPU either way. Unset (or
- * "soft"), nothing below runs and the software path is the reference. */
+ * A backend takes draws, clears, visibility reports and flips instead of the
+ * software rasteriser. Everything else here -- decoding, fences, the GPU
+ * position, NOTIFY, flips counted, the vblank -- stays as it is, so the
+ * guest sees the same GPU either way. The Vulkan backend is the default
+ * where it is built in and comes up; RECOMP_GPU=software (or "soft") keeps
+ * the software rasteriser, the reference, and so does a Vulkan that fails to
+ * initialise or loses its device (lost(), at a flip). */
 static const Nv2aBackend *s_backend;
 /* RECOMP_VK_COMPARE=1 (with RECOMP_GPU=vulkan): both renderers. The
  * software path stays in charge of everything the guest sees -- its pixels,
@@ -5034,19 +5036,35 @@ static const Nv2aBackend *s_backend;
  * same frames by construction, which is what a parity check needs. */
 static int s_backend_compare;
 
+/* Which renderer draws: Vulkan unless asked otherwise or unavailable. The
+ * one "[GPU] renderer:" line says which and why; replay_blinx2.bat reads it
+ * from a recording's game.log to replay with the renderer the recording was
+ * made with. */
 static void backend_select(void)
 {
     const char *g = getenv("RECOMP_GPU");
-    if (!g || !*g || !strcmp(g, "soft"))
-        return;
+    const char *why;
+    int want = 1;
+
+    if (!g || !*g)
+        why = "default";
+    else if (!strcmp(g, "vulkan"))
+        why = "RECOMP_GPU=vulkan";
+    else if (!strcmp(g, "software") || !strcmp(g, "soft"))
+        want = 0, why = "RECOMP_GPU=software";
+    else
+        want = 0, why = "RECOMP_GPU not vulkan or software";
 #if defined(XBOXRECOMP_HAVE_VULKAN)
-    if (!strcmp(g, "vulkan"))
+    if (want)
         s_backend = xbox_vk_backend();
 #endif
     s_backend_compare = s_backend && getenv("RECOMP_VK_COMPARE") != NULL;
-    fprintf(stderr, "  [GPU] RECOMP_GPU=%s: %s%s\n", g,
-            s_backend ? s_backend->name : "not available, rendering in software",
-            s_backend_compare ? " (compared against software, which renders)" : "");
+    if (s_backend)
+        fprintf(stderr, "  [GPU] renderer: %s (%s)%s\n", s_backend->name, why,
+                s_backend_compare ? ", compared against software, which renders" : "");
+    else
+        fprintf(stderr, "  [GPU] renderer: software (%s%s)\n", why,
+                want ? "; vulkan not available" : "");
 }
 
 static void tex_to_backend(const Texture *t, Nv2aTexState *o)
