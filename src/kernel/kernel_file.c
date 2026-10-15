@@ -1200,6 +1200,15 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
+            /* Recorded under a guest-CPU schedule, as in the Windows backend:
+             * host free space moves, and a replay must see the recorded one
+             * (and take the same two values, or every later value is off). */
+            if (xbox_SchedMode()) {
+                info->TotalAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
+                    XBOX_SCHED_DISKSPACE, (uint64_t)info->TotalAllocationUnits.QuadPart);
+                info->AvailableAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
+                    XBOX_SCHED_DISKSPACE, (uint64_t)info->AvailableAllocationUnits.QuadPart);
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
