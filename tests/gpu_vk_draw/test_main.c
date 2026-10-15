@@ -6,6 +6,7 @@
 #include <string.h>
 #include "nv2a_backend.h"
 #include "nv2a_combiner.h"
+#include "xbox_vk.h"
 
 extern const Nv2aBackend *xbox_vk_backend(void);
 
@@ -412,6 +413,48 @@ int main(void)
         rect(&s, 0, 0, 64, 64, 0.5f, white, 1.0f);
         flip();
         expect("rewritten by the CPU", 8, 8, 0xFF00FF00u, 0);
+    }
+
+    /* Supersampling switched on while running (the settings API; it applies
+     * at a flip): the same picture, and visibility still counts native
+     * pixels at 3x. Then back to 1x. */
+    {
+        XboxVkSettings set;
+        xbox_vk_settings_get(&set);
+        set.render_scale = 3;
+        xbox_vk_settings_set(&set);
+        base_state(&s);
+        s.clear_color = 0xFF000000u;
+        be->clear(&s, 0xF3);
+        flip();                                  /* 3x from here */
+        base_state(&s);
+        s.clear_color = 0xFF000000u;
+        be->clear(&s, 0xF3);
+        s.depth_test = 1; s.depth_mask = 1;
+        rect(&s, 0, 0, 64, 64, 0.3f, red, 0);
+        be->report_clear();
+        s.zpass_enable = 1;
+        s.depth_mask = 0;
+        rect(&s, 0, 0, 64, 64, 0.9f, green, 0);  /* behind: 0 */
+        n = report();
+        printf("%s 3x report behind = %u\n", n == 0 ? "ok  " : "FAIL", n);
+        failures += n != 0;
+        be->report_clear();
+        rect(&s, 40, 40, 48, 48, 0.05f, green, 0);
+        n = report();
+        printf("%s 3x report 8x8 = %u\n", n == 64 ? "ok  " : "FAIL", n);
+        failures += n != 64;
+        s.zpass_enable = 0;
+        flip();
+        expect("3x red", 20, 20, 0xFFFF0000u, 0);
+        expect("3x green", 44, 44, 0xFF00FF00u, 0);
+        set.render_scale = 1;
+        xbox_vk_settings_set(&set);
+        flip();                                  /* 1x again */
+        xbox_vk_settings_get(&set);
+        printf("%s back to scale %u\n", set.render_scale == 1 ? "ok  " : "FAIL",
+               set.render_scale);
+        failures += set.render_scale != 1;
     }
 
     /* Culling: back faces with front = CCW; a clockwise (on screen) quad

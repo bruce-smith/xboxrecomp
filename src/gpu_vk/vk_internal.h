@@ -94,5 +94,7 @@ void  vk_store_fence(void);
  * w x h) in it -- from then on the window's own CPU frames are not shown. */
 int   vk_present_ready(void);
 int   vk_present_image(VkImage img, uint32_t w, uint32_t h);
+/* The window's swapchain size (0 before the first frame). */
+int   vk_present_extent(uint32_t *w, uint32_t *h);
 
 #endif

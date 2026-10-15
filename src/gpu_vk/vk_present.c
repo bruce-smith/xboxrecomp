@@ -287,6 +287,334 @@ static void *s_mtx;
 static volatile int s_backend_presents;
 static volatile int s_linear;
 
+/* ---------------------------------------------------------------------- */
+/* The menu overlay (P5's xbox_ui_overlay, pulled each present): a
+ * premultiplied BGRA image at the window's size, uploaded when its serial
+ * changes, blended over the whole frame (ONE, ONE_MINUS_SRC_ALPHA) after
+ * scaling and AA, at window resolution. */
+
+typedef int (*UiPull)(const uint32_t **px, int *w, int *h, uint32_t *serial);
+static UiPull s_ui_pull;
+
+/* RECOMP_VK_UI_TEST=1: a fixed translucent panel instead of the menu
+ * (testing the composite with RECOMP_VK_PRESENT_DUMP). */
+static int ui_test(const uint32_t **px, int *w, int *h, uint32_t *serial)
+{
+    static uint32_t *buf;
+    static int bw, bh;
+    int x, y;
+    if (!buf || bw != (int)s.extent.width || bh != (int)s.extent.height) {
+        free(buf);
+        bw = (int)s.extent.width;
+        bh = (int)s.extent.height;
+        buf = (uint32_t *)calloc((size_t)bw * bh, 4);
+        if (!buf)
+            return 0;
+        for (y = bh / 4; y < bh * 3 / 4; y++)
+            for (x = bw / 4; x < bw * 3 / 4; x++)   /* 50% blue, premultiplied */
+                buf[(size_t)y * bw + x] = 0x80000080u;
+    }
+    *px = buf;
+    *w = bw;
+    *h = bh;
+    *serial = (uint32_t)bw * 65536u + (uint32_t)bh;
+    return 1;
+}
+
+static const char k_ui_vs[] =
+"#version 450\n"
+"void main() {\n"
+"    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+"    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n";
+
+static const char k_ui_fs[] =
+"#version 450\n"
+"layout(set=0, binding=0) uniform sampler2D ui;\n"
+"layout(push_constant) uniform P { vec2 size; } pc;\n"
+"layout(location=0) out vec4 o;\n"
+"void main() { o = texture(ui, gl_FragCoord.xy / pc.size); }\n";
+
+static struct {
+    int ready;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkDescriptorPool dpool;
+    VkDescriptorSet set;
+    VkSampler smp;
+    VkPipeline pipe;
+    VkFormat pipe_fmt;
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    int w, h;
+    uint32_t serial;
+    int fresh;                          /* never uploaded */
+    struct { VkBuffer buf; VkDeviceMemory mem; void *map; VkDeviceSize size; } st[VKP_FRAMES];
+} U;
+
+static int ui_init(void)
+{
+    VkDescriptorSetLayoutBinding lb;
+    VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkPushConstantRange pr;
+    VkDescriptorPoolSize ps;
+    VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    VkResult r_;
+
+    if (U.ready)
+        return U.ready > 0;
+    U.ready = -1;
+    memset(&lb, 0, sizeof lb);
+    lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    lb.descriptorCount = 1;
+    lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    dli.bindingCount = 1;
+    dli.pBindings = &lb;
+    pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pr.offset = 0;
+    pr.size = 8;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &U.dsl;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pr;
+    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps.descriptorCount = 1;
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &ps;
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (!VK_OK(vkCreateDescriptorSetLayout(g_vk.device, &dli, NULL, &U.dsl))
+        || !VK_OK(vkCreatePipelineLayout(g_vk.device, &pli, NULL, &U.layout))
+        || !VK_OK(vkCreateDescriptorPool(g_vk.device, &dpi, NULL, &U.dpool))
+        || !VK_OK(vkCreateSampler(g_vk.device, &sci, NULL, &U.smp)))
+        return 0;
+    ai.descriptorPool = U.dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &U.dsl;
+    if (!VK_OK(vkAllocateDescriptorSets(g_vk.device, &ai, &U.set)))
+        return 0;
+    U.ready = 1;
+    return 1;
+}
+
+static VkPipeline ui_pipeline(void)
+{
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vis = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ias = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    VkDynamicState dyn_s[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dyn = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    VkPipelineRenderingCreateInfo pr = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+    VkShaderModule vs, fs;
+    VkResult r_;
+
+    if (U.pipe && U.pipe_fmt == s.fmt)
+        return U.pipe;
+    vs = vk_shader_module(0, k_ui_vs);
+    fs = vk_shader_module(1, k_ui_fs);
+    if (!vs || !fs)
+        return VK_NULL_HANDLE;
+    memset(ss, 0, sizeof ss);
+    ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    ss[0].module = vs;
+    ss[0].pName = "main";
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ss[1].module = fs;
+    ss[1].pName = "main";
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vps.viewportCount = vps.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&cba, 0, sizeof cba);
+    cba.blendEnable = VK_TRUE;              /* premultiplied alpha over the frame */
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = 0xF;
+    cbs.attachmentCount = 1;
+    cbs.pAttachments = &cba;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dyn_s;
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &s.fmt;
+    ci.pNext = &pr;
+    ci.stageCount = 2;
+    ci.pStages = ss;
+    ci.pVertexInputState = &vis;
+    ci.pInputAssemblyState = &ias;
+    ci.pViewportState = &vps;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pColorBlendState = &cbs;
+    ci.pDynamicState = &dyn;
+    ci.layout = U.layout;
+    if (U.pipe) {
+        vkDestroyPipeline(g_vk.device, U.pipe, NULL);
+        U.pipe = VK_NULL_HANDLE;
+    }
+    if (!VK_OK(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &ci, NULL, &U.pipe)))
+        return VK_NULL_HANDLE;
+    U.pipe_fmt = s.fmt;
+    return U.pipe;
+}
+
+/* The overlay's texture at w x h (recreated on a size change; the queue is
+ * idled first, as the old one may still be sampled). */
+static int ui_texture(int w, int h)
+{
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    VkDescriptorImageInfo ii;
+    VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    VkResult r_;
+    if (U.img && U.w == w && U.h == h)
+        return 1;
+    if (U.img) {
+        vk_lock();
+        vkDeviceWaitIdle(g_vk.device);
+        vk_unlock();
+        vkDestroyImageView(g_vk.device, U.view, NULL);
+        vkDestroyImage(g_vk.device, U.img, NULL);
+        vkFreeMemory(g_vk.device, U.mem, NULL);
+        U.img = VK_NULL_HANDLE;
+    }
+    if (!vk_image_create((uint32_t)w, (uint32_t)h, VK_FORMAT_B8G8R8A8_UNORM,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &U.img, &U.mem))
+        return 0;
+    vi.image = U.img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_B8G8R8A8_UNORM;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (!VK_OK(vkCreateImageView(g_vk.device, &vi, NULL, &U.view)))
+        return 0;
+    ii.sampler = U.smp;
+    ii.imageView = U.view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    wr.dstSet = U.set;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &ii;
+    vkUpdateDescriptorSets(g_vk.device, 1, &wr, 0, NULL);
+    U.w = w;
+    U.h = h;
+    U.fresh = 1;
+    return 1;
+}
+
+/* Record the overlay into cb over swapchain image idx (in TRANSFER_DST
+ * layout); returns the layout it leaves the image in. */
+static VkImageLayout ui_layer(VkCommandBuffer cb, uint32_t idx, VkImageLayout cur)
+{
+    static int test = -1;
+    const uint32_t *px;
+    int w, h;
+    uint32_t serial;
+    UiPull pull = s_ui_pull;
+    VkPipeline p;
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkViewport vp;
+    VkRect2D sc;
+    float size[2];
+
+    if (test < 0)
+        test = getenv("RECOMP_VK_UI_TEST") != NULL;
+    if (test)
+        pull = ui_test;
+    if (!pull || !s.view[idx] || !pull(&px, &w, &h, &serial) || !px || w <= 0 || h <= 0)
+        return cur;
+    if (!ui_init() || !ui_texture(w, h) || !(p = ui_pipeline()))
+        return cur;
+    if (U.fresh || serial != U.serial) {
+        VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+        VkBufferImageCopy c;
+        if (U.st[s.fi].size < bytes) {
+            if (U.st[s.fi].buf) {
+                vkDestroyBuffer(g_vk.device, U.st[s.fi].buf, NULL);
+                vkFreeMemory(g_vk.device, U.st[s.fi].mem, NULL);
+            }
+            if (!vk_buffer_create(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  &U.st[s.fi].buf, &U.st[s.fi].mem, &U.st[s.fi].map)) {
+                U.st[s.fi].buf = VK_NULL_HANDLE;
+                U.st[s.fi].size = 0;
+                return cur;
+            }
+            U.st[s.fi].size = bytes;
+        }
+        memcpy(U.st[s.fi].map, px, (size_t)bytes);
+        barrier(cb, U.img, U.fresh ? VK_IMAGE_LAYOUT_UNDEFINED
+                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        memset(&c, 0, sizeof c);
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        c.imageSubresource.layerCount = 1;
+        c.imageExtent.width = (uint32_t)w;
+        c.imageExtent.height = (uint32_t)h;
+        c.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(cb, U.st[s.fi].buf, U.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &c);
+        barrier(cb, U.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        U.serial = serial;
+        U.fresh = 0;
+    }
+    barrier(cb, s.img[idx], cur, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    ca.imageView = s.view[idx];
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.renderArea.extent = s.extent;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, U.layout, 0, 1, &U.set, 0, NULL);
+    size[0] = (float)s.extent.width;
+    size[1] = (float)s.extent.height;
+    vkCmdPushConstants(cb, U.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8, size);
+    vp.x = vp.y = 0.0f;
+    vp.width = size[0];
+    vp.height = size[1];
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent = s.extent;
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
 /* RECOMP_VK_PRESENT_DUMP=<n>: the swapchain image of the nth present, as
  * it goes to the screen (bars and overlay included), written to
  * vkpresent_<n>.bmp next to the exe -- what was presented, independent of
@@ -382,7 +710,7 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
     VkResult r, r_;
     VkCommandBuffer cb;
     VkImage src;
-    VkImageLayout src_layout;
+    VkImageLayout src_layout, cur;
     int dumping;
 
     {
@@ -521,12 +849,25 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
     vkCmdBlitImage(cb, src, src_layout, s.img[idx],
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                    linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    /* The menu overlay (pulled) -- only over the renderer's own image: a CPU
+     * frame from the window already has it composited in -- then the
+     * callback overlay, then present. */
+    cur = px ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+             : ui_layer(cb, idx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (s_overlay && s.view[idx]) {
         XboxVkOverlay o;
-        barrier(cb, s.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        if (cur == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+            barrier(cb, s.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        else
+            barrier(cb, s.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        cur = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         memset(&o, 0, sizeof o);
         o.get_instance_proc_addr = (void *)vkGetInstanceProcAddr;
         o.instance = (void *)g_vk.instance;
@@ -548,15 +889,16 @@ static int present(const uint32_t *px, VkImage img, uint32_t w, uint32_t h, int 
         o.frame_w = dw;
         o.frame_h = dh;
         s_overlay(s_overlay_user, &o);
+    }
+    if (cur == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
         barrier(cb, s.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    } else {
+    else
         barrier(cb, s.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    }
     dumping = dump_record(cb, s.img[idx]);
     vkEndCommandBuffer(cb);
 
@@ -621,6 +963,13 @@ int xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linear
 int vk_present_ready(void)
 {
     return s.ok;
+}
+
+int vk_present_extent(uint32_t *w, uint32_t *h)
+{
+    *w = s.extent.width;
+    *h = s.extent.height;
+    return s.ok && *w && *h;
 }
 
 int vk_present_image(VkImage img, uint32_t w, uint32_t h)

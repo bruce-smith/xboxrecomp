@@ -16,6 +16,9 @@ typedef struct {
     uint8_t  cube[4];                   /* stage samples a cube map */
     uint8_t  bump_in[4];                /* BUMPENVMAP: the input stage */
     uint8_t  bump_signed[4];            /* its G (bit 0) / B (bit 1) signed */
+    /* Supersampling's counting pass (vk_backend.c): the render scale; only
+     * the sub-pixel at each native pixel's centre survives. 0: not one. */
+    uint8_t  count_scale;
 } VkPshKey;
 
 void  vk_psh_key(const Nv2aDrawState *st, VkPshKey *k);

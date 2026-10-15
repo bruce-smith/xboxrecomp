@@ -70,6 +70,22 @@ typedef void (*XboxVkOverlayFn)(void *user, const XboxVkOverlay *o);
 /* Install (or with NULL remove) the overlay. Thread-safe. */
 void xbox_vk_overlay_set(XboxVkOverlayFn fn, void *user);
 
+/* Image-quality settings of the GPU renderer, for an in-game menu; the
+ * environment gives the start values (RECOMP_VK_SCALE=1|3|5,
+ * RECOMP_VK_AA=fxaa). A change applies at the next flip. Nothing the game
+ * can see changes with them: frames read back into its memory stay at its
+ * own resolution and visibility tests count native pixels, so exact
+ * replays stay exact. Full-resolution output needs Vulkan presentation
+ * (RECOMP_VK_PRESENT=1); with the GDI window the supersampled frame is shown
+ * filtered down to 640x480. */
+typedef struct {
+    uint32_t render_scale;      /* 1 (native, default), 3 or 5; even -> next odd */
+    uint32_t post_aa;           /* 0 off (default), 1 FXAA */
+} XboxVkSettings;
+
+void xbox_vk_settings_get(XboxVkSettings *s);
+void xbox_vk_settings_set(const XboxVkSettings *s);
+
 #ifdef __cplusplus
 }
 #endif

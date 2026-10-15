@@ -192,6 +192,13 @@ char *vk_psh_glsl(const VkPshKey *k)
             "    return texture(t, u.tsz[st].z != 0.0 ? uv : uv * u.tsz[st].xy);\n"
             "}\n");
     put(&s, "void main() {\n    vec4 c;\n");
+    /* Counting pass of a supersampled visibility test: at an odd render
+     * scale S the middle sub-pixel, (S - 1) / 2 of each S x S block, has
+     * its centre on the native pixel centre, so the query counts exactly
+     * the native pixels. */
+    if (k->count_scale > 1)
+        put(&s, "    if (any(notEqual(ivec2(gl_FragCoord.xy) %% %d, ivec2(%d)))) discard;\n",
+            k->count_scale, (k->count_scale - 1) / 2);
 
     if (!k->rc_seen) {
         /* No combiners programmed: the software path's "stage 0 texel x
