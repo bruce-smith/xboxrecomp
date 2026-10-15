@@ -26,8 +26,17 @@
 #include <strings.h>
 #include <unistd.h>
 #include <SDL.h>
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+#include "xbox_vk.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* RECOMP_VK_PRESENT=1: frames reach the screen through a Vulkan swapchain on
+ * this window (src/gpu_vk) instead of the SDL renderer -- which lets the GPU
+ * renderer present its own frame at its own resolution. Anything that fails
+ * leaves the SDL renderer in charge, as GDI on Windows. */
+static int s_vk;
 
 static volatile int  s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -305,24 +314,49 @@ static int fb_thread(void *unused)
                     && (int)(s_fb_height * (uint32_t)k) <= wa.h)
                     break;
     }
-    win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                           (int)(s_fb_width * (uint32_t)k), (int)(s_fb_height * (uint32_t)k),
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN
-                           | (start_fullscreen() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
-    /* No vsync: the loop paces itself every 16 ms, as the GDI window does. */
-    ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : NULL;
-    if (!ren && win)
-        ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                                  SDL_TEXTUREACCESS_STREAMING,
-                                  (int)s_fb_width, (int)s_fb_height) : NULL;
-    if (!tex) {
+    {
+        Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN
+                     | (start_fullscreen() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        int w = (int)(s_fb_width * (uint32_t)k), h = (int)(s_fb_height * (uint32_t)k);
+        win = NULL;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        if (getenv("RECOMP_VK_PRESENT")) {
+            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_UNDEFINED,
+                                   SDL_WINDOWPOS_UNDEFINED, w, h,
+                                   flags | SDL_WINDOW_VULKAN);
+            s_vk = win ? xbox_vk_present_init(win) : 0;
+            if (!s_vk) {
+                fprintf(stderr, "  [FBWIN] Vulkan presentation unavailable; using SDL\n");
+                if (win)
+                    SDL_DestroyWindow(win);
+                win = NULL;
+            }
+        }
+#endif
+        if (!win)
+            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_UNDEFINED,
+                                   SDL_WINDOWPOS_UNDEFINED, w, h, flags);
+    }
+    ren = NULL;
+    tex = NULL;
+    if (!s_vk) {
+        /* No vsync: the loop paces itself every 16 ms, as the GDI window does. */
+        ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : NULL;
+        if (!ren && win)
+            ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+        tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                      SDL_TEXTUREACCESS_STREAMING,
+                                      (int)s_fb_width, (int)s_fb_height) : NULL;
+    }
+    if (!win || (!s_vk && !tex)) {
         fprintf(stderr, "  [FBWIN] cannot open the window: %s\n", SDL_GetError());
         s_fb_running = 0;
         return 0;
     }
-    /* Letterboxed at the frame's aspect, black bars around it. */
-    SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
+    /* Letterboxed at the frame's aspect, black bars around it (the Vulkan
+     * path does the same in xbox_vk_present_frame). */
+    if (ren)
+        SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
     SDL_RaiseWindow(win);
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s)\n",
@@ -364,18 +398,27 @@ static int fb_thread(void *unused)
                          s_fb_pitch, s_fb_pitch / s_fb_width);
             have = 1;
         }
-        if (linear != shown_linear) {
-            SDL_SetTextureScaleMode(tex, linear ? SDL_ScaleModeLinear
-                                                : SDL_ScaleModeNearest);
-            shown_linear = linear;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        if (s_vk) {
+            /* Skipped inside while the GPU renderer presents its own frame. */
+            if (have)
+                xbox_vk_present_frame(s_rgb, s_fb_width, s_fb_height, linear);
+        } else
+#endif
+        {
+            if (linear != shown_linear) {
+                SDL_SetTextureScaleMode(tex, linear ? SDL_ScaleModeLinear
+                                                    : SDL_ScaleModeNearest);
+                shown_linear = linear;
+            }
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderClear(ren);
+            if (have) {
+                SDL_UpdateTexture(tex, NULL, s_rgb, (int)s_fb_width * 4);
+                SDL_RenderCopy(ren, tex, NULL, NULL);
+            }
+            SDL_RenderPresent(ren);
         }
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderClear(ren);
-        if (have) {
-            SDL_UpdateTexture(tex, NULL, s_rgb, (int)s_fb_width * 4);
-            SDL_RenderCopy(ren, tex, NULL, NULL);
-        }
-        SDL_RenderPresent(ren);
         {
             const char *dump = getenv("RECOMP_FB_DUMP");
             const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
@@ -403,8 +446,15 @@ static int fb_thread(void *unused)
         }
         SDL_Delay(16);
     }
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        xbox_vk_present_shutdown();
+    s_vk = 0;
+#endif
+    if (tex)
+        SDL_DestroyTexture(tex);
+    if (ren)
+        SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     free(s_rgb);
     s_rgb = NULL;

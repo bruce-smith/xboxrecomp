@@ -1,31 +1,60 @@
 /**
  * The Vulkan backend's platform file for POSIX hosts (Linux, SteamOS):
- * pthreads for the queue lock, the completion thread, its events and
- * mutexes.
+ * the window-system surface through SDL2 (the framebuffer window,
+ * video/fb_present_sdl.c, is an SDL window: X11 or Wayland alike), and
+ * pthreads for the queue lock, the completion thread, its events and mutexes.
  *
- * No window-system surface yet. Rendering is offscreen and its frames reach
- * the screen through the framebuffer window (video/fb_present_sdl.c), which is
- * the default on Windows as well; RECOMP_VK_PRESENT -- the swapchain path --
- * asks for a surface, gets VK_NULL_HANDLE and falls back. An SDL surface
- * (SDL_Vulkan_CreateSurface on the framebuffer window) is the follow-up.
+ * The surface extensions are asked for only when RECOMP_VK_PRESENT is set and
+ * there is a window (not RECOMP_HEADLESS): rendering offscreen needs none,
+ * and a headless machine may have no display to ask SDL about.
  */
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
 #include "vk_internal.h"
+#include <SDL.h>
+#include <SDL_vulkan.h>
 
 const char *const *vk_surface_extensions(void)
 {
-    static const char *const ext[] = { NULL };
+    static const char *ext[16];
+    static int done;
+    unsigned n = 0;
+
+    if (done)
+        return ext;
+    done = 1;
+    if (!getenv("RECOMP_VK_PRESENT") || getenv("RECOMP_HEADLESS"))
+        return ext;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0
+        || SDL_Vulkan_LoadLibrary(NULL) != 0
+        || !SDL_Vulkan_GetInstanceExtensions(NULL, &n, NULL)
+        || n == 0 || n >= sizeof ext / sizeof ext[0]
+        || !SDL_Vulkan_GetInstanceExtensions(NULL, &n, ext)) {
+        fprintf(stderr, "  [VK] no window-system extensions from SDL: %s\n",
+                SDL_GetError());
+        ext[0] = NULL;
+        return ext;
+    }
+    ext[n] = NULL;
     return ext;
 }
 
+/* native_window: the framebuffer window's SDL_Window, made with
+ * SDL_WINDOW_VULKAN. */
 VkSurfaceKHR vk_surface_create(VkInstance inst, void *native_window)
 {
-    (void)inst; (void)native_window;
-    return VK_NULL_HANDLE;
+    VkSurfaceKHR s = VK_NULL_HANDLE;
+    if (!native_window
+        || !SDL_Vulkan_CreateSurface((SDL_Window *)native_window, inst, &s)) {
+        fprintf(stderr, "  [VK] SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+        return VK_NULL_HANDLE;
+    }
+    return s;
 }
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;

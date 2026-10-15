@@ -54,11 +54,16 @@ if(WIN32)
     set_source_files_properties(${xbr_volk_SOURCE_DIR}/volk.c vk_platform_win32.c
         PROPERTIES COMPILE_DEFINITIONS VK_USE_PLATFORM_WIN32_KHR)
 else()
-    # POSIX: pthreads; offscreen only for now (no window-system surface).
+    # POSIX: pthreads, and the window-system surface through SDL2 (its
+    # Vulkan helpers pick xlib/xcb/wayland for the window it made).
     list(APPEND GPU_VK_SOURCES vk_platform_posix.c)
 endif()
 
 add_library(xbox_gpu_vk STATIC ${GPU_VK_SOURCES})
+if(NOT WIN32)
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(xbox_gpu_vk PRIVATE SDL2::SDL2)
+endif()
 target_include_directories(xbox_gpu_vk
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE ${xbr_vulkan_headers_SOURCE_DIR}/include ${xbr_volk_SOURCE_DIR}
