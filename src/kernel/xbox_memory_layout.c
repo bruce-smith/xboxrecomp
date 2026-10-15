@@ -1390,6 +1390,7 @@ static void xbox_Nv2aAckStart(void)
         /* The ack thread is the NV2A agent; the vblank ack has no thread of
          * its own and happens at the guest's yield points (the pump). */
         xbox_SchedAddPump(nv2a_sched_pump);
+        xbox_SchedExpect(XBOX_SCHED_AGENT_NV2A, 0, 0);   /* virtual mode */
         g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                          g_nv2a_memory, 0, NULL);
         fprintf(stderr, "  NV2A acknowledgements: on the guest-CPU schedule\n");

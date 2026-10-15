@@ -169,7 +169,9 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart == 0) {
         /* Zero interval = yield the thread's time slice */
-        int b = xbox_SchedBlockBegin();   /* and the guest CPU, if held */
+        int b;
+        xbox_SchedMarkSpin();
+        b = xbox_SchedBlockBegin();       /* and the guest CPU, if held */
         SwitchToThread();
         xbox_SchedBlockEnd(b);
         return STATUS_SUCCESS;
@@ -300,7 +302,9 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode)
 
 NTSTATUS __stdcall xbox_NtYieldExecution(void)
 {
-    int b = xbox_SchedBlockBegin();       /* the guest CPU too, if held */
+    int b;
+    xbox_SchedMarkSpin();
+    b = xbox_SchedBlockBegin();           /* the guest CPU too, if held */
     SwitchToThread();
     xbox_SchedBlockEnd(b);
     return STATUS_SUCCESS;
@@ -362,7 +366,7 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
     if (GetThreadId(ThreadHandle) == GetCurrentThreadId())
         prev = xbox_SchedSuspendSelf(ThreadHandle);
     else
-        prev = SuspendThread(ThreadHandle);
+        prev = xbox_SchedSuspendOther(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());

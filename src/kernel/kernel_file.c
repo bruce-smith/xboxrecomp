@@ -561,7 +561,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             }
             /* The host disk's free space: it moves with whatever else writes
              * to the disk, so under a guest-CPU schedule it is recorded. */
-            if (xbox_SchedMode()) {
+            if (xbox_SchedVirtual()) {       /* the same everywhere */
+                info->TotalAllocationUnits.QuadPart = 1048576;
+                info->AvailableAllocationUnits.QuadPart = 524288;
+            } else if (xbox_SchedMode()) {
                 info->TotalAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
                     XBOX_SCHED_DISKSPACE, (uint64_t)info->TotalAllocationUnits.QuadPart);
                 info->AvailableAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(

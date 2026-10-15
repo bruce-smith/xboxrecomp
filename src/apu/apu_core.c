@@ -118,6 +118,11 @@ extern int      xbox_SchedBlockBegin(void);
 extern void     xbox_SchedBlockEnd(int released);
 extern int      xbox_SchedReplaying(void);
 extern uint64_t xbox_SchedValue(int kind, uint64_t live);
+extern int      xbox_SchedVirtual(void);
+extern uint64_t xbox_SchedVirtualNs(void);
+extern void     xbox_SchedVirtualPause(uint64_t ns);
+extern void     xbox_SchedExpect(int agent, int suspended, unsigned long tid);
+extern void     xbox_SchedQpcHost(LARGE_INTEGER *q);
 #define APU_SCHED_AGENT 3      /* XBOX_SCHED_AGENT_APU */
 #define APU_SCHED_KIND  15     /* XBOX_SCHED_APU */
 
@@ -268,7 +273,8 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        r = xbox_SchedVirtual() ? xbox_SchedVirtualNs() / 100
+                                : (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
         r = xbox_SchedValue(APU_SCHED_KIND, r);   /* host time: recorded */
         break;
     default:
@@ -539,7 +545,9 @@ static void monitor_submit_xa2(MCPXAPUState *d, int samples)
     qemu_mutex_unlock(&d->lock);
     sched_b = xbox_SchedBlockBegin();
     qemu_mutex_lock(&d->lock);
-    while (xa2_queued_buffers() >= xa2_max_queued_buffers()) {
+    /* Virtual mode paces the APU by virtual time; the sound card does not
+     * hold it back (a full queue drops the period). */
+    while (!xbox_SchedVirtual() && xa2_queued_buffers() >= xa2_max_queued_buffers()) {
         if (++waited > 200) {
             if (g_mon_xa2_paced)
                 fprintf(stderr, "[APU] XAudio2 queue not draining; pacing on"
@@ -826,7 +834,19 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
-            qemu_cond_wait(&d->cond, &d->lock);
+            if (xbox_SchedVirtual()) {
+                /* Virtual mode: an idle APU stays in the rotation (a host
+                 * wait would hold the token up), looking every 1 ms of
+                 * virtual time for the title's start. */
+                int t;
+                qemu_mutex_unlock(&d->lock);
+                xbox_SchedVirtualPause(1000000ull);
+                t = xbox_SchedEnter();
+                xbox_SchedLeave(t);
+                qemu_mutex_lock(&d->lock);
+            } else {
+                qemu_cond_wait(&d->cond, &d->lock);
+            }
             d->is_idle = false;
             continue;
         }
@@ -836,6 +856,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         if (!xbox_SchedReplaying())     /* a replay: the schedule paces it */
             throttle(d);
+        else
+            xbox_SchedVirtualPause(666667ull);  /* virtual: 32 samples at 48 kHz */
 
         qemu_mutex_unlock(&d->lock);
         turn = xbox_SchedEnter();
@@ -894,7 +916,7 @@ static void *mcpx_apu_frame_thread(void *arg)
 #define TRAP_HOLD_MS 40.0
                 LARGE_INTEGER now;
                 double held;
-                QueryPerformanceCounter(&now);
+                xbox_SchedQpcHost(&now);       /* virtual in virtual mode */
                 if (!trap_t0.QuadPart)
                     trap_t0 = now;
                 held = (now.QuadPart - trap_t0.QuadPart) * 1000.0 / qpf.QuadPart;
@@ -1089,6 +1111,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     /* Start background frame thread */
+    xbox_SchedExpect(APU_SCHED_AGENT, 0, 0);    /* virtual mode's rotation */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);

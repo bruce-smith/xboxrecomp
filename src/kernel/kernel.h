@@ -852,6 +852,14 @@ void     xbox_SchedClose(void);                 /* last run + flush, at exit */
 DWORD    xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
                           DWORD ms, DWORD timeout_code);
 void     xbox_SchedEnterCS(CRITICAL_SECTION *cs);
+int      xbox_SchedVirtual(void);              /* mode 3, RECOMP_SCHED_VIRTUAL */
+uint64_t xbox_SchedVirtualNs(void);
+void     xbox_SchedVirtualPause(uint64_t ns);
+void     xbox_SchedMarkSpin(void);              /* the next let-go is a spin's yield */
+void     xbox_SchedExpect(int agent, int suspended, DWORD tid);
+void     xbox_SchedQpcHost(LARGE_INTEGER *q);   /* virtual in mode 3 */
+uint64_t xbox_SchedTickMs64(void);
+DWORD    xbox_SchedSuspendOther(HANDLE h);
 int      xbox_SchedTakeLock(int (*try_take)(void *ctx), void (*wait_free)(void *ctx),
                             void *ctx);
 DWORD    xbox_SchedSleep(DWORD ms, BOOL alertable);

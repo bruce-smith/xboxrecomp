@@ -1500,7 +1500,9 @@ void xbox_OhciInit(void)
     fflush(stderr);
 
     {
-        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+        HANDLE th;
+        xbox_SchedExpect(XBOX_SCHED_AGENT_OHCI, 0, 0);   /* virtual mode */
+        th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }

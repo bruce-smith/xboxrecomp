@@ -74,7 +74,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define SCHED_AGENTS     256
 #define SCHED_KINDS      16
 
-static int s_mode = -1;                 /* 0 off, 1 record, 2 replay */
+static int s_mode = -1;                 /* 0 off, 1 record, 2 replay, 3 virtual */
 /* 2: every wait's outcome is recorded, not only a finite one's. */
 #define SCHED_FILE_VER 2
 static uint32_t s_file_ver = SCHED_FILE_VER;
@@ -115,6 +115,53 @@ typedef struct { uint64_t *n; uint32_t count, i; } SchedPreempts;
 static SchedPreempts s_pre[SCHED_AGENTS];      /* replay: loop counts to yield at */
 static void sched_arm_loop_check(void);
 static uint64_t sched_value(int kind, uint64_t live, int released);
+
+/* --- mode 3: deterministic without a recording (RECOMP_SCHED_VIRTUAL=1) ---
+ *
+ * The same one guest CPU, but nothing decided by the host: no recording to
+ * follow and none made, and still the same run every time from the same
+ * input. That is what lockstep multiplayer needs, and a replay that needs no
+ * schedule file.
+ *
+ * - The CPU is a token passed round-robin among the agents in agent-id
+ *   order. An agent joins the rotation when it is created (in its creator's
+ *   turn, or during the single-threaded start-up), leaves when it ends, and is
+ *   skipped while suspended -- suspension is the scheduler's own count here,
+ *   not a host SuspendThread.
+ * - A let-go names what the agent waits for (t_vw): nothing (a yield), a
+ *   virtual deadline (a sleep, a device model's period), a condition tried
+ *   while holding the token (an object a wait can take, a free lock, a
+ *   serviced notify), or both. When the token reaches an agent whose
+ *   condition does not hold, it passes it straight on. Objects are only ever
+ *   taken in their waiter's turn, so no host thread's timing decides who gets
+ *   one.
+ * - Time is virtual (s_vt, ns): each turn adds its work (loop iterations,
+ *   g_loop_n, and a fixed cost); a whole round of agents that all passed jumps
+ *   it to the earliest deadline. Every clock the guest reads derives from it.
+ *   The host only paces: it sleeps while virtual time is ahead of the wall
+ *   clock (RECOMP_SCHED_VIRTUAL_FAST=1: not at all, for tests).
+ * - Loop heads preempt every SCHED_LOOP_INTERVAL iterations, always. */
+typedef struct {
+    int (*fn)(void *ctx);       /* tried holding the token; may take the object */
+    void *ctx;
+    uint64_t deadline;          /* virtual ns, 0 none */
+    int hit, timed_out;
+    int spin;                   /* a yield in a spin: runs, but counts as idle */
+} SchedVWait;
+static volatile uint64_t s_vt;
+static volatile LONG s_tok = XBOX_SCHED_AGENT_MAIN;
+static volatile LONG s_alive[SCHED_AGENTS], s_susp[SCHED_AGENTS];
+static volatile uint64_t s_dl[SCHED_AGENTS];
+static HANDLE s_tev[SCHED_AGENTS];
+static int s_idle_run;
+static LARGE_INTEGER s_wall0;
+static int s_vfast;
+static RECOMP_TLS SchedVWait t_vw;
+static RECOMP_TLS uint64_t t_loop0;
+static RECOMP_TLS uint64_t t_vt_left;    /* virtual time at this agent's last let-go */
+#define VT_LOOP_NS 10ull
+#define VT_TURN_NS 1000ull
+#define VT_BASE_FILETIME 134116992000000000ull   /* 2026-01-01 00:00 UTC */
 static int s_sites;                     /* RECOMP_SCHED_SITES, see sched_value */
 static volatile LONG s_site_reports;
 static void sched_preempt_load(int agent, uint64_t n);
@@ -192,8 +239,11 @@ static void sched_atexit(void)
 
 /* Write the run in progress and flush: on every way out of the process
  * (atexit, the window's close, the watchdog). */
+void xbox_SchedVtraceFlush(void);
+
 void xbox_SchedClose(void)
 {
+    xbox_SchedVtraceFlush();
     if (s_mode == 1 && s_out) {
         sched_emit_run();
         s_run = 0;
@@ -313,9 +363,16 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
     {
         const char *r = getenv("RECOMP_SCHED_RECORD");
         const char *p = getenv("RECOMP_SCHED_REPLAY");
+        const char *v = getenv("RECOMP_SCHED_VIRTUAL");
         int mode = 0;
         QueryPerformanceFrequency(&s_qpf);
-        if (p && *p) {
+        if (v && *v && *v != '0' && !(p && *p) && !(r && *r)) {
+            QueryPerformanceCounter(&s_wall0);
+            s_vfast = getenv("RECOMP_SCHED_VIRTUAL_FAST") != NULL;
+            mode = 3;
+            fprintf(stderr, "  [SCHED] virtual mode: deterministic guest CPU and "
+                    "clocks, no recording%s\n", s_vfast ? " (unpaced)" : "");
+        } else if (p && *p) {
             mode = sched_load(p) ? 2 : 0;
         } else if (r && *r) {
             s_out = fopen(r, "wb");
@@ -339,9 +396,85 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
     return TRUE;
 }
 
+/* The schedule paces the device models (no host sleeps between their turns):
+ * a replay, and virtual mode. */
 int xbox_SchedReplaying(void)
 {
-    return xbox_SchedMode() == 2;
+    int m = xbox_SchedMode();
+    return m == 2 || m == 3;
+}
+
+int xbox_SchedVirtual(void)
+{
+    return xbox_SchedMode() == 3;
+}
+
+uint64_t xbox_SchedVirtualNs(void)
+{
+    return s_vt;
+}
+
+static HANDLE sched_tev(int agent)
+{
+    if (!s_tev[agent]) {
+        HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (InterlockedCompareExchangePointer((PVOID *)&s_tev[agent], e, NULL))
+            CloseHandle(e);
+    }
+    return s_tev[agent];
+}
+
+/* The host's performance counter and tick count -- or, in virtual mode, the
+ * same in virtual time: what device models decide by (the vblank's cadence,
+ * a timer's due time, the APU's hold). */
+void xbox_SchedQpcHost(LARGE_INTEGER *q)
+{
+    if (xbox_SchedMode() == 3) {
+        uint64_t t = s_vt, hz = (uint64_t)s_qpf.QuadPart;
+        q->QuadPart = (LONGLONG)((t / 1000000000ull) * hz
+                                 + (t % 1000000000ull) * hz / 1000000000ull);
+        return;
+    }
+    QueryPerformanceCounter(q);
+}
+
+uint64_t xbox_SchedTickMs64(void)
+{
+    if (xbox_SchedMode() == 3)
+        return 1000ull + s_vt / 1000000ull;
+    return GetTickCount64();
+}
+
+/* Virtual mode: an agent joins the rotation. Called by whatever creates it,
+ * at a point every run reaches in the same order (a guest turn, or start-up
+ * before the guest runs); tid if known, for resumes and suspends by handle. */
+void xbox_SchedExpect(int agent, int suspended, DWORD tid)
+{
+    if (xbox_SchedMode() != 3 || agent <= 0 || agent >= SCHED_AGENTS)
+        return;
+    sched_tev(agent);
+    if (tid)
+        s_agent_tid[agent] = tid;
+    s_susp[agent] = suspended ? 1 : 0;
+    InterlockedExchange(&s_alive[agent], 1);
+}
+
+/* Virtual mode: the next turn of this agent comes ns of virtual time from
+ * now (a device model's period). A no-op otherwise. */
+/* Virtual mode: the coming let-go is a spin's yield (see sched_acquire3). */
+void xbox_SchedMarkSpin(void)
+{
+    if (s_mode == 3)
+        t_vw.spin = 1;
+}
+
+void xbox_SchedVirtualPause(uint64_t ns)
+{
+    /* From the agent's own last turn, not from whatever the clock reads now:
+     * a device model calls this between its turns, while another agent is
+     * moving the clock, and how far it has got is host timing. */
+    if (xbox_SchedMode() == 3)
+        t_vw.deadline = (t_held ? s_vt : t_vt_left) + ns;
 }
 
 void xbox_SchedBind(int agent)
@@ -349,6 +482,8 @@ void xbox_SchedBind(int agent)
     t_agent = agent;
     if (agent > 0 && agent < SCHED_AGENTS)
         s_agent_tid[agent] = GetCurrentThreadId();
+    if (agent == XBOX_SCHED_AGENT_MAIN)
+        xbox_SchedExpect(agent, 0, 0);
 }
 
 int xbox_SchedAgent(void)
@@ -512,8 +647,195 @@ static int sched_my_turn(void)
     return s_mode == 2 && s_turn == t_agent && !s_busy;
 }
 
+/* --- mode 3: the token ------------------------------------------------- */
+
+static int sched_vw_met(void)
+{
+    if (t_vw.fn) {
+        if (t_vw.fn(t_vw.ctx)) {
+            t_vw.hit = 1;
+            return 1;
+        }
+        if (t_vw.deadline && s_vt >= t_vw.deadline) {
+            t_vw.timed_out = 1;
+            return 1;
+        }
+        return 0;
+    }
+    return !t_vw.deadline || s_vt >= t_vw.deadline;
+}
+
+static int sched_next_agent(int me)
+{
+    int i;
+    for (i = 1; i <= SCHED_AGENTS; i++) {
+        int a = (me + i) % SCHED_AGENTS;
+        if (a && s_alive[a] && !s_susp[a])
+            return a;
+    }
+    return me;
+}
+
+static void sched_pass_token(int me)
+{
+    int n = sched_next_agent(me);
+    InterlockedExchange(&s_tok, n);
+    SetEvent(sched_tev(n));
+}
+
+static int sched_runnable_count(void)
+{
+    int a, n = 0;
+    for (a = 1; a < SCHED_AGENTS; a++)
+        if (s_alive[a] && !s_susp[a])
+            n++;
+    return n;
+}
+
+/* Every agent passed: nothing can happen before the earliest deadline, so
+ * virtual time goes there -- and, paced, the host waits for the wall clock to
+ * catch up, which is what makes the game run at its own speed. */
+static void sched_vt_idle_advance(void)
+{
+    uint64_t m = ~0ull;
+    int a;
+    for (a = 1; a < SCHED_AGENTS; a++)
+        if (s_alive[a] && !s_susp[a] && s_dl[a] > s_vt && s_dl[a] < m)
+            m = s_dl[a];
+    if (m == ~0ull) {
+        static volatile LONG warned;
+        if (InterlockedIncrement(&warned) <= 3) {
+            fprintf(stderr, "  [SCHED] virtual: every agent waits with no deadline "
+                    "(deadlock?); time moves on 1 ms\n");
+            fflush(stderr);
+        }
+        m = s_vt + 1000000ull;
+    }
+    s_vt = m;
+    if (!s_vfast) {
+        LARGE_INTEGER now;
+        uint64_t wall;
+        QueryPerformanceCounter(&now);
+        wall = (uint64_t)((now.QuadPart - s_wall0.QuadPart) * 1000000000.0
+                          / (double)s_qpf.QuadPart);
+        if (s_vt > wall + 1000000ull)
+            Sleep((DWORD)((s_vt - wall) / 1000000ull));
+    }
+}
+
+extern RECOMP_TLS uint64_t g_loop_n;      /* the loop heads, below */
+
+/* RECOMP_SCHED_VTRACE=<file> (virtual mode, a debugging aid): every token
+ * taken and every clock value handed out, as 24-byte records -- u8 type
+ * (1 turn, 2 value), u8 agent, u16 kind, u32 guest [esp], u64 virtual time
+ * or value, u64 loop count -- so two runs compared record by record
+ * (scratch vtcmp.py) show where the first one went another way. */
+static FILE *s_vtrace;
+static int s_vtrace_on = -1;
+static CRITICAL_SECTION s_vtrace_cs;
+
+static void sched_vtrace(int type, int agent, int kind, uint64_t a, uint64_t b)
+{
+    struct { uint8_t t, ag; uint16_t k; uint32_t site; uint64_t a, b; } r;
+    if (s_vtrace_on < 0) {
+        const char *e = getenv("RECOMP_SCHED_VTRACE");
+        InitializeCriticalSection(&s_vtrace_cs);
+        s_vtrace = e && *e ? fopen(e, "wb") : NULL;
+        if (s_vtrace)
+            setvbuf(s_vtrace, NULL, _IOFBF, 1 << 22);
+        s_vtrace_on = s_vtrace != NULL;
+    }
+    if (!s_vtrace_on)
+        return;
+    r.t = (uint8_t)type;
+    r.ag = (uint8_t)agent;
+    r.k = (uint16_t)kind;
+    r.site = g_esp && g_esp < 0x08000000u ? *(uint32_t *)(g_xbox_mem_offset + g_esp) : 0;
+    r.a = a;
+    r.b = b;
+    EnterCriticalSection(&s_vtrace_cs);
+    fwrite(&r, sizeof r, 1, s_vtrace);
+    {
+        static unsigned n;
+        if (!(++n & 0xFFFF))
+            fflush(s_vtrace);           /* runs are often killed */
+    }
+    LeaveCriticalSection(&s_vtrace_cs);
+}
+
+void xbox_SchedVtraceFlush(void)
+{
+    if (s_vtrace_on > 0) {
+        EnterCriticalSection(&s_vtrace_cs);
+        fflush(s_vtrace);
+        LeaveCriticalSection(&s_vtrace_cs);
+    }
+}
+
+static void sched_acquire3(void)
+{
+    int me = t_agent;
+    HANDLE ev = sched_tev(me);
+    for (;;) {
+        DWORD t0 = GetTickCount();
+        int warned = 0;
+        while (s_tok != me) {
+            WaitForSingleObject(ev, 1000);
+            if (!warned && s_tok != me && GetTickCount() - t0 > 10000) {
+                int h = s_tok;
+                warned = 1;
+                fprintf(stderr, "  [SCHED] virtual: agent %d waited 10 s for the "
+                        "token; agent %d has it%s\n", me, h,
+                        h > 0 && h < SCHED_AGENTS && s_alive[h] ? "" : " (not alive)");
+                if (h > 0 && h < SCHED_AGENTS && s_where[h])
+                    sched_stuck(GetTickCount() - t0);
+                fflush(stderr);
+            }
+        }
+        t_held = 1;                         /* the condition may take an object */
+        if (sched_vw_met()) {
+            /* A spinner (a yield point, a zero sleep, a plain yield) runs
+             * its next look at the flag, but makes no progress of its own:
+             * a round of spinners and passers moves the clock on, or a
+             * thread spinning on the vblank would hold time still. */
+            if (t_vw.spin) {
+                t_vw.spin = 0;
+                if (++s_idle_run >= sched_runnable_count()) {
+                    sched_vt_idle_advance();
+                    s_idle_run = 0;
+                }
+            } else {
+                s_idle_run = 0;
+            }
+            t_loop0 = g_loop_n;
+            s_holder = me;
+            sched_vtrace(1, me, 0, s_vt, g_loop_n);
+            return;                         /* the caller keeps t_held */
+        }
+        t_held = 0;
+        s_dl[me] = t_vw.deadline ? t_vw.deadline : ~0ull;
+        if (++s_idle_run >= sched_runnable_count()) {
+            sched_vt_idle_advance();
+            s_idle_run = 0;
+        }
+        sched_pass_token(me);
+    }
+}
+
+static void sched_release3(void)
+{
+    s_vt += (g_loop_n - t_loop0) * VT_LOOP_NS + VT_TURN_NS;
+    t_vt_left = s_vt;
+    s_holder = 0;
+    sched_pass_token(t_agent);
+}
+
 static void sched_acquire(void)
 {
+    if (s_mode == 3) {
+        sched_acquire3();
+        return;
+    }
     if (s_mode == 1) {
         LONG t = InterlockedIncrement(&s_ticket_next) - 1;
         DWORD t0 = 0;
@@ -586,6 +908,10 @@ static void sched_acquire(void)
 
 static void sched_release(void)
 {
+    if (s_mode == 3) {
+        sched_release3();
+        return;
+    }
     if (s_mode == 1) {
         s_holder = 0;
         InterlockedIncrement(&s_ticket_serving);
@@ -634,7 +960,7 @@ static void sched_turn_pages(void)
     }
     if (s_sites < 0)
         s_sites = getenv("RECOMP_SCHED_SITES") != NULL;
-    if (!n || !s_sites || !t_agent || t_agent >= SCHED_AGENTS)
+    if (!n || !s_sites || !t_agent || t_agent >= SCHED_AGENTS || s_mode == 3)
         return;
     for (i = 0; i < n; i++) {
         const uint32_t *p = (const uint32_t *)(g_xbox_mem_offset + va[i]);
@@ -672,6 +998,8 @@ int xbox_SchedEnter(void)
     t_held = 1;
     sched_arm_loop_check();
     sched_turn_pages();
+    if (s_mode == 3)
+        memset(&t_vw, 0, sizeof t_vw);  /* a device model's pause is spent */
     return 1;
 }
 
@@ -689,7 +1017,7 @@ int xbox_SchedBlockBegin(void)
         return 0;
     if (s_sites < 0)
         s_sites = getenv("RECOMP_SCHED_SITES") != NULL;
-    if (s_sites > 0 && t_agent > 0 && t_agent < SCHED_AGENTS) {
+    if (s_sites > 0 && t_agent > 0 && t_agent < SCHED_AGENTS && s_mode != 3) {
         /* RECOMP_SCHED_SITES: which host code let go, so a replay that does
          * not let go here (or does elsewhere) names it. */
         uint64_t tag = SCHED_LETGO_TAG | (uint64_t)(uint32_t)
@@ -769,6 +1097,7 @@ void xbox_SchedYield(uint32_t va)
         return;
     for (i = 0; i < s_npumps; i++)
         s_pumps[i]();
+    xbox_SchedMarkSpin();
     b = xbox_SchedBlockBegin();
     xbox_SchedBlockEnd(b);
 }
@@ -778,7 +1107,10 @@ void xbox_SchedYield(uint32_t va)
  * period at each of them: the agent goes straight to waiting for its turn. */
 void xbox_SchedHostPause(DWORD ms)
 {
-    if (xbox_SchedMode() != 2)
+    int m = xbox_SchedMode();
+    if (m == 3)
+        xbox_SchedVirtualPause((uint64_t)ms * 1000000ull);
+    else if (m != 2)
         Sleep(ms);
 }
 
@@ -814,11 +1146,45 @@ uint64_t xbox_SchedValue(int kind, uint64_t live)
     return sched_value(kind, live, 0);
 }
 
+/* Virtual mode: every clock from virtual time, in the units the live value
+ * has; decisions (vblank, timers firing, the APU's hold) are made from the
+ * virtual clocks at their sites, so their live value already is virtual. */
+static uint64_t sched_value_virtual2(int kind, uint64_t live);
+
+static uint64_t sched_value_virtual(int kind, uint64_t live)
+{
+    uint64_t v = sched_value_virtual2(kind, live);
+    sched_vtrace(2, t_agent, kind, v, g_loop_n);
+    return v;
+}
+
+static uint64_t sched_value_virtual2(int kind, uint64_t live)
+{
+    uint64_t t = s_vt;
+    switch (kind) {
+    case XBOX_SCHED_QPC: {
+        LARGE_INTEGER f = xbox_KeQueryPerformanceFrequency();
+        uint64_t hz = (uint64_t)f.QuadPart;
+        return (t / 1000000000ull) * hz + (t % 1000000000ull) * hz / 1000000000ull;
+    }
+    case XBOX_SCHED_SYSTIME:  return VT_BASE_FILETIME + t / 100;
+    case XBOX_SCHED_INTTIME:  return t / 100;
+    case XBOX_SCHED_RDTSC:    return (t / 1000ull) * 733333ull
+                                     + (t % 1000ull) * 733333ull / 1000ull;
+    case XBOX_SCHED_TICK:     return 1000ull + t / 1000000ull;
+    case XBOX_SCHED_PAD:      return 0;          /* no host input: unchanged */
+    case XBOX_SCHED_FILETIME: return VT_BASE_FILETIME;
+    }
+    return live;
+}
+
 static uint64_t sched_value(int kind, uint64_t live, int released)
 {
     int a = t_agent;
     if (!xbox_SchedMode())
         return live;
+    if (s_mode == 3)
+        return sched_value_virtual(kind, live);
     if (!a || a >= SCHED_AGENTS || kind >= SCHED_KINDS || (!t_held && !released)) {
         /* A host value nobody records: if guest code asked for it, a replay
          * sees another one. Named, a few times, so the gap can be found. */
@@ -908,6 +1274,14 @@ static uint64_t sched_value(int kind, uint64_t live, int released)
  * without waiting, anything else waits for as long as it takes. try_wait(ctx,
  * ms) does the wait and returns its result; timeout_code is what it returns
  * on a timeout. */
+/* Virtual mode: one try of a wait's object (struct in xbox_SchedWaitFn). */
+static int sched_vw_try_wait(void *p)
+{
+    struct { DWORD (*tw)(void *, DWORD); void *ctx; DWORD to, r; } *w = p;
+    w->r = w->tw(w->ctx, 0);
+    return w->r != w->to;
+}
+
 DWORD xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
                        DWORD ms, DWORD timeout_code)
 {
@@ -919,6 +1293,21 @@ DWORD xbox_SchedWaitFn(DWORD (*try_wait)(void *ctx, DWORD ms), void *ctx,
     r = try_wait(ctx, 0);
     if (r != timeout_code || ms == 0)
         return r;
+    if (s_mode == 3) {
+        /* Tried at each of this agent's turns, holding the token; the
+         * object is taken there or the virtual deadline passes. */
+        struct { DWORD (*tw)(void *, DWORD); void *ctx; DWORD to, r; } w;
+        w.tw = try_wait; w.ctx = ctx; w.to = timeout_code; w.r = timeout_code;
+        memset(&t_vw, 0, sizeof t_vw);
+        t_vw.fn = sched_vw_try_wait;
+        t_vw.ctx = &w;
+        t_vw.deadline = ms == INFINITE ? 0 : s_vt + (uint64_t)ms * 1000000ull;
+        b = xbox_SchedBlockBegin();
+        xbox_SchedBlockEnd(b);
+        r = t_vw.hit ? w.r : timeout_code;
+        memset(&t_vw, 0, sizeof t_vw);
+        return r;
+    }
     b = xbox_SchedBlockBegin();
     if (s_mode == 2) {
         /* The object is taken by the host wait, as in the recording: taking
@@ -977,6 +1366,16 @@ int xbox_SchedTakeLock(int (*try_take)(void *ctx), void (*wait_free)(void *ctx),
 {
     if (try_take(ctx))
         return 1;
+    if (t_held && s_mode == 3) {
+        int b;
+        memset(&t_vw, 0, sizeof t_vw);
+        t_vw.fn = try_take;
+        t_vw.ctx = ctx;
+        b = xbox_SchedBlockBegin();
+        xbox_SchedBlockEnd(b);
+        memset(&t_vw, 0, sizeof t_vw);
+        return 1;
+    }
     if (!t_held) {
         do
             wait_free(ctx);
@@ -1058,6 +1457,15 @@ DWORD xbox_SchedSleep(DWORD ms, BOOL alertable)
     int b;
     if (!t_held)
         return SleepEx(ms, alertable);
+    if (s_mode == 3) {
+        memset(&t_vw, 0, sizeof t_vw);
+        t_vw.deadline = ms ? s_vt + (uint64_t)ms * 1000000ull : 0;
+        t_vw.spin = ms == 0;
+        b = xbox_SchedBlockBegin();
+        xbox_SchedBlockEnd(b);
+        memset(&t_vw, 0, sizeof t_vw);
+        return 0;
+    }
     b = xbox_SchedBlockBegin();
     if (s_mode == 2) {
         r = (DWORD)sched_value(XBOX_SCHED_SLEEP, 0, 1);
@@ -1088,6 +1496,12 @@ DWORD xbox_SchedSuspendSelf(HANDLE self)
 
     if (!t_held)
         return SuspendThread(self);
+    if (s_mode == 3) {                      /* the scheduler's own count */
+        prev = (DWORD)InterlockedIncrement(&s_susp[t_agent]) - 1;
+        b = xbox_SchedBlockBegin();
+        xbox_SchedBlockEnd(b);
+        return prev;
+    }
     for (i = 0; i < SCHED_SUSPENDERS && slot < 0; i++)
         if (InterlockedCompareExchange(&s_suspending[i], tid, 0) == 0)
             slot = i;
@@ -1099,11 +1513,41 @@ DWORD xbox_SchedSuspendSelf(HANDLE self)
     return prev;
 }
 
+static int sched_agent_of(HANDLE h)
+{
+    DWORD tid = GetThreadId(h);
+    int a;
+    if (!tid)
+        return 0;
+    for (a = 1; a < SCHED_AGENTS; a++)
+        if (s_alive[a] && s_agent_tid[a] == tid)
+            return a;
+    return 0;
+}
+
+/* Virtual mode: another agent suspended -- skipped by the token until
+ * resumed. Elsewhere SuspendThread. */
+DWORD xbox_SchedSuspendOther(HANDLE h)
+{
+    int a;
+    if (xbox_SchedMode() == 3 && (a = sched_agent_of(h)))
+        return (DWORD)InterlockedIncrement(&s_susp[a]) - 1;
+    return SuspendThread(h);
+}
+
 DWORD xbox_SchedResume(HANDLE h)
 {
     LONG tid = (LONG)GetThreadId(h);
-    DWORD prev = ResumeThread(h), t0;
+    DWORD prev, t0;
     int i;
+
+    if (xbox_SchedMode() == 3 && (i = sched_agent_of(h))) {
+        prev = (DWORD)s_susp[i];
+        if (prev)
+            InterlockedDecrement(&s_susp[i]);
+        return prev;
+    }
+    prev = ResumeThread(h);
 
     if (prev != 0 || !tid)
         return prev;
@@ -1159,7 +1603,7 @@ RECOMP_TLS uint64_t g_loop_chk = ~0ull;
 
 static void sched_arm_loop_check(void)
 {
-    if (s_mode == 1)
+    if (s_mode == 1 || s_mode == 3)
         g_loop_chk = g_loop_n + SCHED_LOOP_INTERVAL;
     else if (s_mode == 2) {
         SchedPreempts *p = &s_pre[t_agent];
@@ -1189,10 +1633,15 @@ void xbox_SchedLoopCheck(void)
             sched_backtrace();
             fflush(stderr);
         }
-        if (s_mode == 1 || !t_agent)
+        if (s_mode == 1 || s_mode == 3 || !t_agent)
             g_loop_chk = g_loop_n + SCHED_LOOP_INTERVAL;
         else
             g_loop_chk = g_loop_n + 1 > s_pre_next() ? g_loop_n + 1 : s_pre_next();
+        return;
+    }
+    if (s_mode == 3) {                      /* a fixed quantum */
+        xbox_SchedBlockEnd(xbox_SchedBlockBegin());
+        g_loop_chk = g_loop_n + SCHED_LOOP_INTERVAL;
         return;
     }
     if (s_mode == 1) {
@@ -1253,6 +1702,8 @@ void xbox_SchedThreadEnding(DWORD code)
     int i;
     if (!xbox_SchedMode())
         return;
+    if (s_mode == 3 && t_agent > 0 && t_agent < SCHED_AGENTS)
+        InterlockedExchange(&s_alive[t_agent], 0);  /* out of the rotation */
     for (i = 0; i < SCHED_EXITED; i++)
         if (s_exited_tid[i] == 0
             && InterlockedCompareExchange(&s_exited_tid[i], tid, 0) == 0) {
@@ -1291,6 +1742,17 @@ int xbox_SchedWaitUntil(int (*done)(void *ctx), void *ctx, DWORD ms)
         t0 = GetTickCount();
         while (!(ok = done(ctx)) && GetTickCount() - t0 < ms)
             Sleep(0);
+        return ok;
+    }
+    if (s_mode == 3) {
+        memset(&t_vw, 0, sizeof t_vw);
+        t_vw.fn = done;
+        t_vw.ctx = ctx;
+        t_vw.deadline = s_vt + (uint64_t)ms * 1000000ull;
+        b = xbox_SchedBlockBegin();
+        xbox_SchedBlockEnd(b);
+        ok = t_vw.hit;
+        memset(&t_vw, 0, sizeof t_vw);
         return ok;
     }
     b = xbox_SchedBlockBegin();

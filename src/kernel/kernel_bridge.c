@@ -549,8 +549,15 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
      * Blinx 2: its audio init creates three threads suspended and stores each
      * handle only after CreateThread returns, so the audio thread ran early,
      * self-suspended on a handle that was still 0, and spun on the failure. */
-    th = CreateThread(NULL, 0, bridge_thread_main, s,
-                      suspended ? CREATE_SUSPENDED : 0, NULL);
+    {
+        /* Virtual mode keeps suspension in the scheduler: the host thread
+         * runs to its first turn, which the token skips until a resume. */
+        int agent = s->agent, virt = xbox_SchedVirtual();
+        th = CreateThread(NULL, 0, bridge_thread_main, s,
+                          suspended && !virt ? CREATE_SUSPENDED : 0, NULL);
+        if (th && virt)
+            xbox_SchedExpect(agent, suspended, GetThreadId(th));
+    }
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -2530,7 +2537,7 @@ static void kernel_vblank_tick(void)
      * (Blinx 2) ran at half speed. Advancing the deadline by the period keeps
      * the average at 60 even though each wake is a little late; a long stall
      * resynchronises instead of firing a burst. */
-    QueryPerformanceCounter(&now);
+    xbox_SchedQpcHost(&now);              /* virtual time in virtual mode */
     due = now.QuadPart >= next;
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
         if (due)
@@ -2954,7 +2961,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         uint64_t fire_mask = 0;
 
         if (xbox_SchedReplaying())
-            ;                   /* a replay: straight to waiting for its turn */
+            xbox_SchedVirtualPause(1000000ull);  /* replay: nothing; virtual: 1 ms */
         else if (g_timer_wake)
             WaitForSingleObject(g_timer_wake, 10);
         else
@@ -2979,7 +2986,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 kernel_raise_interrupt(NV2A_VECTOR);
         }
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        now = (long long)xbox_SchedTickMs64();
         if (turn) {
             for (i = 0; i < XBOX_MAX_TIMERS; i++) {
                 EnterCriticalSection(&g_timer_lock);
@@ -3036,6 +3043,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
         g_timer_started = 1;
+        xbox_SchedExpect(XBOX_SCHED_AGENT_TIMER, 0, 0);   /* virtual mode */
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
     }
 
@@ -3047,7 +3055,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_ms    = (long long)xbox_SchedTickMs64() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
@@ -7760,7 +7768,7 @@ static void bridge_KeSuspendThread(void)
     if (hThread)
         g_eax = (uint32_t)(GetThreadId(hThread) == GetCurrentThreadId()
                            ? xbox_SchedSuspendSelf(hThread)
-                           : SuspendThread(hThread));
+                           : xbox_SchedSuspendOther(hThread));
     else
         g_eax = 0;
 }
