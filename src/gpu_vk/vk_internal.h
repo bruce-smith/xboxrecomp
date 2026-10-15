@@ -25,6 +25,7 @@ typedef struct {
     int              swapchain;      /* VK_KHR_swapchain enabled */
     int              nan_preserve;   /* shaders may keep NaN/inf exactly */
     volatile int     lost;           /* VK_ERROR_DEVICE_LOST seen */
+    int              wsi;            /* window-system extensions enabled */
 } XboxVk;
 
 extern XboxVk g_vk;

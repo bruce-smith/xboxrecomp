@@ -47,16 +47,21 @@ int vk_instance_init(void)
     vkEnumerateInstanceExtensionProperties(NULL, &have_n, NULL);
     have = (VkExtensionProperties *)calloc(have_n ? have_n : 1, sizeof *have);
     vkEnumerateInstanceExtensionProperties(NULL, &have_n, have);
+    /* The window-system extensions only matter for presenting through
+     * Vulkan: without them the renderer still works (headless, or into the
+     * usual window), so they are asked for only when all are there. */
+    g_vk.wsi = 1;
     for (i = 0; want && want[i]; i++) {
         for (j = 0; j < have_n && strcmp(have[j].extensionName, want[i]); j++)
             ;
         if (j == have_n) {
-            fprintf(stderr, "  [VK] instance extension %s missing\n", want[i]);
-            free(have);
-            return 0;
+            fprintf(stderr, "  [VK] instance extension %s missing: no Vulkan presentation\n",
+                    want[i]);
+            g_vk.wsi = 0;
         }
-        ext[n++] = want[i];
     }
+    for (i = 0; g_vk.wsi && want && want[i]; i++)
+        ext[n++] = want[i];
     free(have);
 
     app.pApplicationName = "xboxrecomp";
@@ -100,6 +105,30 @@ static int pick_queue(VkPhysicalDevice pd, VkSurfaceKHR surface)
     return -1;
 }
 
+/* Why `pd` cannot run the renderer, or NULL: Vulkan 1.3, a graphics queue,
+ * and the features device_init_locked enables. */
+static const char *unsuitable(VkPhysicalDevice pd, const VkPhysicalDeviceProperties *p, int q)
+{
+    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    if (p->apiVersion < VK_API_VERSION_1_3)
+        return "Vulkan 1.3 needed";
+    if (q < 0)
+        return "no usable queue";
+    f2.pNext = &f12;
+    f12.pNext = &f13;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    if (!f2.features.depthClamp || !f2.features.shaderClipDistance
+        || !f2.features.occlusionQueryPrecise)
+        return "lacks depthClamp/shaderClipDistance/occlusionQueryPrecise";
+    if (!f12.hostQueryReset || !f12.timelineSemaphore)
+        return "lacks hostQueryReset/timelineSemaphore";
+    if (!f13.dynamicRendering || !f13.synchronization2)
+        return "lacks dynamicRendering/synchronization2";
+    return NULL;
+}
+
 static int device_init_locked(VkSurfaceKHR surface);
 
 int vk_device_init(VkSurfaceKHR surface)
@@ -137,33 +166,46 @@ static int device_init_locked(VkSurfaceKHR surface)
         fprintf(stderr, "  [VK] no physical devices\n");
         return 0;
     }
+    /* The choice: RECOMP_VK_DEVICE=<index|part of the name> if it names a
+     * suitable device; otherwise a discrete GPU, then an integrated one, then
+     * a virtual one. A CPU implementation (lavapipe, SwiftShader) only when
+     * named: it would be slower than the software renderer. */
     for (i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
-        int q, s;
+        const char *why;
+        int q, s, named = 0;
         vkGetPhysicalDeviceProperties(pds[i], &p);
         q = pick_queue(pds[i], surface);
-        fprintf(stderr, "  [VK] device %u: %s (type %d, API %u.%u)%s\n", i,
-                p.deviceName, (int)p.deviceType, VK_API_VERSION_MAJOR(p.apiVersion),
-                VK_API_VERSION_MINOR(p.apiVersion), q < 0 ? ", no usable queue" : "");
-        if (q < 0 || p.apiVersion < VK_API_VERSION_1_3)
-            continue;
+        why = unsuitable(pds[i], &p, q);
         if (sel) {
             char *end;
             unsigned long k = strtoul(sel, &end, 10);
-            s = (*end == 0) ? (k == i) * 10 : (strstr(p.deviceName, sel) != NULL) * 10;
-        } else {
-            s = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
-              : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+            named = (*end == 0) ? k == i : strstr(p.deviceName, sel) != NULL;
         }
+        fprintf(stderr, "  [VK] device %u: %s (type %d, API %u.%u)%s%s\n", i,
+                p.deviceName, (int)p.deviceType, VK_API_VERSION_MAJOR(p.apiVersion),
+                VK_API_VERSION_MINOR(p.apiVersion), why ? ": " : "", why ? why : "");
+        if (why)
+            continue;
+        s = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 4
+          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3
+          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 2
+          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 0 : 1;
+        if (named)
+            s = 10;
         if (s > score) {
             score = s;
             best = (int)i;
             bestq = q;
         }
     }
-    if (best < 0 || (sel && score < 10)) {
-        fprintf(stderr, "  [VK] no suitable device%s%s\n",
-                sel ? " matching RECOMP_VK_DEVICE=" : "", sel ? sel : "");
+    if (sel && score < 10)
+        fprintf(stderr, "  [VK] no suitable device matches RECOMP_VK_DEVICE=%s;"
+                " choosing automatically\n", sel);
+    if (best < 0 || score <= 0) {
+        fprintf(stderr, "  [VK] no suitable GPU%s\n",
+                best >= 0 ? " (only a CPU implementation; name it in RECOMP_VK_DEVICE"
+                            " to use it anyway)" : "");
         return 0;
     }
     g_vk.phys = pds[best];

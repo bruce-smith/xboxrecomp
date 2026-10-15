@@ -127,7 +127,7 @@ int xbox_vk_present_init(void *native_window)
 
     if (s.ok)
         return 1;
-    if (!vk_instance_init())
+    if (!vk_instance_init() || !g_vk.wsi)
         return 0;
     s.surface = vk_surface_create(g_vk.instance, native_window);
     if (!s.surface || !vk_device_init(s.surface))
