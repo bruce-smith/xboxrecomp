@@ -1381,17 +1381,22 @@ ULONGLONG GetTickCount64(void)
 
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
+/* 10 MHz, 100 ns ticks: what QueryPerformanceFrequency reports on every
+ * current Windows host. The title sees both numbers (KeQueryPerformance-
+ * Counter/Frequency), and a schedule recorded on Windows hands back Windows
+ * counter values: with a 1 GHz frequency here, a replay of one on Linux saw
+ * time pass 100 times too slowly and crawled through its first movie. */
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    count->QuadPart = (LONGLONG)ts.tv_sec * 10000000LL + ts.tv_nsec / 100;
     return TRUE;
 }
 
 BOOL QueryPerformanceFrequency(PLARGE_INTEGER freq)
 {
-    freq->QuadPart = 1000000000LL;   /* QPC is in nanoseconds */
+    freq->QuadPart = 10000000LL;
     return TRUE;
 }
 
