@@ -27,6 +27,8 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <fnmatch.h>
+#include <ctype.h>
+#include <stdlib.h>
 #endif
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
@@ -830,12 +832,13 @@ static void unix_to_filetime(time_t sec, long nsec, LARGE_INTEGER* out)
     out->HighPart = (LONG)(t >> 32);
 }
 
+/* What NTFS reports for the same file, so the title sees the attributes it
+ * sees on Windows: a regular file carries ARCHIVE (0x20), a directory
+ * DIRECTORY, either READONLY when it is not writable. */
 static ULONG mode_to_xbox_attrs(mode_t m)
 {
-    ULONG a = 0;
-    if (S_ISDIR(m))      a |= XBOX_FILE_ATTRIBUTE_DIRECTORY;
+    ULONG a = S_ISDIR(m) ? XBOX_FILE_ATTRIBUTE_DIRECTORY : 0x20u /* ARCHIVE */;
     if (!(m & S_IWUSR))  a |= XBOX_FILE_ATTRIBUTE_READONLY;
-    if (a == 0)          a = XBOX_FILE_ATTRIBUTE_NORMAL;
     return a;
 }
 
@@ -1261,17 +1264,74 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     return STATUS_SUCCESS;
 }
 
-/* Directory enumeration state, keyed by the directory's Nt handle. */
+/* Directory enumeration state, keyed by the directory's Nt handle.
+ *
+ * The whole listing is read, filtered and sorted when a scan starts: NTFS
+ * returns names in order (upper-cased, ordinal), readdir in whatever order
+ * the file system keeps, and the title sees the order -- a guest that takes
+ * the first match, or numbers what it finds, would otherwise behave
+ * differently from Windows, and an exact replay of a Windows recording
+ * would part from it. */
 #define MAX_DIR_CONTEXTS 64
 typedef struct {
     HANDLE handle;
-    DIR*   dir;
-    char   pattern[64];
+    char **names;
+    int    count, next;
+    int    active;
 } DIR_CONTEXT;
+
+static void dir_ctx_clear(DIR_CONTEXT *ctx)
+{
+    int i;
+    for (i = 0; i < ctx->count; i++)
+        free(ctx->names[i]);
+    free(ctx->names);
+    ctx->names = NULL;
+    ctx->count = ctx->next = 0;
+    ctx->active = 0;
+}
+
+static int ntfs_name_cmp(const void *a, const void *b)
+{
+    const unsigned char *x = *(const unsigned char *const *)a;
+    const unsigned char *y = *(const unsigned char *const *)b;
+    for (;; x++, y++) {
+        int cx = toupper(*x), cy = toupper(*y);
+        if (cx != cy || !cx)
+            return cx - cy;
+    }
+}
+
+/* FindFirstFile's wildcards: "*.*" and "*" match every name, a dot-less name
+ * matches "*." -- otherwise ordinary case-insensitive globbing. */
+static int win_wild_match(const char *pattern, const char *name)
+{
+    if (!strcmp(pattern, "*") || !strcmp(pattern, "*.*"))
+        return 1;
+    if (!strcmp(pattern, "*.") )
+        return strchr(name, '.') == NULL;
+    return fnmatch(pattern, name, FNM_CASEFOLD) == 0;
+}
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* The handle is being closed: forget its scan, so a handle that later gets
+ * the same value starts a fresh one. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    int i;
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (i = 0; i < MAX_DIR_CONTEXTS; i++)
+        if (s_dir_contexts[i].handle == FileHandle) {
+            dir_ctx_clear(&s_dir_contexts[i]);
+            s_dir_contexts[i].handle = NULL;
+        }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
@@ -1300,51 +1360,68 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             if (s_dir_contexts[i].handle == NULL) { ctx = &s_dir_contexts[i]; break; }
         if (!ctx) { LeaveCriticalSection(&s_dir_cs); return STATUS_INSUFFICIENT_RESOURCES; }
         ctx->handle = FileHandle;
-        ctx->dir = NULL;
+        ctx->names = NULL;
+        ctx->count = ctx->next = 0;
+        ctx->active = 0;
     }
 
-    if (RestartScan || ctx->dir == NULL) {
-        if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
+    if (RestartScan || !ctx->active) {
+        char pattern[MAX_PATH];
+        DIR *dir;
+        struct dirent *d;
+        int cap = 0;
         const char* dpath = w32_handle_path(FileHandle);
+
+        dir_ctx_clear(ctx);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
-        ctx->dir = opendir(dpath);
-        if (!ctx->dir) {
-            LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
-        }
         if (FileName && FileName->Buffer && FileName->Length > 0) {
             USHORT n = FileName->Length;
-            if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
-            memcpy(ctx->pattern, FileName->Buffer, n);
-            ctx->pattern[n] = '\0';
+            if (n >= sizeof(pattern)) n = sizeof(pattern) - 1;
+            memcpy(pattern, FileName->Buffer, n);
+            pattern[n] = '\0';
         } else {
-            strcpy(ctx->pattern, "*");
+            strcpy(pattern, "*");
         }
-    }
-
-    /* Advance to the next entry matching the search pattern. */
-    struct dirent* de;
-    const char* dpath = w32_handle_path(FileHandle);
-    struct stat st;
-    for (;;) {
-        de = readdir(ctx->dir);
-        if (!de) {
-            closedir(ctx->dir);
-            ctx->dir = NULL;
+        dir = opendir(dpath);
+        if (!dir) {
             ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
-            break;
+        while ((d = readdir(dir)) != NULL) {
+            /* FATX enumeration never exposes the host's dot directories. */
+            if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
+                continue;
+            if (!win_wild_match(pattern, d->d_name))
+                continue;
+            if (ctx->count == cap) {
+                cap = cap ? cap * 2 : 32;
+                ctx->names = (char **)realloc(ctx->names, (size_t)cap * sizeof(char *));
+            }
+            ctx->names[ctx->count++] = strdup(d->d_name);
+        }
+        closedir(dir);
+        if (ctx->count > 1)
+            qsort(ctx->names, (size_t)ctx->count, sizeof(char *), ntfs_name_cmp);
+        ctx->active = 1;
     }
 
+    if (ctx->next >= ctx->count) {
+        dir_ctx_clear(ctx);
+        ctx->handle = NULL;
+        LeaveCriticalSection(&s_dir_cs);
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        return STATUS_NO_MORE_FILES;
+    }
+
+    const char* dpath = w32_handle_path(FileHandle);
+    struct stat st;
+    char name[MAX_PATH];
+    snprintf(name, sizeof(name), "%s", ctx->names[ctx->next++]);
+
     char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
+    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", name);
     if (stat(full, &st) != 0)
         memset(&st, 0, sizeof(st));
     LeaveCriticalSection(&s_dir_cs);
@@ -1352,7 +1429,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
 
-    int name_len = (int)strlen(de->d_name);
+    int name_len = (int)strlen(name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
@@ -1368,7 +1445,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
     if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
+        memcpy(entry->FileName, name, name_len);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = header_size + name_len;
     return STATUS_SUCCESS;
