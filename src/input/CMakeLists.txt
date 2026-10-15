@@ -12,7 +12,7 @@ else()
     # XInput's API on SDL2 GameController (Steam Deck, any pad SDL knows).
     target_sources(xbox_input PRIVATE xinput_host_sdl.c)
     find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
+    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2 xbox_settings)
 endif()
 
 if(MSVC)
