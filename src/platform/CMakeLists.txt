@@ -30,6 +30,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads)
+    # m: _clearfp (feclearexcept); dl: dladdr for the symbol helpers.
+    target_link_libraries(platform PUBLIC Threads::Threads m ${CMAKE_DL_LIBS})
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

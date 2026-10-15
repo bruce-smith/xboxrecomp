@@ -538,6 +538,106 @@ WCHAR *xbox_wcscpy(WCHAR *dst, const WCHAR *src);
 BOOL SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft);
 BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
 
+/* ---- Additions for the blinx2 runtime -------------------------------- */
+typedef ULONG64 DWORD64, *PDWORD64;
+
+#define THREAD_TERMINATE          0x0001u
+#define THREAD_SUSPEND_RESUME     0x0002u
+#define THREAD_GET_CONTEXT        0x0008u
+#define THREAD_SET_CONTEXT        0x0010u
+#define THREAD_QUERY_INFORMATION  0x0040u
+#define THREAD_ALL_ACCESS         0x001FFFFFu
+
+#define MB_SYSTEMMODAL     0x00001000u
+#define MB_SETFOREGROUND   0x00010000u
+#define MB_TOPMOST         0x00040000u
+
+/* A new handle for a thread this layer created (or the calling thread);
+ * NULL for any other id. Close it with CloseHandle. */
+HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid);
+DWORD  GetThreadId(HANDLE h);
+
+/* 64-bit interlocked arithmetic; Increment/Decrement/Add64 return the new
+ * value, Exchange/ExchangeAdd64 the old one, as in Win32. */
+LONGLONG InterlockedIncrement64(volatile LONGLONG *p);
+LONGLONG InterlockedDecrement64(volatile LONGLONG *p);
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v);
+LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *p, LONGLONG v);
+LONGLONG InterlockedAdd64(volatile LONGLONG *p, LONGLONG v);
+typedef struct _SYSTEM_INFO {
+    WORD      wProcessorArchitecture;
+    WORD      wReserved;
+    DWORD     dwPageSize;
+    LPVOID    lpMinimumApplicationAddress;
+    LPVOID    lpMaximumApplicationAddress;
+    DWORD_PTR dwActiveProcessorMask;
+    DWORD     dwNumberOfProcessors;
+    DWORD     dwProcessorType;
+    DWORD     dwAllocationGranularity;
+    WORD      wProcessorLevel;
+    WORD      wProcessorRevision;
+} SYSTEM_INFO, *LPSYSTEM_INFO;
+VOID GetSystemInfo(LPSYSTEM_INFO si);
+
+/* Bitwise; both return the old value. */
+LONG InterlockedAnd(volatile LONG *p, LONG v);
+LONG InterlockedOr(volatile LONG *p, LONG v);
+
+#define MemoryBarrier()   __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor()  __builtin_ia32_pause()
+#else
+#define YieldProcessor()  ((void)0)
+#endif
+#define _ReturnAddress()  __builtin_return_address(0)
+
+/* A condition variable slept on with an SRW lock held. */
+#define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u
+BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock,
+                               DWORD ms, ULONG flags);
+
+/* WaitOnAddress / WakeByAddress* (a futex on Linux). As in Win32 a wait may
+ * return spuriously; callers re-check the value. */
+BOOL WaitOnAddress(volatile VOID *addr, PVOID compare, SIZE_T size, DWORD ms);
+VOID WakeByAddressSingle(PVOID addr);
+VOID WakeByAddressAll(PVOID addr);
+
+/* Host symbols for the diagnostic stack dumps: dladdr/backtrace stand in
+ * for dbghelp. Only exported symbols resolve (link the exe -rdynamic). */
+HMODULE GetModuleHandleA(LPCSTR name);
+USHORT  CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash);
+typedef struct _SYMBOL_INFO {
+    ULONG   SizeOfStruct;
+    ULONG   TypeIndex;
+    ULONG64 Reserved[2];
+    ULONG   Index;
+    ULONG   Size;
+    ULONG64 ModBase;
+    ULONG   Flags;
+    ULONG64 Value;
+    ULONG64 Address;
+    ULONG   Register;
+    ULONG   Scope;
+    ULONG   Tag;
+    ULONG   NameLen;
+    ULONG   MaxNameLen;
+    CHAR    Name[1];
+} SYMBOL_INFO, *PSYMBOL_INFO;
+#define MAX_SYM_NAME 2000
+BOOL  SymInitialize(HANDLE process, PCSTR search_path, BOOL invade);
+BOOL  SymFromAddr(HANDLE process, DWORD64 addr, PDWORD64 disp, PSYMBOL_INFO si);
+DWORD SymSetOptions(DWORD options);
+
+/* Another thread's registers, between SuspendThread and ResumeThread
+ * (x86-64 Linux; FALSE elsewhere). */
+BOOL GetThreadContext(HANDLE h, PCONTEXT ctx);
+BOOL SetThreadContext(HANDLE h, PCONTEXT ctx);
+
+/* Called when no vectored handler takes a fault. EXECUTE_HANDLER ends the
+ * process, CONTINUE_EXECUTION resumes with the (edited) context. */
+typedef LONG (*LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f);
+
 /* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
  * The APU has a waveOut fallback path; on Linux it just stays inactive
  * and the (real) SDL2 audio path will replace it later. */

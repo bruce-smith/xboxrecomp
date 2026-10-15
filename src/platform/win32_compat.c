@@ -37,6 +37,22 @@
 #else
 #include <sys/sysinfo.h>
 #endif
+#include <semaphore.h>
+#include <limits.h>
+#include <dlfcn.h>
+#if defined(__linux__)
+#include <execinfo.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#endif
+
+/* Signal-driven exceptions (AddVectoredExceptionHandler) and suspension of
+ * another thread (SuspendThread/GetThreadContext): x86-64 Linux, where
+ * CONTEXT is the Win64 register set (xbox_winnt.h). */
+#if defined(__linux__) && defined(__x86_64__)
+#define W32_SIGNALS 1
+#include <ucontext.h>
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -201,13 +217,26 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
 /* Forward decl; the definition lives further down with the wait helpers. */
 static void deadline_from_ms(DWORD ms, struct timespec *ts);
 
+/* cond first, so cv->Ptr still reads as a pthread_cond_t *. seq counts
+ * wakes: SleepConditionVariableSRW waits on it as a futex, because a
+ * pthread_cond_t can only pair with a mutex and an SRW lock is a rwlock. */
+typedef struct { pthread_cond_t cond; volatile uint32_t seq; } w32_cv;
+
+static void w32_futex_wake(volatile uint32_t *w, int n);
+
 static void cv_lazy_init(PCONDITION_VARIABLE cv)
 {
-    if (!cv->Ptr) {
-        pthread_cond_t *c = (pthread_cond_t *)malloc(sizeof(pthread_cond_t));
-        pthread_cond_init(c, NULL);
-        /* Race window OK for typical Win32 usage (the CS is held). */
-        cv->Ptr = c;
+    if (!__atomic_load_n(&cv->Ptr, __ATOMIC_ACQUIRE)) {
+        /* Published with a CAS: a CONDITION_VARIABLE_INIT variable may be
+         * woken by a thread holding no lock at all. */
+        w32_cv *c = (w32_cv *)calloc(1, sizeof(w32_cv));
+        PVOID expect = NULL;
+        pthread_cond_init(&c->cond, NULL);
+        if (!__atomic_compare_exchange_n(&cv->Ptr, &expect, (PVOID)c, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            pthread_cond_destroy(&c->cond);
+            free(c);
+        }
     }
 }
 
@@ -236,14 +265,22 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
 
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv)
 {
+    w32_cv *c;
     cv_lazy_init(cv);
-    pthread_cond_signal((pthread_cond_t *)cv->Ptr);
+    c = (w32_cv *)cv->Ptr;
+    pthread_cond_signal(&c->cond);
+    __atomic_add_fetch(&c->seq, 1, __ATOMIC_SEQ_CST);
+    w32_futex_wake(&c->seq, 1);
 }
 
 VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 {
+    w32_cv *c;
     cv_lazy_init(cv);
-    pthread_cond_broadcast((pthread_cond_t *)cv->Ptr);
+    c = (w32_cv *)cv->Ptr;
+    pthread_cond_broadcast(&c->cond);
+    __atomic_add_fetch(&c->seq, 1, __ATOMIC_SEQ_CST);
+    w32_futex_wake(&c->seq, INT_MAX);
 }
 
 /* ===================================================================== */
@@ -281,6 +318,15 @@ typedef struct w32_object {
     DWORD           exit_code;
     int             suspend_count;
     pthread_cond_t  gate;
+    /* Suspension by another thread: the target parks in a signal handler
+     * (SuspendThread), posting susp_ack once it has; susp_ctx is its
+     * register state while parked (GetThreadContext/SetThreadContext). */
+    volatile int    susp_parked;
+    sem_t           susp_ack;
+#if defined(W32_SIGNALS)
+    CONTEXT         susp_ctx;
+#endif
+    struct w32_object *reg_next;     /* live threads, for OpenThread */
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
@@ -335,7 +381,50 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    sem_init(&o->susp_ack, 0, 0);
     return o;
+}
+
+/* Live thread objects, for OpenThread by id. */
+static pthread_mutex_t s_threads_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object     *s_threads;
+
+static void thread_register(w32_object *o)
+{
+    pthread_mutex_lock(&s_threads_lock);
+    o->reg_next = s_threads;
+    s_threads = o;
+    pthread_mutex_unlock(&s_threads_lock);
+}
+
+static void thread_unregister(w32_object *o)
+{
+    w32_object **pp;
+    pthread_mutex_lock(&s_threads_lock);
+    for (pp = &s_threads; *pp; pp = &(*pp)->reg_next)
+        if (*pp == o) { *pp = o->reg_next; break; }
+    pthread_mutex_unlock(&s_threads_lock);
+}
+
+/* The calling thread's object. Threads this layer did not create (main,
+ * or a library's) get one on first use, so they can be suspended, opened
+ * by id and waited on like any other; it lives as long as the process. */
+static w32_object *w32_self(void)
+{
+    if (!t_self_obj) {
+        w32_object *o = obj_alloc(K_THREAD);
+        o->tid = GetCurrentThreadId();
+        o->thread = pthread_self();
+        o->thread_joinable = 1;          /* running: signals may be sent */
+        t_self_obj = o;
+        thread_register(o);
+    }
+    return t_self_obj;
+}
+
+static w32_object *thread_of(HANDLE h)
+{
+    return h == PSEUDO_CURRENT_THREAD ? w32_self() : (w32_object *)h;
 }
 
 static void obj_release(w32_object *o)
@@ -349,7 +438,10 @@ static void obj_release(w32_object *o)
         if (o->fd >= 0) close(o->fd);
     } else if (o->kind == K_WAITABLE_TIMER) {
         /* Waitable timers: no special cleanup needed */
+    } else if (o->kind == K_THREAD) {
+        thread_unregister(o);
     }
+    sem_destroy(&o->susp_ack);
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
@@ -391,7 +483,7 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
 {
     (void)srcProc; (void)dstProc; (void)access; (void)inherit;
     if (!dst) return FALSE;
-    if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
+    if (src == PSEUDO_CURRENT_THREAD)  src = (HANDLE)w32_self();
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
     w32_object *o = (w32_object *)src;
@@ -691,11 +783,14 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+static void w32_thread_signal_setup(void);
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+    w32_thread_signal_setup();
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -742,6 +837,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     }
     pthread_attr_destroy(&attr);
     o->thread_joinable = 1;
+    thread_register(o);
 
     if (threadId) *threadId = o->tid;
     return (HANDLE)o;
@@ -772,27 +868,64 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
     return TRUE;
 }
 
+/* Suspension, three ways, one count:
+ *   - CREATE_SUSPENDED: the trampoline waits on gate before the start routine;
+ *   - a thread suspending itself waits on gate the same way;
+ *   - another thread is stopped with W32_SIG_SUSPEND: its handler records the
+ *     registers, acks, and sigsuspends until the count is back to 0.
+ * SuspendThread on another thread returns once it has stopped (Win32 only
+ * promises that by the next GetThreadContext; every caller here wants it). */
+#if defined(W32_SIGNALS)
+#define W32_SIG_SUSPEND (SIGRTMIN + 4)
+#define W32_SIG_RESUME  (SIGRTMIN + 5)
+#endif
+
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = thread_of(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
-    if (o->suspend_count > 0 && --o->suspend_count == 0)
+    if (o->suspend_count > 0 && --o->suspend_count == 0) {
         pthread_cond_broadcast(&o->gate);
+#if defined(W32_SIGNALS)
+        if (o->susp_parked)
+            pthread_kill(o->thread, W32_SIG_RESUME);
+#endif
+    }
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = thread_of(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
+    if (o == t_self_obj) {
+        /* Self: block right here until resumed. */
+        o->suspend_count++;
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
+        pthread_mutex_unlock(&o->lock);
+        return prev;
+    }
+    if (o->exited) {
+        pthread_mutex_unlock(&o->lock);
+        return prev;
+    }
     o->suspend_count++;
+#if defined(W32_SIGNALS)
+    /* Not yet started (start gate) or already stopped: nothing to send. */
+    if (prev == 0 && o->thread_joinable) {
+        pthread_kill(o->thread, W32_SIG_SUSPEND);
+        pthread_mutex_unlock(&o->lock);
+        while (sem_wait(&o->susp_ack) != 0 && errno == EINTR)
+            ;
+        return prev;
+    }
+#endif
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -1912,8 +2045,524 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+/* ===================================================================== */
+/* 64-bit interlocked arithmetic                                         */
+/* ===================================================================== */
+
+LONGLONG InterlockedIncrement64(volatile LONGLONG *p)  { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedDecrement64(volatile LONGLONG *p)  { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v)    { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *p, LONGLONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedAdd64(volatile LONGLONG *p, LONGLONG v)         { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+VOID GetSystemInfo(LPSYSTEM_INFO si)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN), pg = sysconf(_SC_PAGESIZE);
+    memset(si, 0, sizeof *si);
+    si->wProcessorArchitecture = 9;            /* PROCESSOR_ARCHITECTURE_AMD64 */
+    si->dwPageSize = (DWORD)(pg > 0 ? pg : 4096);
+    si->dwAllocationGranularity = 65536;       /* as Win32; VirtualAlloc rounds to it */
+    si->lpMinimumApplicationAddress = (LPVOID)(uintptr_t)0x10000;
+    si->lpMaximumApplicationAddress = (LPVOID)(uintptr_t)0x7FFFFFFEFFFFull;
+    si->dwNumberOfProcessors = (DWORD)(n > 0 ? n : 1);
+    si->dwActiveProcessorMask = si->dwNumberOfProcessors >= 64 ? ~(DWORD_PTR)0
+                              : (((DWORD_PTR)1 << si->dwNumberOfProcessors) - 1);
+}
+
+LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+
+/* ===================================================================== */
+/* Futex words: SRW condition variables and WaitOnAddress                */
+/* ===================================================================== */
+
+/* Wait while *w == val, at most ms. 1 on a timeout, 0 otherwise (woken,
+ * value already changed, or spurious -- callers re-check). */
+static int w32_futex_wait(volatile uint32_t *w, uint32_t val, DWORD ms)
+{
+#if defined(__linux__)
+    struct timespec ts, *pts = NULL;
+    if (ms != INFINITE) {
+        ts.tv_sec  = ms / 1000;
+        ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+        pts = &ts;
+    }
+    if (syscall(SYS_futex, (uint32_t *)w, FUTEX_WAIT_PRIVATE, val, pts, NULL, 0) == -1
+        && errno == ETIMEDOUT)
+        return 1;
+    return 0;
+#else
+    /* No futex: poll in 1 ms steps; every return but the last is spurious. */
+    if (__atomic_load_n(w, __ATOMIC_SEQ_CST) != val)
+        return 0;
+    usleep(1000);
+    return ms != INFINITE && ms <= 1;
+#endif
+}
+
+static void w32_futex_wake(volatile uint32_t *w, int n)
+{
+#if defined(__linux__)
+    syscall(SYS_futex, (uint32_t *)w, FUTEX_WAKE_PRIVATE, n, NULL, NULL, 0);
+#else
+    (void)w; (void)n;
+#endif
+}
+
+BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock,
+                               DWORD ms, ULONG flags)
+{
+    w32_cv *c;
+    uint32_t seq;
+    int timed_out;
+
+    cv_lazy_init(cv);
+    c = (w32_cv *)cv->Ptr;
+    /* Read under the lock: a wake after the release bumps seq first, so the
+     * futex wait below returns at once rather than sleeping through it. */
+    seq = __atomic_load_n(&c->seq, __ATOMIC_SEQ_CST);
+    if (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) ReleaseSRWLockShared(lock);
+    else                                             ReleaseSRWLockExclusive(lock);
+    timed_out = w32_futex_wait(&c->seq, seq, ms);
+    if (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) AcquireSRWLockShared(lock);
+    else                                             AcquireSRWLockExclusive(lock);
+    if (timed_out) {
+        SetLastError(1460 /* ERROR_TIMEOUT */);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* WaitOnAddress: one futex word per hash bucket, bumped by every wake of
+ * an address in it. The value is compared after the bucket is read, so a
+ * change plus wake between the two makes the futex wait return at once. */
+#define W32_ADDR_BUCKETS 256
+static volatile uint32_t s_addr_seq[W32_ADDR_BUCKETS];
+
+static volatile uint32_t *addr_bucket(const volatile void *addr)
+{
+    uint32_t h = (uint32_t)(((uintptr_t)addr >> 2) * 2654435761u);
+    return &s_addr_seq[h >> 24];
+}
+
+BOOL WaitOnAddress(volatile VOID *addr, PVOID compare, SIZE_T size, DWORD ms)
+{
+    volatile uint32_t *b = addr_bucket(addr);
+    uint32_t seq = __atomic_load_n(b, __ATOMIC_SEQ_CST);
+    if (memcmp((const void *)addr, compare, size) != 0)
+        return TRUE;
+    if (w32_futex_wait(b, seq, ms)) {
+        SetLastError(1460 /* ERROR_TIMEOUT */);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID WakeByAddressSingle(PVOID addr)
+{
+    /* All of them: the bucket is shared, and the one woken might not be
+     * waiting on this address. Waiters re-check. */
+    WakeByAddressAll(addr);
+}
+
+VOID WakeByAddressAll(PVOID addr)
+{
+    volatile uint32_t *b = addr_bucket(addr);
+    __atomic_add_fetch(b, 1, __ATOMIC_SEQ_CST);
+    w32_futex_wake(b, INT_MAX);
+}
+
+/* ===================================================================== */
+/* Threads by id                                                         */
+/* ===================================================================== */
+
+HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid)
+{
+    w32_object *o, *found = NULL;
+    (void)access; (void)inherit;
+    if (tid == GetCurrentThreadId()) {
+        found = w32_self();
+        InterlockedIncrement(&found->refcount);
+        return (HANDLE)found;
+    }
+    pthread_mutex_lock(&s_threads_lock);
+    for (o = s_threads; o; o = o->reg_next)
+        if (o->tid == tid && o->refcount > 0) {
+            InterlockedIncrement(&o->refcount);
+            found = o;
+            break;
+        }
+    pthread_mutex_unlock(&s_threads_lock);
+    if (!found)
+        SetLastError(87 /* ERROR_INVALID_PARAMETER */);
+    return (HANDLE)found;
+}
+
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o = thread_of(h);
+    return (o && o->kind == K_THREAD) ? o->tid : 0;
+}
+
+/* ===================================================================== */
+/* Host symbols (dbghelp stand-ins)                                      */
+/* ===================================================================== */
+
+HMODULE GetModuleHandleA(LPCSTR name)
+{
+    Dl_info di;
+    if (name)
+        return NULL;
+    /* This layer is linked into the executable, so its own address names
+     * the executable's image. */
+    if (dladdr((void *)&GetModuleHandleA, &di) && di.dli_fbase)
+        return (HMODULE)di.dli_fbase;
+    return NULL;
+}
+
+USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)
+{
+#if defined(__linux__)
+    void *buf[128];
+    int n = backtrace(buf, 128), i, out = 0;
+    if (hash) *hash = 0;
+    for (i = (int)skip + 1; i < n && out < (int)count; i++)
+        frames[out++] = buf[i];
+    return (USHORT)out;
+#else
+    (void)skip; (void)count; (void)frames;
+    if (hash) *hash = 0;
+    return 0;
+#endif
+}
+
+BOOL  SymInitialize(HANDLE p, PCSTR path, BOOL invade) { (void)p; (void)path; (void)invade; return TRUE; }
+DWORD SymSetOptions(DWORD options) { return options; }
+
+BOOL SymFromAddr(HANDLE process, DWORD64 addr, PDWORD64 disp, PSYMBOL_INFO si)
+{
+    Dl_info di;
+    size_t n;
+    (void)process;
+    if (!si || !dladdr((void *)(uintptr_t)addr, &di) || !di.dli_sname)
+        return FALSE;
+    n = strlen(di.dli_sname);
+    if (si->MaxNameLen) {
+        if (n > si->MaxNameLen - 1) n = si->MaxNameLen - 1;
+        memcpy(si->Name, di.dli_sname, n);
+        si->Name[n] = 0;
+    } else {
+        n = 0;
+    }
+    si->NameLen = (ULONG)n;
+    si->Address = (ULONG64)(uintptr_t)di.dli_saddr;
+    si->ModBase = (ULONG64)(uintptr_t)di.dli_fbase;
+    if (disp) *disp = addr - si->Address;
+    return TRUE;
+}
+
+/* ===================================================================== */
+/* Vectored exception handlers on signals                                */
+/* ===================================================================== */
+
+/* A fault (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) on a thread becomes an
+ * EXCEPTION_RECORD + CONTEXT and goes down the handler list exactly as Win32
+ * VEH does, on the faulting thread. A handler that answers
+ * EXCEPTION_CONTINUE_EXECUTION has its CONTEXT written back -- that is how
+ * the MMIO traps step over the instruction they emulated. Nobody handling
+ * it: the top-level filter, then the default action (a core dump). Handlers
+ * run on a per-thread alternate stack so a host stack overflow is reported
+ * rather than silent. */
+#define W32_MAX_VEH 16
+static PVECTORED_EXCEPTION_HANDLER s_veh[W32_MAX_VEH];
+static volatile int s_veh_n;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_top_filter;
+
+#define W32_ALTSTACK (256 * 1024)
+static __thread void     *t_altstack;
+static __thread uintptr_t t_stack_lo;  /* lowest usable byte of this stack */
+
+static void w32_install_fault_handlers(void);
+
+#if defined(W32_SIGNALS)
+static void ctx_from_uc(CONTEXT *c, const ucontext_t *uc)
+{
+    const greg_t *g = uc->uc_mcontext.gregs;
+    c->ContextFlags = CONTEXT_FULL;
+    c->EFlags = (DWORD)g[REG_EFL];
+    c->Rax = (ULONG64)g[REG_RAX];  c->Rcx = (ULONG64)g[REG_RCX];
+    c->Rdx = (ULONG64)g[REG_RDX];  c->Rbx = (ULONG64)g[REG_RBX];
+    c->Rsp = (ULONG64)g[REG_RSP];  c->Rbp = (ULONG64)g[REG_RBP];
+    c->Rsi = (ULONG64)g[REG_RSI];  c->Rdi = (ULONG64)g[REG_RDI];
+    c->R8  = (ULONG64)g[REG_R8];   c->R9  = (ULONG64)g[REG_R9];
+    c->R10 = (ULONG64)g[REG_R10];  c->R11 = (ULONG64)g[REG_R11];
+    c->R12 = (ULONG64)g[REG_R12];  c->R13 = (ULONG64)g[REG_R13];
+    c->R14 = (ULONG64)g[REG_R14];  c->R15 = (ULONG64)g[REG_R15];
+    c->Rip = (ULONG64)g[REG_RIP];
+}
+
+static void ctx_to_uc(ucontext_t *uc, const CONTEXT *c)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    g[REG_EFL] = (greg_t)c->EFlags;
+    g[REG_RAX] = (greg_t)c->Rax;  g[REG_RCX] = (greg_t)c->Rcx;
+    g[REG_RDX] = (greg_t)c->Rdx;  g[REG_RBX] = (greg_t)c->Rbx;
+    g[REG_RSP] = (greg_t)c->Rsp;  g[REG_RBP] = (greg_t)c->Rbp;
+    g[REG_RSI] = (greg_t)c->Rsi;  g[REG_RDI] = (greg_t)c->Rdi;
+    g[REG_R8]  = (greg_t)c->R8;   g[REG_R9]  = (greg_t)c->R9;
+    g[REG_R10] = (greg_t)c->R10;  g[REG_R11] = (greg_t)c->R11;
+    g[REG_R12] = (greg_t)c->R12;  g[REG_R13] = (greg_t)c->R13;
+    g[REG_R14] = (greg_t)c->R14;  g[REG_R15] = (greg_t)c->R15;
+    g[REG_RIP] = (greg_t)c->Rip;
+}
+
+static void w32_fault(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    int saved_errno = errno, i, n;
+    EXCEPTION_RECORD er;
+    CONTEXT ctx;
+    EXCEPTION_POINTERS ep;
+    LONG r;
+
+    memset(&er, 0, sizeof er);
+    ctx_from_uc(&ctx, uc);
+    ep.ExceptionRecord = &er;
+    ep.ContextRecord = &ctx;
+    er.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS: {
+        uintptr_t a = (uintptr_t)si->si_addr;
+        greg_t err = uc->uc_mcontext.gregs[REG_ERR];
+        er.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        er.NumberParameters = 2;
+        /* Page-fault error code: bit 1 write, bit 4 instruction fetch. */
+        er.ExceptionInformation[0] = (err & 16) ? 8 : (err & 2) ? 1 : 0;
+        er.ExceptionInformation[1] = (ULONG_PTR)a;
+        if (t_stack_lo && a < t_stack_lo + 65536 && a + (1u << 20) >= t_stack_lo)
+            er.ExceptionCode = EXCEPTION_STACK_OVERFLOW;
+        break;
+    }
+    case SIGFPE:
+        er.ExceptionCode = si->si_code == FPE_INTDIV ? EXCEPTION_INT_DIVIDE_BY_ZERO
+                         : si->si_code == FPE_INTOVF ? 0xC0000095u /* INTEGER_OVERFLOW */
+                         : si->si_code == FPE_FLTDIV ? EXCEPTION_FLT_DIVIDE_BY_ZERO
+                         : EXCEPTION_FLT_INVALID_OPERATION;
+        break;
+    case SIGILL:
+        er.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    case SIGTRAP:
+        if (si->si_code == TRAP_TRACE) {
+            er.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        } else {
+            /* int3: Linux reports the address after it, Win32 the int3. */
+            er.ExceptionCode = 0x80000003u;   /* EXCEPTION_BREAKPOINT */
+            ctx.Rip--;
+            er.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+        }
+        break;
+    default:
+        er.ExceptionCode = 0xC0000001u;
+        break;
+    }
+
+    n = __atomic_load_n(&s_veh_n, __ATOMIC_ACQUIRE);
+    for (i = 0; i < n; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            ctx_to_uc(uc, &ctx);
+            errno = saved_errno;
+            return;
+        }
+    }
+    if (s_top_filter) {
+        r = s_top_filter(&ep);
+        if (r == EXCEPTION_CONTINUE_EXECUTION) {
+            ctx_to_uc(uc, &ctx);
+            errno = saved_errno;
+            return;
+        }
+        if (r == EXCEPTION_EXECUTE_HANDLER)
+            _exit(128 + sig);
+    }
+    /* Unhandled: the default action, when the instruction faults again. */
+    signal(sig, SIG_DFL);
+    errno = saved_errno;
+}
+
+/* Another thread's SuspendThread: record the registers, ack, park. */
+static void w32_suspend_handler(int sig, siginfo_t *si, void *ucv)
+{
+    w32_object *o = t_self_obj;
+    int saved_errno = errno;
+    sigset_t m;
+    (void)sig; (void)si;
+    if (!o)
+        return;
+    ctx_from_uc(&o->susp_ctx, (ucontext_t *)ucv);
+    __atomic_store_n(&o->susp_parked, 1, __ATOMIC_SEQ_CST);
+    sem_post(&o->susp_ack);
+    /* W32_SIG_RESUME is blocked outside sigsuspend, so a resume sent before
+     * the wait is pending, not lost. */
+    pthread_sigmask(SIG_BLOCK, NULL, &m);
+    sigdelset(&m, W32_SIG_RESUME);
+    while (__atomic_load_n(&o->suspend_count, __ATOMIC_SEQ_CST) > 0)
+        sigsuspend(&m);
+    __atomic_store_n(&o->susp_parked, 0, __ATOMIC_SEQ_CST);
+    ctx_to_uc((ucontext_t *)ucv, &o->susp_ctx);   /* SetThreadContext */
+    errno = saved_errno;
+}
+
+static void w32_resume_handler(int sig, siginfo_t *si, void *ucv)
+{
+    (void)sig; (void)si; (void)ucv;
+}
+
+static void w32_install_fault_handlers(void)
+{
+    /* Idempotent; installed on first registration, so a process that never
+     * registers a handler keeps the default fault behaviour. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = w32_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+}
+
+BOOL GetThreadContext(HANDLE h, PCONTEXT ctx)
+{
+    w32_object *o = thread_of(h);
+    if (!o || o->kind != K_THREAD || !ctx || o == t_self_obj
+        || !__atomic_load_n(&o->susp_parked, __ATOMIC_SEQ_CST))
+        return FALSE;
+    *ctx = o->susp_ctx;
+    return TRUE;
+}
+
+BOOL SetThreadContext(HANDLE h, PCONTEXT ctx)
+{
+    w32_object *o = thread_of(h);
+    if (!o || o->kind != K_THREAD || !ctx || o == t_self_obj
+        || !__atomic_load_n(&o->susp_parked, __ATOMIC_SEQ_CST))
+        return FALSE;
+    o->susp_ctx = *ctx;
+    return TRUE;
+}
+#else  /* !W32_SIGNALS */
+static void w32_install_fault_handlers(void) { }
+BOOL GetThreadContext(HANDLE h, PCONTEXT ctx) { (void)h; (void)ctx; return FALSE; }
+BOOL SetThreadContext(HANDLE h, PCONTEXT ctx) { (void)h; (void)ctx; return FALSE; }
+#endif /* W32_SIGNALS */
+
+/* Per thread: the alternate signal stack, this stack's bounds (stack
+ * overflow detection), and W32_SIG_RESUME blocked. Run by every thread this
+ * layer creates and, from the constructor below, the main thread. */
+static void w32_thread_signal_setup(void)
+{
+#if defined(W32_SIGNALS)
+    stack_t ss;
+    sigset_t m;
+    pthread_attr_t a;
+    void *lo;
+    size_t sz;
+
+    if (!t_altstack) {
+        void *p = mmap(NULL, W32_ALTSTACK, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+            ss.ss_sp = p;
+            ss.ss_size = W32_ALTSTACK;
+            ss.ss_flags = 0;
+            if (sigaltstack(&ss, NULL) == 0)
+                t_altstack = p;
+            else
+                munmap(p, W32_ALTSTACK);
+        }
+    }
+    if (pthread_getattr_np(pthread_self(), &a) == 0) {
+        if (pthread_attr_getstack(&a, &lo, &sz) == 0)
+            t_stack_lo = (uintptr_t)lo;
+        pthread_attr_destroy(&a);
+    }
+    sigemptyset(&m);
+    sigaddset(&m, W32_SIG_RESUME);
+    pthread_sigmask(SIG_BLOCK, &m, NULL);
+#endif
+}
+
+#if defined(W32_SIGNALS)
+__attribute__((constructor))
+static void w32_signals_init(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = w32_suspend_handler;
+    sigaction(W32_SIG_SUSPEND, &sa, NULL);
+    sa.sa_sigaction = w32_resume_handler;
+    sigaction(W32_SIG_RESUME, &sa, NULL);
+    w32_thread_signal_setup();   /* the main thread; others inherit the mask */
+}
+#endif
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
-ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+{
+    int i, n;
+    if (!Handler)
+        return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    n = s_veh_n;
+    if (n == W32_MAX_VEH) {
+        pthread_mutex_unlock(&s_veh_lock);
+        return NULL;
+    }
+    if (First) {
+        for (i = n; i > 0; i--)
+            s_veh[i] = s_veh[i - 1];
+        s_veh[0] = Handler;
+    } else {
+        s_veh[n] = Handler;
+    }
+    __atomic_store_n(&s_veh_n, n + 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&s_veh_lock);
+    w32_install_fault_handlers();
+    return (PVOID)Handler;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i, j, n;
+    ULONG found = 0;
+    pthread_mutex_lock(&s_veh_lock);
+    n = s_veh_n;
+    for (i = 0; i < n; i++)
+        if ((PVOID)s_veh[i] == h) {
+            for (j = i; j < n - 1; j++)
+                s_veh[j] = s_veh[j + 1];
+            s_veh[n - 1] = NULL;
+            __atomic_store_n(&s_veh_n, n - 1, __ATOMIC_RELEASE);
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&s_veh_lock);
+    return found;
+}
+
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f)
+{
+    LPTOP_LEVEL_EXCEPTION_FILTER old = s_top_filter;
+    s_top_filter = f;
+    w32_install_fault_handlers();
+    return old;
+}
 
 #endif /* !_WIN32 */

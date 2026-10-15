@@ -153,10 +153,26 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
- 
-#ifdef __linux__
+/* PCONTEXT: Windows VEH register state.
+ *
+ * x86-64: the Win64 field names over the host's registers, so the MMIO trap
+ * handlers (platform/mmio_decode.h and the device hooks) read and write the
+ * same Rax..R15/Rip/EFlags on both hosts. win32_compat.c's signal handler
+ * fills one from the ucontext_t and copies it back. Only the integer state
+ * is carried: no handler here touches the FPU or vector registers. */
+#if defined(__x86_64__)
+#define CONTEXT_AMD64    0x00100000u
+#define CONTEXT_CONTROL  (CONTEXT_AMD64 | 0x1u)
+#define CONTEXT_INTEGER  (CONTEXT_AMD64 | 0x2u)
+#define CONTEXT_FULL     (CONTEXT_CONTROL | CONTEXT_INTEGER)
+typedef struct _CONTEXT {
+    DWORD    ContextFlags;
+    DWORD    EFlags;
+    ULONG64  Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    ULONG64  R8, R9, R10, R11, R12, R13, R14, R15;
+    ULONG64  Rip;
+} CONTEXT, *PCONTEXT;
+#elif defined(__linux__)
 /* On gcc these data structures are necessary  even if anyone is going to be used*/
 typedef union Register{
 	uint32_t X; // all register
