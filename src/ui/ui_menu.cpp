@@ -26,7 +26,6 @@
 #include "imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
-extern "C" int xbox_SchedMode(void);                    /* kernel/sched.c */
 extern "C" int xbox_settings_enum(const char *section, int i, const char **key,
                                   const char **label, int *type, int *lo, int *hi,
                                   const char *const **names, int *n,
@@ -38,8 +37,14 @@ volatile LONG s_open;
 HWND s_hwnd;
 bool s_ctx_ready;
 int s_scale;                        /* integer UI scale for the window size */
-std::vector<uint32_t> s_overlay;    /* premultiplied 0xAARRGGBB */
+std::vector<uint32_t> s_overlay;    /* back buffer: premultiplied 0xAARRGGBB */
 int s_ow, s_oh;
+/* What readers get (the window, a Vulkan present on another thread): the
+ * last finished frame, swapped in under the lock, held shared by a reader
+ * from xbox_ui_overlay() to xbox_ui_overlay_release(). */
+std::vector<uint32_t> s_front;
+int s_fw, s_fh;
+SRWLOCK s_front_lock = SRWLOCK_INIT;
 volatile LONG s_serial;
 const unsigned char *s_tex;         /* font atlas, RGBA8 */
 int s_tw, s_th;
@@ -359,7 +364,7 @@ void section_cheats()
 {
     if (!xbox_ui_guest_writes_allowed())
         ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1),
-                           "An exact recording or replay is running: cheats are off.");
+                           "A replay (or a deterministic run) is running: cheats are off.");
     declared_options("cheats");
     if (!panels("cheats"))
         ImGui::TextDisabled("No cheat engine in this build yet.");
@@ -499,20 +504,35 @@ int xbox_ui_render(void *hwnd, int w, int h)
     draw_menu(w, h);
     ImGui::Render();
     raster(ImGui::GetDrawData());
+    AcquireSRWLockExclusive(&s_front_lock);
+    s_front.swap(s_overlay);
+    std::swap(s_fw, s_ow);
+    std::swap(s_fh, s_oh);
     InterlockedIncrement(&s_serial);
+    ReleaseSRWLockExclusive(&s_front_lock);
     return 1;
 }
 
 int xbox_ui_overlay(const uint32_t **px, int *w, int *h, uint32_t *serial)
 {
-    if (!s_open || s_overlay.empty())
+    if (!s_open)
         return 0;
-    *px = s_overlay.data();
-    *w = s_ow;
-    *h = s_oh;
+    AcquireSRWLockShared(&s_front_lock);
+    if (s_front.empty() || !s_open) {
+        ReleaseSRWLockShared(&s_front_lock);
+        return 0;
+    }
+    *px = s_front.data();
+    *w = s_fw;
+    *h = s_fh;
     if (serial)
         *serial = (uint32_t)s_serial;
-    return 1;
+    return 1;                           /* held until xbox_ui_overlay_release */
+}
+
+void xbox_ui_overlay_release(void)
+{
+    ReleaseSRWLockShared(&s_front_lock);
 }
 
 void xbox_ui_add_panel(const char *section, const char *title,
@@ -577,9 +597,13 @@ void xbox_ui_run_deferred(void)
         d.fn(d.ctx);
 }
 
+/* Not during a replay or a deterministic (virtual-mode) run. A recording is
+ * fine: the cheat engine writes each applied cheat into the input recording,
+ * and a replay applies it again at the same poll. */
 int xbox_ui_guest_writes_allowed(void)
 {
-    return xbox_SchedMode() == 0;
+    extern int xbox_SchedReplaying(void);
+    return !xbox_SchedReplaying();
 }
 
 void xbox_ui_set_about(const char *text)

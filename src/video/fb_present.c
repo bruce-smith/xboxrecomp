@@ -253,15 +253,20 @@ static int fb_show_menu(HWND hwnd, HDC hdc, const uint32_t *px)
     GetClientRect(hwnd, &c);
     cw = c.right - c.left;
     ch = c.bottom - c.top;
-    if (!xbox_ui_render(hwnd, cw, ch) || !xbox_ui_overlay(&ov, &ow, &oh, NULL)
-        || ow != cw || oh != ch)
+    if (!xbox_ui_render(hwnd, cw, ch) || !xbox_ui_overlay(&ov, &ow, &oh, NULL))
         return 0;
+    if (ow != cw || oh != ch) {
+        xbox_ui_overlay_release();
+        return 0;
+    }
     if (comp_n < cw * ch) {
         free(comp);
         comp = (uint32_t *)malloc((size_t)cw * ch * 4);
         comp_n = comp ? cw * ch : 0;
-        if (!comp)
+        if (!comp) {
+            xbox_ui_overlay_release();
             return 0;
+        }
     }
     if ((long long)cw * s_fb_height >= (long long)ch * s_fb_width) {
         dh = ch;
@@ -293,6 +298,7 @@ static int fb_show_menu(HWND hwnd, HDC hdc, const uint32_t *px)
                    | ((g & 0xFF) * ia / 255 + (o & 0xFF));
         }
     }
+    xbox_ui_overlay_release();
 #if defined(XBOXRECOMP_HAVE_VULKAN)
     if (s_vk) {
         xbox_vk_present_frame(comp, (uint32_t)cw, (uint32_t)ch, 0);

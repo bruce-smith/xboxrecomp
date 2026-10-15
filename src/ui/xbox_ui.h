@@ -66,8 +66,12 @@ int  xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam
 int  xbox_ui_render(void *hwnd, int client_w, int client_h);
 
 /* The overlay: premultiplied 0xAARRGGBB at the client size; returns 0 when
- * the menu is closed. serial changes whenever the pixels do. */
+ * the menu is closed. serial changes whenever the pixels do. Callable from
+ * any thread: when it returns 1 the pixels stay valid, and are held, until
+ * xbox_ui_overlay_release() -- call that once done reading (keep it short:
+ * the menu waits for it to publish its next frame). */
 int  xbox_ui_overlay(const uint32_t **px, int *w, int *h, uint32_t *serial);
+void xbox_ui_overlay_release(void);
 
 /* Panels other modules add to a section ("cheats", "graphics", ...): draw is
  * called every frame while the menu shows that section, on the window
@@ -88,8 +92,9 @@ void xbox_ui_same_line(void);
 /* Guest-visible changes from the menu (cheats): the window thread is not a
  * guest agent, so it must not write guest memory. xbox_ui_defer queues fn to
  * run on the guest's main thread at its next input poll, which calls
- * xbox_ui_run_deferred(). xbox_ui_guest_writes_allowed() is 0 while an exact
- * recording or replay is running. */
+ * xbox_ui_run_deferred(). xbox_ui_guest_writes_allowed() is 0 during a
+ * replay or a deterministic (virtual-mode) run; a recording is fine as long
+ * as the change goes into the input recording (the cheat engine does). */
 void xbox_ui_defer(void (*fn)(void *ctx), void *ctx);
 void xbox_ui_run_deferred(void);
 int  xbox_ui_guest_writes_allowed(void);
