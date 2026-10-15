@@ -28,8 +28,14 @@
 
 #include <stdint.h>
 
+/* Windows, or an x86-64 POSIX host, where win32_compat delivers the fault
+ * with the same Win64 CONTEXT (platform/xbox_winnt.h). */
+#if defined(_WIN32) || defined(__x86_64__)
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "xbox_winnt.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -202,5 +208,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */
 #endif /* MMIO_DECODE_H */

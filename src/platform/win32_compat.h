@@ -309,6 +309,10 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_ADD       0x6B
 #define VK_SUBTRACT  0x6D
 #define VK_DIVIDE    0x6F
+#define VK_NUMPAD2   0x62
+#define VK_NUMPAD4   0x64
+#define VK_NUMPAD6   0x66
+#define VK_NUMPAD8   0x68
 #define VK_F1        0x70
 #define VK_F2        0x71
 #define VK_F3        0x72
@@ -339,7 +343,10 @@ BOOL    PeekMessageA(LPMSG msg, HWND wnd, UINT min, UINT max, UINT flags);
 BOOL    TranslateMessage(const MSG *msg);
 LRESULT DispatchMessageA(const MSG *msg);
 
-/* ---- XInput (stub on POSIX -- real gamepad goes through input_compat) -- */
+/* ---- XInput ------------------------------------------------------------
+ * The Win32 API's vocabulary. The functions are implemented on SDL2's
+ * GameController by src/input/xinput_host_sdl.c (part of xbox_input), so the
+ * input layer above them is the same code on every host. */
 typedef struct _XINPUT_GAMEPAD {
     WORD  wButtons;
     BYTE  bLeftTrigger;
@@ -350,7 +357,26 @@ typedef struct _XINPUT_STATE {
     DWORD          dwPacketNumber;
     XINPUT_GAMEPAD Gamepad;
 } XINPUT_STATE;
+typedef struct _XINPUT_VIBRATION {
+    WORD wLeftMotorSpeed;
+    WORD wRightMotorSpeed;
+} XINPUT_VIBRATION;
+typedef struct _XINPUT_CAPABILITIES {
+    BYTE             Type;
+    BYTE             SubType;
+    WORD             Flags;
+    XINPUT_GAMEPAD   Gamepad;
+    XINPUT_VIBRATION Vibration;
+} XINPUT_CAPABILITIES;
 DWORD XInputGetState(DWORD idx, XINPUT_STATE *state);
+DWORD XInputSetState(DWORD idx, XINPUT_VIBRATION *vibration);
+DWORD XInputGetCapabilities(DWORD idx, DWORD flags, XINPUT_CAPABILITIES *caps);
+
+#define XINPUT_DEVTYPE_GAMEPAD               0x01
+#define XINPUT_DEVSUBTYPE_GAMEPAD            0x01
+#define XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE   7849
+#define XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE  8689
+#define XINPUT_GAMEPAD_TRIGGER_THRESHOLD     30
 
 #define XINPUT_GAMEPAD_DPAD_UP        0x0001
 #define XINPUT_GAMEPAD_DPAD_DOWN      0x0002
@@ -547,6 +573,15 @@ typedef ULONG64 DWORD64, *PDWORD64;
 #define THREAD_SET_CONTEXT        0x0010u
 #define THREAD_QUERY_INFORMATION  0x0040u
 #define THREAD_ALL_ACCESS         0x001FFFFFu
+
+#define EXCEPTION_BREAKPOINT             0x80000003u
+#define EXCEPTION_NONCONTINUABLE_EXCEPTION 0xC0000025u
+#define EXCEPTION_ARRAY_BOUNDS_EXCEEDED  0xC000008Cu
+#define EXCEPTION_INT_OVERFLOW           0xC0000095u
+#define EXCEPTION_PRIV_INSTRUCTION       0xC0000096u
+
+#define SYMOPT_UNDNAME          0x00000002u
+#define SYMOPT_DEFERRED_LOADS   0x00000004u
 
 #define MB_SYSTEMMODAL     0x00001000u
 #define MB_SETFOREGROUND   0x00010000u

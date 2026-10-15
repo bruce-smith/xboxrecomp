@@ -836,6 +836,48 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* The Win32 error an open failure would have given (g_xbox_last_file_error,
+ * which only distinguishes the cases callers act on). */
+static uint32_t errno_to_win32(int e)
+{
+    switch (e) {
+        case ENOENT:  return 2;     /* ERROR_FILE_NOT_FOUND */
+        case ENOTDIR: return 3;     /* ERROR_PATH_NOT_FOUND */
+        case EACCES:
+        case EPERM:   return 5;     /* ERROR_ACCESS_DENIED */
+        case EEXIST:  return 80;    /* ERROR_FILE_EXISTS */
+        case ENOMEM:  return 8;     /* ERROR_NOT_ENOUGH_MEMORY */
+        default:      return 31;    /* ERROR_GEN_FAILURE */
+    }
+}
+
+/* The guest path to a host path, honouring RootDirectory: XDeleteSaveGame
+ * opens each child relative to its save directory, so a relative name is
+ * joined to the path the directory handle was opened with. 0xFFFFFFFD
+ * (ObDosDevicesDirectory, a drive-letter name) and absolute names go through
+ * the path rules. */
+static BOOL posix_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                           char *host_path, DWORD buf_size)
+{
+    const char *xbox_path = get_xbox_path(ObjectAttributes);
+    if (!xbox_path)
+        return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\'
+        && !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char *base = w32_handle_path(ObjectAttributes->RootDirectory);
+        size_t n;
+        if (!base)
+            return FALSE;
+        n = (size_t)snprintf(host_path, buf_size, "%s/%s", base, xbox_path);
+        if (n >= buf_size)
+            return FALSE;
+        for (char *p = host_path; *p; p++)
+            if (*p == '\\') *p = '/';
+        return TRUE;
+    }
+    return xbox_translate_path(xbox_path, host_path, buf_size);
+}
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -856,15 +898,28 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     char host_path[MAX_PATH];
+    struct stat dst;
     (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    /* A partition device opened as a directory (a free-space query) gets the
+     * directory holding its image, as in the Windows backend. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) && stat(host_path, &dst) == 0
+        && !S_ISDIR(dst.st_mode)) {
+        char *slash = strrchr(host_path, '/');
+        if (slash && slash != host_path) {
+            *slash = 0;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: directory open of a device image, "
+                     "using its containing directory instead");
+        }
     }
 
     int fd;
@@ -878,7 +933,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        g_xbox_last_file_error = errno_to_win32(e);
+        /* A warning, as in the Windows backend: a failed open is how a title
+         * silently decides an asset is missing. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)",
+                 host_path, e);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;

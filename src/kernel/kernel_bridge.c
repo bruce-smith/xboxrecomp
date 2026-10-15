@@ -43,6 +43,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
+#if !defined(_WIN32)
+#include <errno.h>
+#include <sys/stat.h>       /* the POSIX rename's existence check */
+#endif
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
@@ -4034,6 +4038,69 @@ static NTSTATUS bridge_rename_file(HANDLE handle, uint32_t info_va)
             : (NTSTATUS)0xC0000022;                 /* ACCESS_DENIED */
     }
 }
+#else
+/* POSIX: the same rename, by path (the handle's fd stays valid across it). */
+static NTSTATUS bridge_rename_file(HANDLE handle, uint32_t info_va)
+{
+    uint8_t  replace = BRIDGE_MEM8(info_va);
+    uint32_t root    = BRIDGE_MEM32(info_va + 4);
+    uint16_t len     = BRIDGE_MEM16(info_va + 8);
+    uint32_t buf     = BRIDGE_MEM32(info_va + 12);
+    char     name[MAX_PATH], dst[MAX_PATH];
+    const char *src = w32_handle_path(handle);
+    static unsigned shown;
+    int ok, err = 0;
+    struct stat st;
+
+    if (!len || len >= sizeof(name) || !buf || !bridge_buf_ok(buf, len, "rename")) {
+        fprintf(stderr, "  [FILE] rename: bad name (replace=%u root=0x%08X len=%u buf=0x%08X)\n",
+                replace, root, len, buf);
+        fflush(stderr);
+        return (NTSTATUS)0xC0000033;                /* OBJECT_NAME_INVALID */
+    }
+    memcpy(name, XBOX_TO_NATIVE(buf), len);
+    name[len] = 0;
+
+    if (name[0] == '\\' || !root || root == 0xFFFFFFFDu
+            || (name[0] && name[1] == ':')) {
+        if (!xbox_translate_path(name, dst, MAX_PATH)) {
+            fprintf(stderr, "  [FILE] rename: cannot translate %s\n", name);
+            fflush(stderr);
+            return (NTSTATUS)0xC000003A;            /* OBJECT_PATH_NOT_FOUND */
+        }
+    } else {
+        const char *base = w32_handle_path(bridge_resolve_handle(root));
+        char *p;
+        if (!base) {
+            fprintf(stderr, "  [FILE] rename: no path for root 0x%08X (%s)\n", root, name);
+            fflush(stderr);
+            return (NTSTATUS)0xC000003A;
+        }
+        snprintf(dst, sizeof dst, "%s/%s", base, name);
+        for (p = dst; *p; p++)
+            if (*p == '\\') *p = '/';
+    }
+    if (!src)
+        return (NTSTATUS)0xC0000008;                /* INVALID_HANDLE */
+
+    if (!replace && stat(dst, &st) == 0) {
+        ok = 0;
+        err = EEXIST;
+    } else {
+        ok = rename(src, dst) == 0;
+        if (!ok)
+            err = errno;
+    }
+    if (shown++ < 16) {
+        fprintf(stderr, "  [FILE] rename -> %s %s (errno=%d)\n", name,
+                ok ? "ok" : "FAILED", ok ? 0 : err);
+        fflush(stderr);
+    }
+    if (ok)
+        return 0;
+    return err == EEXIST ? (NTSTATUS)0xC0000035     /* OBJECT_NAME_COLLISION */
+                         : (NTSTATUS)0xC0000022;    /* ACCESS_DENIED */
+}
 #endif
 
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
@@ -4052,14 +4119,12 @@ static void bridge_NtSetInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
-#ifdef _WIN32
     if (infoclass == 10 && length >= 16) {   /* FileRenameInformation */
         NTSTATUS st = bridge_rename_file(handle, info_va);
         bridge_write_iostatus(ios_va, st, 0);
         g_eax = (uint32_t)st;
         return;
     }
-#endif
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -4464,7 +4529,6 @@ static void bridge_ObReferenceObjectByHandle(void)
     (void)obj_type;
     if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
 
-#ifdef _WIN32
     /* Thread handles get a minimal KTHREAD the title can read.
      *
      * XAPI GetExitCodeThread (Blinx 2: sub_00298004) references the handle,
@@ -4507,7 +4571,6 @@ static void bridge_ObReferenceObjectByHandle(void)
             }
         }
     }
-#endif
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 

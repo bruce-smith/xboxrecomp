@@ -860,7 +860,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = thread_of(h);      /* pseudo handle too, as Win32 */
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -932,7 +932,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = thread_of(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -946,14 +946,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = thread_of(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = thread_of(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -1582,9 +1582,7 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepad is wired through input_compat (SDL2). */
-DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
-{ (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
+/* XInputGetState & co.: src/input/xinput_host_sdl.c (SDL2 GameController). */
 
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
@@ -2199,8 +2197,21 @@ HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid)
 
 DWORD GetThreadId(HANDLE h)
 {
-    w32_object *o = thread_of(h);
-    return (o && o->kind == K_THREAD) ? o->tid : 0;
+    /* Any handle may be asked (the bridge probes whether one is a thread),
+     * so look it up rather than dereference it: 0 for a non-thread, as in
+     * Win32. */
+    w32_object *o;
+    DWORD tid = 0;
+    if (h == PSEUDO_CURRENT_THREAD)
+        return GetCurrentThreadId();
+    pthread_mutex_lock(&s_threads_lock);
+    for (o = s_threads; o; o = o->reg_next)
+        if ((HANDLE)o == h) {
+            tid = o->tid;
+            break;
+        }
+    pthread_mutex_unlock(&s_threads_lock);
+    return tid;
 }
 
 /* ===================================================================== */

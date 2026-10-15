@@ -2219,8 +2219,26 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        /* The original address first, as on Windows. Where the host allows
+         * it (Linux: vm.mmap_min_addr is 64 KB, and a PIE executable and its
+         * libraries load far above 4 GB) guest memory is then identity-mapped
+         * like on Windows, and the fixed-address views below -- the
+         * contiguous window at 0x80000000, the tiled aperture at 0xF0000000
+         * -- land where the title expects them instead of inside the span.
+         * MapViewOfFileEx here never displaces an existing mapping
+         * (MAP_FIXED_NOREPLACE), so a taken range just fails. */
+        g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                        0, 0, g_memory_size,
+                                        (LPVOID)XBOX_BASE_ADDRESS);
+        if (g_memory_base && (uintptr_t)g_memory_base != XBOX_BASE_ADDRESS) {
+            UnmapViewOfFile(g_memory_base);
+            g_memory_base = NULL;
+        }
+        g_span_size = g_memory_base ? 0
+                    : g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_base = g_span_size
+                    ? VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS)
+                    : NULL;
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,

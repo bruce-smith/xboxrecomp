@@ -114,7 +114,6 @@ int xbox_IrqlRaisedCount(void)
  * section because the wait is bounded: a leaked raise (see KfLowerIrql) would
  * otherwise stop every DPC for good. Running past the bound is logged.
  * RECOMP_DISPATCH_LOCK=0 turns it off. */
-#if defined(_WIN32)
 static HANDLE s_dispatch_mutex;
 static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
 static XBOX_THREAD_LOCAL int t_dispatch_held;
@@ -191,10 +190,6 @@ static void dispatch_unlock(void)
         ReleaseMutex(s_dispatch_mutex);
     }
 }
-#else
-static void dispatch_lock(DWORD timeout_ms, const char *who) { (void)timeout_ms; (void)who; }
-static void dispatch_unlock(void) { }
-#endif
 
 #define DISPATCH_WAIT_THREAD_MS 2000u   /* a guest raise or a DPC */
 
