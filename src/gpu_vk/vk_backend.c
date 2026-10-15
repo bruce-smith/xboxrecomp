@@ -130,6 +130,7 @@ static struct {
     Pipe pipes[VKB_PIPES];
     int npipes;
     uint32_t new_pipes, new_vsh;          /* created since the last stats line */
+    uint32_t zdraws, nreports;            /* counted draws, GET_REPORTs */
     struct { VkPshKey key; VkShaderModule fs; int used; } fsh[VKB_FSH];
     /* Vertex programs, by their instruction words. */
     struct { uint64_t h; uint32_t n; uint32_t (*w)[4]; VkShaderModule vs; } vsh[VKB_VSH];
@@ -1784,6 +1785,7 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
 
     if (st->zpass_enable) {
+        B.zdraws++;
         vkCmdBeginQuery(cb, s->qpool, s->nq, VK_QUERY_CONTROL_PRECISE_BIT);
         vkCmdDrawIndexed(cb, nix, 1, 0, 0, 0);
         vkCmdEndQuery(cb, s->qpool, s->nq);
@@ -1866,6 +1868,7 @@ static void vk_report(uint32_t at, uint64_t stamp, int force)
     int k;
     if (!B.ok)
         return;
+    B.nreports++;
     if (g_vk.lost) {                  /* nothing will ever count it: visible */
         report_write(at, stamp, 100000u);
         return;
@@ -2001,10 +2004,28 @@ static void frame_stats(void)
 {
     if (getenv("RECOMP_VK_STATS") && B.frame % 60 == 0) {
         fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits,"
-                " %u new pipelines (%d kept), %u new vertex shaders (last 60 frames)\n",
+                " %u new pipelines (%d kept), %u new vertex shaders, %u counted draws,"
+                " %u visibility reports (last 60 frames)\n",
                 B.frame, B.draws, B.tris, B.uploads, B.submits, B.new_pipes, B.npipes,
-                B.new_vsh);
+                B.new_vsh, B.zdraws, B.nreports);
         B.draws = B.tris = B.uploads = B.submits = B.new_pipes = B.new_vsh = 0;
+        B.zdraws = B.nreports = 0;
+    }
+}
+
+/* The finished frame (the colour surface at `addr`, its top-left w x h) to
+ * the window's Vulkan swapchain, when there is one. */
+static void flip_present(uint32_t addr, uint32_t w, uint32_t h)
+{
+    int i;
+    if (!vk_present_ready())
+        return;
+    for (i = 0; i < VKB_SURFS; i++) {
+        Surf *s = &B.surf[i];
+        if (s->img && !s->depth && s->addr == addr) {
+            vk_present_image(s->img, w < s->w ? w : s->w, h < s->h ? h : s->h);
+            return;
+        }
     }
 }
 
@@ -2049,8 +2070,11 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
             mode = getenv("RECOMP_HEADLESS") ? 0 : 1;
     }
     B.frame++;
-    if (!pitch || mode == 0) {
+    /* With Vulkan presentation the window shows this image itself (at the
+     * renderer's resolution): no read-back is needed for it. */
+    if (!pitch || mode == 0 || (mode == 1 && vk_present_ready())) {
         submit(0);
+        flip_present(addr, w, h);
         frame_stats();
         return;
     }
@@ -2063,6 +2087,7 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
         for (y = 0; y < h; y++)
             memcpy(mem + addr + (size_t)y * pitch, B.rb.map + (size_t)y * rowb, rowb);
         surf_resign(addr);
+        flip_present(addr, w, h);
         frame_stats();
         return;
     }

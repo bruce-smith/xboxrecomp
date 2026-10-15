@@ -41,6 +41,35 @@ int  xbox_vk_present_frame(const uint32_t *px, uint32_t w, uint32_t h, int linea
 
 void xbox_vk_present_shutdown(void);
 
+/* Overlay hook: an in-game menu (Dear ImGui) drawn over each presented
+ * frame, before present, whether the frame came from the GPU renderer or
+ * from the CPU. The callback runs inside frame submission, on the thread
+ * that presents, while `command_buffer` is recording: record into it with
+ * dynamic rendering (vkCmdBeginRendering) on `image_view`, which is in
+ * COLOR_ATTACHMENT_OPTIMAL layout; leave it in that layout. Handles are
+ * the Vulkan ones (VkInstance, ...) as opaque values, so this header needs
+ * no Vulkan headers; `get_instance_proc_addr` is vkGetInstanceProcAddr (the
+ * library loads Vulkan at run time: give it to ImGui_ImplVulkan_LoadFunctions).
+ * frame_x/y/w/h: where the game's frame is in the window (the rest is the
+ * black bars). Only with Vulkan presentation (RECOMP_VK_PRESENT=1). */
+typedef struct {
+    void *get_instance_proc_addr;
+    void *instance, *physical_device, *device, *queue;
+    uint32_t queue_family;
+    void *command_buffer;
+    uint64_t image, image_view;
+    uint32_t format;                /* VkFormat of the swapchain */
+    uint32_t width, height;         /* the window's client area */
+    uint32_t image_count, image_index;
+    uint64_t frame;
+    uint32_t frame_x, frame_y, frame_w, frame_h;
+} XboxVkOverlay;
+
+typedef void (*XboxVkOverlayFn)(void *user, const XboxVkOverlay *o);
+
+/* Install (or with NULL remove) the overlay. Thread-safe. */
+void xbox_vk_overlay_set(XboxVkOverlayFn fn, void *user);
+
 #ifdef __cplusplus
 }
 #endif

@@ -89,5 +89,10 @@ void  vk_yield(void);
 /* A full memory barrier: stores before it are visible to other CPUs before
  * stores after it. */
 void  vk_store_fence(void);
+/* Vulkan presentation (vk_present.c), for the renderer: is the window's
+ * swapchain up, and show the device image `img` (GENERAL layout, its top-left
+ * w x h) in it -- from then on the window's own CPU frames are not shown. */
+int   vk_present_ready(void);
+int   vk_present_image(VkImage img, uint32_t w, uint32_t h);
 
 #endif
