@@ -256,6 +256,19 @@ void xbox_SchedClose(void)
     }
 }
 
+/* The per-agent lists read from a schedule grow by doubling (1024, 2048, ...):
+ * grown by 1024 at a time, a recording with tens of millions of values spent
+ * minutes in realloc before the replay began (Windows copies on most of them). */
+static int sched_grow_at(uint32_t n)
+{
+    return n == 0 || (n >= 1024 && !(n & (n - 1)));
+}
+
+static uint32_t sched_grown(uint32_t n)
+{
+    return n < 1024 ? 1024 : n * 2;
+}
+
 static int sched_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -312,9 +325,9 @@ static int sched_load(const char *path)
                 || a >= SCHED_AGENTS || b >= SCHED_KINDS)
                 break;
             q = &s_q[a];
-            if (!(q->n & 1023)) {
-                q->kind = (uint8_t *)realloc(q->kind, q->n + 1024);
-                q->val = (uint64_t *)realloc(q->val, (q->n + 1024) * sizeof(uint64_t));
+            if (sched_grow_at(q->n)) {
+                q->kind = (uint8_t *)realloc(q->kind, sched_grown(q->n));
+                q->val = (uint64_t *)realloc(q->val, sched_grown(q->n) * sizeof(uint64_t));
             }
             d = (int64_t)((c >> 1) ^ (~(c & 1) + 1));     /* zigzag */
             prev = s_prev_val[a][b] + (uint64_t)d;
@@ -1597,8 +1610,8 @@ DWORD xbox_SchedResume(HANDLE h)
 static void sched_preempt_load(int agent, uint64_t n)
 {
     SchedPreempts *p = &s_pre[agent];
-    if (!(p->count & 1023))
-        p->n = (uint64_t *)realloc(p->n, (p->count + 1024) * sizeof(uint64_t));
+    if (sched_grow_at(p->count))
+        p->n = (uint64_t *)realloc(p->n, sched_grown(p->count) * sizeof(uint64_t));
     p->n[p->count++] = n;
 }
 
