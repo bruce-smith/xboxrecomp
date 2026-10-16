@@ -23,9 +23,7 @@
  * - Sync check: every 60 frames each peer hashes guest RAM at the same point
  *   and sends the hash; a mismatch stops the session with a report.
  */
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "net_os.h"         /* sockets etc.: Winsock or POSIX; first, for winsock2.h */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,8 +33,6 @@
 #include "../kernel/kernel.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../usb/usb_gamepad.h"
-
-#pragma comment(lib, "ws2_32.lib")
 
 #define NP_MAXP     4
 #define NP_RING     2048
@@ -107,7 +103,7 @@ static void refuse(const struct sockaddr_in *to, int reason)
 
 static void send_to(const struct sockaddr_in *a, const void *p, int n)
 {
-    sendto(s_sock, (const char *)p, n, 0, (const struct sockaddr *)a, sizeof *a);
+    sendto(s_sock, (const char *)p, n, NP_SENDFLAGS, (const struct sockaddr *)a, sizeof *a);
 }
 
 /* Host: to every joiner except `except` (a player number, or -1). */
@@ -300,33 +296,26 @@ static DWORD WINAPI net_thread(LPVOID unused)
  * Every peer must start from the same saves. The host's UDATA/TDATA (its own
  * saves: RECOMP_SAVE_DIR, else the game folder) go to every joiner over TCP
  * on the session's port, and everyone -- the host too -- plays on a copy in
- * %LOCALAPPDATA%\xboxrecomp\netplay\p<n> with an empty Z: cache, which the
+ * <data>/xboxrecomp/netplay/<port>/p<n> with an empty Z: cache, which the
  * game rebuilds from the disc the same way everywhere. A network game never
  * writes to anyone's real saves. */
 static char s_session[MAX_PATH];
 
 static void rm_tree(const char *dir)
 {
-    char pat[MAX_PATH], p[MAX_PATH];
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
-    snprintf(pat, sizeof pat, "%s\\*", dir);
-    h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
-                continue;
-            snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    char p[MAX_PATH];
+    NpDir d;
+    if (np_dir_open(&d, dir)) {
+        while (np_dir_next(&d)) {
+            snprintf(p, sizeof p, "%s%c%s", dir, NP_SEP, d.name);
+            if (d.is_dir)
                 rm_tree(p);
-            else {
-                SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);
-                DeleteFileA(p);
-            }
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+            else
+                np_unlink(p);
+        }
+        np_dir_close(&d);
     }
-    RemoveDirectoryA(dir);
+    np_rmdir(dir);
 }
 
 static void mk_dirs(const char *path)            /* every level of path */
@@ -334,24 +323,24 @@ static void mk_dirs(const char *path)            /* every level of path */
     char p[MAX_PATH];
     size_t i;
     snprintf(p, sizeof p, "%s", path);
-    for (i = 3; p[i]; i++)
-        if (p[i] == '\\') {
+    for (i = 1; p[i]; i++)
+        if (p[i] == NP_SEP && p[i - 1] != ':') {
             p[i] = 0;
-            CreateDirectoryA(p, NULL);
-            p[i] = '\\';
+            np_mkdir(p);
+            p[i] = NP_SEP;
         }
-    CreateDirectoryA(p, NULL);
+    np_mkdir(p);
 }
 
-/* %LOCALAPPDATA%\xboxrecomp\netplay\<port>\p<n>: by port too, so two games
- * on one PC (a loopback test) do not share a folder. */
+/* <data>/netplay/<port>/p<n> (data: %LOCALAPPDATA%\xboxrecomp, or
+ * $XDG_DATA_HOME/xboxrecomp): by port too, so two games on one PC (a
+ * loopback test) do not share a folder. */
 static void session_dir(int player, int port)
 {
     char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH))
-        snprintf(base, sizeof base, ".");
-    snprintf(s_session, sizeof s_session, "%s\\xboxrecomp\\netplay\\%d\\p%d", base, port,
-             player + 1);
+    np_data_dir(base, sizeof base);
+    snprintf(s_session, sizeof s_session, "%s%cnetplay%c%d%cp%d", base, NP_SEP, NP_SEP,
+             port, NP_SEP, player + 1);
     rm_tree(s_session);
     mk_dirs(s_session);
 }
@@ -361,7 +350,7 @@ static int send_all(SOCKET s, const void *p, int n)
 {
     const char *c = (const char *)p;
     while (n > 0) {
-        int k = send(s, c, n, 0);
+        int k = (int)send(s, c, n, NP_SENDFLAGS);
         if (k <= 0)
             return 0;
         c += k;
@@ -374,7 +363,7 @@ static int recv_all(SOCKET s, void *p, int n)
 {
     char *c = (char *)p;
     while (n > 0) {
-        int k = recv(s, c, n, 0);
+        int k = (int)recv(s, c, n, 0);
         if (k <= 0)
             return 0;
         c += k;
@@ -383,31 +372,30 @@ static int recv_all(SOCKET s, void *p, int n)
     return 1;
 }
 
+/* rel is sent with '/' whatever this host uses: the receiver may be another OS. */
 static int send_tree(SOCKET s, const char *root, const char *rel)
 {
-    char pat[MAX_PATH], full[MAX_PATH], r[MAX_PATH];
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
-    snprintf(pat, sizeof pat, "%s\\%s\\*", root, rel);
-    h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE)
+    char dir[MAX_PATH], full[MAX_PATH], r[MAX_PATH];
+    NpDir d;
+    snprintf(dir, sizeof dir, "%s%c%s", root, NP_SEP, rel);
+    np_native_path(dir + strlen(root));
+    if (!np_dir_open(&d, dir))
         return 1;
-    do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
-            continue;
-        snprintf(r, sizeof r, "%s\\%s", rel, fd.cFileName);
-        snprintf(full, sizeof full, "%s\\%s", root, r);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    while (np_dir_next(&d)) {
+        snprintf(r, sizeof r, "%s/%s", rel, d.name);
+        snprintf(full, sizeof full, "%s%c%s", dir, NP_SEP, d.name);
+        if (d.is_dir) {
             if (!send_tree(s, root, r))
                 break;
         } else {
             FILE *f = fopen(full, "rb");
             uint16_t len = (uint16_t)strlen(r);
-            uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            uint64_t size = d.size;
             char buf[65536];
             size_t n;
             if (!f)
                 continue;
+            np_wire_path(r);
             if (!send_all(s, &len, 2) || !send_all(s, r, len) || !send_all(s, &size, 8)) {
                 fclose(f);
                 break;
@@ -417,8 +405,8 @@ static int send_tree(SOCKET s, const char *root, const char *rel)
                     break;
             fclose(f);
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    }
+    np_dir_close(&d);
     return 1;
 }
 
@@ -437,14 +425,15 @@ static int recv_tree(SOCKET s, const char *root)
         if (len >= sizeof r || !recv_all(s, r, len) || !recv_all(s, &size, 8))
             return -1;
         r[len] = 0;
-        if (strstr(r, ".."))
+        if (strstr(r, "..") || r[0] == '/' || r[0] == '\\' || strchr(r, ':'))
             return -1;                          /* nothing outside the session */
-        snprintf(full, sizeof full, "%s\\%s", root, r);
-        slash = strrchr(full, '\\');
+        np_native_path(r);
+        snprintf(full, sizeof full, "%s%c%s", root, NP_SEP, r);
+        slash = strrchr(full, NP_SEP);
         if (slash) {
             *slash = 0;
             mk_dirs(full);
-            *slash = '\\';
+            *slash = NP_SEP;
         }
         f = fopen(full, "wb");
         while (size > 0) {
@@ -467,25 +456,20 @@ static int recv_tree(SOCKET s, const char *root)
 /* Host: the saves into its own session, then to each joiner. */
 static void copy_tree(const char *src, const char *dst)
 {
-    char pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
+    char a[MAX_PATH], b[MAX_PATH];
+    NpDir d;
     mk_dirs(dst);
-    snprintf(pat, sizeof pat, "%s\\*", src);
-    h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE)
+    if (!np_dir_open(&d, src))
         return;
-    do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
-            continue;
-        snprintf(a, sizeof a, "%s\\%s", src, fd.cFileName);
-        snprintf(b, sizeof b, "%s\\%s", dst, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    while (np_dir_next(&d)) {
+        snprintf(a, sizeof a, "%s%c%s", src, NP_SEP, d.name);
+        snprintf(b, sizeof b, "%s%c%s", dst, NP_SEP, d.name);
+        if (d.is_dir)
             copy_tree(a, b);
         else
-            CopyFileA(a, b, FALSE);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+            np_copy_file(a, b);
+    }
+    np_dir_close(&d);
 }
 
 /* ---- the session ------------------------------------------------------------ */
@@ -535,12 +519,12 @@ static uint64_t build_identity(const char *game_dir)
         h = fnv(h, s_build_id, strlen(s_build_id));
         fprintf(stderr, "[NET] build: %s\n", s_build_id);
     } else {
-        GetModuleFileNameA(NULL, path, MAX_PATH);
+        np_exe_path(path, sizeof path);
         h = fnv_file(h, path);
         fprintf(stderr, "[NET] build: %s; matching the exe's bytes\n",
                 s_build_id && *s_build_id ? s_build_id : "(no identity)");
     }
-    snprintf(path, sizeof path, "%s\\default.xbe", game_dir ? game_dir : ".");
+    snprintf(path, sizeof path, "%s%cdefault.xbe", game_dir ? game_dir : ".", NP_SEP);
     h = fnv_file(h, path);
     return fnv(h, "portable-math", 13);
 }
@@ -555,7 +539,7 @@ static int handshake_host(int port, const char *save_src)
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(s_sock, (struct sockaddr *)&a, sizeof a)) {
-        fprintf(stderr, "[NET] cannot listen on UDP port %d (%d)\n", port, WSAGetLastError());
+        fprintf(stderr, "[NET] cannot listen on UDP port %d (%d)\n", port, np_sockerr());
         return 0;
     }
     /* The saves go out on TCP, same port: listen now so a joiner that
@@ -563,17 +547,17 @@ static int handshake_host(int port, const char *save_src)
     ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET || bind(ls, (struct sockaddr *)&a, sizeof a)
         || listen(ls, NP_MAXP)) {
-        fprintf(stderr, "[NET] cannot listen on TCP port %d (%d)\n", port, WSAGetLastError());
+        fprintf(stderr, "[NET] cannot listen on TCP port %d (%d)\n", port, np_sockerr());
         return 0;
     }
     session_dir(0, port);
     {
         char src[MAX_PATH], dst[MAX_PATH];
-        snprintf(src, sizeof src, "%s\\UDATA", save_src);
-        snprintf(dst, sizeof dst, "%s\\UDATA", s_session);
+        snprintf(src, sizeof src, "%s%cUDATA", save_src, NP_SEP);
+        snprintf(dst, sizeof dst, "%s%cUDATA", s_session, NP_SEP);
         copy_tree(src, dst);
-        snprintf(src, sizeof src, "%s\\TDATA", save_src);
-        snprintf(dst, sizeof dst, "%s\\TDATA", s_session);
+        snprintf(src, sizeof src, "%s%cTDATA", save_src, NP_SEP);
+        snprintf(dst, sizeof dst, "%s%cTDATA", s_session, NP_SEP);
         copy_tree(src, dst);
     }
     fprintf(stderr, "[NET] hosting on UDP port %d: waiting for %d player(s)\n",
@@ -724,7 +708,6 @@ static int handshake_join(const char *ip, int port)
 int xbox_NetplayStart(const char *game_dir)
 {
     const char *e = getenv("RECOMP_NET");
-    WSADATA wd;
     int ok = 0;
     if (!e || !*e)
         return 0;
@@ -736,15 +719,12 @@ int xbox_NetplayStart(const char *game_dir)
         s_delay = atoi(getenv("RECOMP_NET_DELAY"));
     if (s_delay < 1 || s_delay > 30)
         s_delay = 3;
-    if (WSAStartup(MAKEWORD(2, 2), &wd))
+    if (!np_net_init())
         return 0;
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s_sock == INVALID_SOCKET)
         return 0;
-    {
-        DWORD to = 200;                             /* handshake polls */
-        setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof to);
-    }
+    np_rcvtimeo(s_sock, 200);                       /* handshake polls */
     s_exe_hash = build_identity(game_dir);
     if (!strncmp(e, "host:", 5)) {
         const char *sd = getenv("RECOMP_SAVE_DIR");
@@ -773,10 +753,7 @@ int xbox_NetplayStart(const char *game_dir)
         }
         return 0;
     }
-    {
-        DWORD to = 10;                              /* the resend cadence */
-        setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof to);
-    }
+    np_rcvtimeo(s_sock, 10);                        /* the resend cadence */
     {   /* frames before the delay: nothing pressed, for everyone */
         static const uint8_t zero[18];
         uint32_t f;
@@ -791,26 +768,26 @@ int xbox_NetplayStart(const char *game_dir)
      * (the Network tab's "Vulkan display") changes only what this player
      * sees: software stays authoritative and Vulkan presents (P10's shadow
      * mode). Headless there is nothing to present. */
-    _putenv_s("RECOMP_SCHED_VIRTUAL", "1");
-    _putenv_s("RECOMP_SAVE_DIR", s_session);
+    np_setenv("RECOMP_SCHED_VIRTUAL", "1");
+    np_setenv("RECOMP_SAVE_DIR", s_session);
     {
         char n[8];
         snprintf(n, sizeof n, "%d", s_np);
-        _putenv_s("RECOMP_USB_PADS", n);
+        np_setenv("RECOMP_USB_PADS", n);
     }
     {
         const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
         if (vk && *vk == '1' && !(hl && *hl == '1')) {
-            _putenv_s("RECOMP_GPU", "vulkan");
-            _putenv_s("RECOMP_VK_SHADOW", "1");
-            _putenv_s("RECOMP_VK_PRESENT", "1");
+            np_setenv("RECOMP_GPU", "vulkan");
+            np_setenv("RECOMP_VK_SHADOW", "1");
+            np_setenv("RECOMP_VK_PRESENT", "1");
         } else {
-            _putenv_s("RECOMP_GPU", "software");
+            np_setenv("RECOMP_GPU", "software");
         }
     }
     /* One implementation of the x87 maths (fsin, fcos, ...) on every peer:
      * each OS's C library differs in the last bit (src/kernel/recomp_math.c). */
-    _putenv_s("RECOMP_PORTABLE_MATH", "1");
+    np_setenv("RECOMP_PORTABLE_MATH", "1");
     recomp_set_portable_math(1);
     s_on = 1;
     usb_gamepad_set_override(xbox_NetplayPadState);
