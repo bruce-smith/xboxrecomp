@@ -1996,7 +1996,9 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     }
 #undef SET_DYN
 
-    if (st->zpass_enable && rt->sc > 1) {
+    /* Compare and shadow modes: software answers every visibility test (the
+     * executor sends no reports here), so nothing is counted. */
+    if (st->zpass_enable && !B.compare_mode && rt->sc > 1) {
         /* Supersampled: the count must be the native one (the title steers
          * by it, and a replay must see the same numbers at any scale). The
          * draw runs once more first, writing nothing, with a shader that
@@ -2023,7 +2025,7 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
             vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_wmask & 0xFF);
         }
         vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
-    } else if (st->zpass_enable) {
+    } else if (st->zpass_enable && !B.compare_mode) {
         B.zdraws++;
         vkCmdBeginQuery(cb, s->qpool, s->nq, VK_QUERY_CONTROL_PRECISE_BIT);
         vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
