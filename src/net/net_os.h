@@ -104,7 +104,9 @@ static void np_dir_close(NpDir *d) { FindClose(d->h); }
 #else   /* POSIX */
 
 #include <sys/types.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <netinet/in.h>

@@ -24,6 +24,7 @@
  *   and sends the hash; a mismatch stops the session with a report.
  */
 #include "net_os.h"         /* sockets etc.: Winsock or POSIX; first, for winsock2.h */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,15 @@
 
 enum { PK_HELLO = 1, PK_WELCOME, PK_START, PK_INPUT, PK_HASH, PK_BYE };
 
-typedef struct { uint32_t f; uint8_t have; uint8_t s[18]; } NpIn;
+/* One player's frame: the 18 bytes of pad state, then an optional cheat
+ * event (a flag and 22 bytes, cheats.c's request), so a cheat applies on every
+ * peer at the same frame. NP_PROTO is in the join identity: peers whose
+ * records differ cannot join each other. */
+#define NP_PROTO    2
+#define NP_REC      (18 + 1 + 22)
+#define NP_EV_FLAG  18
+#define NP_EV       19
+typedef struct { uint32_t f; uint8_t have; uint8_t s[NP_REC]; } NpIn;
 
 static int s_on, s_is_host, s_me, s_np = 2, s_delay = 3;
 static SOCKET s_sock = INVALID_SOCKET;
@@ -53,6 +62,7 @@ static SRWLOCK s_lock = SRWLOCK_INIT;
 static uint32_t s_sampled;                       /* local frames sampled so far */
 static uint64_t s_exe_hash;
 static char s_why[256];                          /* why the session did not start */
+static char s_host_info[400];                    /* the host's status lines */
 static uint32_t s_hash_f[NP_MAXP];
 static uint64_t s_hash_v[NP_MAXP][2];            /* last two checks per player */
 static uint32_t s_hash_fr[NP_MAXP][2];
@@ -84,7 +94,7 @@ int xbox_NetplayPlayers(void) { return s_np; }
 
 #pragma pack(push, 1)
 typedef struct { uint8_t type, player, players, delay; uint64_t exe; } PkHello;
-typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][18]; } PkInput;
+typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][NP_REC]; } PkInput;
 typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t hash; } PkHash;
 /* A refused hello is answered with a BYE whose reason says why. */
 enum { BYE_LEFT = 0, BYE_BUILD = 1, BYE_FULL = 2 };
@@ -125,7 +135,7 @@ static void store_input(int player, uint32_t f, const uint8_t *s)
     AcquireSRWLockExclusive(&s_lock);
     if (!(e->have && e->f == f)) {
         e->f = f;
-        memcpy(e->s, s, 18);
+        memcpy(e->s, s, NP_REC);
         e->have = 1;
     }
     ReleaseSRWLockExclusive(&s_lock);
@@ -145,7 +155,7 @@ static void send_local_inputs(void)
     pk.first = first;
     AcquireSRWLockShared(&s_lock);
     for (f = first; f <= last; f++, n++)
-        memcpy(pk.s[n], s_in[s_me][f % NP_RING].s, 18);
+        memcpy(pk.s[n], s_in[s_me][f % NP_RING].s, NP_REC);
     ReleaseSRWLockShared(&s_lock);
     pk.count = (uint16_t)n;
     broadcast(&pk, (int)sizeof pk, -1);
@@ -530,7 +540,189 @@ static uint64_t build_identity(const char *game_dir)
     }
     snprintf(path, sizeof path, "%s%cdefault.xbe", game_dir ? game_dir : ".", NP_SEP);
     h = fnv_file(h, path);
-    return fnv(h, "portable-math", 13);
+    h = fnv(h, "portable-math", 13);
+    {
+        const uint32_t proto = NP_PROTO;
+        h = fnv(h, &proto, sizeof proto);
+    }
+    return h;
+}
+
+/* ---- the status window -------------------------------------------------------
+ *
+ * Starting a network game restarts the exe, and the session is set up before
+ * the game's own window exists: without this the player saw nothing at all
+ * for as long as it took (up to 2 minutes, or for ever while a host waited
+ * for players). It shows what is happening, and Cancel, Escape or closing it
+ * gives up: the game then starts on its own. Windows only (and not headless);
+ * the same lines go to the log everywhere. */
+static char s_stat[640];
+static volatile LONG s_cancel;                   /* the player gave up */
+static volatile LONG s_stat_done;
+#if defined(_WIN32)
+static SRWLOCK s_stat_lock = SRWLOCK_INIT;
+static HANDLE s_stat_thread;
+
+static LRESULT CALLBACK stat_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT r;
+        char t[sizeof s_stat];
+        AcquireSRWLockShared(&s_stat_lock);
+        memcpy(t, s_stat, sizeof t);
+        ReleaseSRWLockShared(&s_stat_lock);
+        GetClientRect(h, &r);
+        r.left += 18; r.top += 16; r.right -= 18; r.bottom -= 56;
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextA(dc, t, -1, &r, DT_WORDBREAK | DT_NOPREFIX);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == 1)
+            InterlockedExchange(&s_cancel, 1);
+        return 0;
+    case WM_CLOSE:
+        InterlockedExchange(&s_cancel, 1);
+        return 0;
+    case WM_TIMER:
+        if (s_stat_done) {
+            DestroyWindow(h);
+            return 0;
+        }
+        InvalidateRect(h, NULL, TRUE);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static DWORD WINAPI stat_thread(LPVOID unused)
+{
+    WNDCLASSA wc;
+    HWND h;
+    MSG msg;
+    int W = 520, H = 260;
+    (void)unused;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = stat_proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = "Blinx2NetStatus";
+    RegisterClassA(&wc);
+    h = CreateWindowExA(WS_EX_TOPMOST, wc.lpszClassName, "Blinx 2 network game",
+                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                        (GetSystemMetrics(SM_CXSCREEN) - W) / 2,
+                        (GetSystemMetrics(SM_CYSCREEN) - H) / 2, W, H,
+                        NULL, NULL, wc.hInstance, NULL);
+    if (!h)
+        return 0;
+    {
+        HWND b = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                               W - 130, H - 80, 100, 28, h, (HMENU)(INT_PTR)1,
+                               wc.hInstance, NULL);
+        SendMessageA(b, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    }
+    ShowWindow(h, SW_SHOWNORMAL);
+    SetForegroundWindow(h);
+    SetTimer(h, 1, 250, NULL);
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE)
+            InterlockedExchange(&s_cancel, 1);
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return 0;
+}
+#endif
+
+/* The status text (also logged when it changes). */
+static void np_status(const char *fmt, ...)
+{
+    char t[sizeof s_stat];
+    va_list ap;
+    int changed;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof t, fmt, ap);
+    va_end(ap);
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&s_stat_lock);
+#endif
+    changed = strcmp(t, s_stat) != 0;
+    if (changed)
+        memcpy(s_stat, t, sizeof t);
+#if defined(_WIN32)
+    ReleaseSRWLockExclusive(&s_stat_lock);
+#endif
+    if (changed) {
+        fprintf(stderr, "[NET] %s\n", t);
+        fflush(stderr);
+    }
+}
+
+static void stat_open(void)
+{
+#if defined(_WIN32)
+    const char *hl = getenv("RECOMP_HEADLESS");
+    if (!(hl && *hl == '1'))
+        s_stat_thread = CreateThread(NULL, 0, stat_thread, NULL, 0, NULL);
+#endif
+}
+
+static void stat_close(void)
+{
+    InterlockedExchange(&s_stat_done, 1);
+#if defined(_WIN32)
+    if (s_stat_thread) {
+        WaitForSingleObject(s_stat_thread, 2000);
+        CloseHandle(s_stat_thread);
+        s_stat_thread = NULL;
+    }
+#endif
+}
+
+/* This PC's IPv4 addresses, for the host to tell the others. */
+static void local_addresses(char *out, size_t n)
+{
+    char name[256];
+    struct addrinfo hints, *res = NULL, *a;
+    size_t used = 0;
+    out[0] = 0;
+    if (gethostname(name, sizeof name))
+        return;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(name, NULL, &hints, &res))
+        return;
+    for (a = res; a && used + 20 < n; a = a->ai_next) {
+        char ip[64];
+        const struct sockaddr_in *sa = (const struct sockaddr_in *)a->ai_addr;
+        if (!inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof ip) || !strncmp(ip, "127.", 4))
+            continue;
+        if (strstr(out, ip))
+            continue;
+        used += (size_t)snprintf(out + used, n - used, "%s%s", used ? ", " : "", ip);
+    }
+    freeaddrinfo(res);
+}
+
+/* Wait up to ms for a socket to become readable (a connection to accept). */
+static int wait_readable(SOCKET sk, unsigned ms)
+{
+    fd_set r;
+    struct timeval tv;
+    FD_ZERO(&r);
+    FD_SET(sk, &r);
+    tv.tv_sec = (long)(ms / 1000u);
+    tv.tv_usec = (long)((ms % 1000u) * 1000u);
+    return select((int)sk + 1, &r, NULL, NULL, &tv) > 0;
 }
 
 static int handshake_host(int port, const char *save_src)
@@ -543,7 +735,8 @@ static int handshake_host(int port, const char *save_src)
     a.sin_port = htons((u_short)port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(s_sock, (struct sockaddr *)&a, sizeof a)) {
-        fprintf(stderr, "[NET] cannot listen on UDP port %d (%d)\n", port, np_sockerr());
+        snprintf(s_why, sizeof s_why, "Cannot host on UDP port %d (error %d): is another "
+                 "game already using it? Choose another port.", port, np_sockerr());
         return 0;
     }
     /* The saves go out on TCP, same port: listen now so a joiner that
@@ -551,7 +744,8 @@ static int handshake_host(int port, const char *save_src)
     ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET || bind(ls, (struct sockaddr *)&a, sizeof a)
         || listen(ls, NP_MAXP)) {
-        fprintf(stderr, "[NET] cannot listen on TCP port %d (%d)\n", port, np_sockerr());
+        snprintf(s_why, sizeof s_why, "Cannot host on TCP port %d (error %d): is another "
+                 "program already using it? Choose another port.", port, np_sockerr());
         return 0;
     }
     session_dir(0, port);
@@ -564,11 +758,23 @@ static int handshake_host(int port, const char *save_src)
         snprintf(dst, sizeof dst, "%s%cTDATA", s_session, NP_SEP);
         copy_tree(src, dst);
     }
-    fprintf(stderr, "[NET] hosting on UDP port %d: waiting for %d player(s)\n",
-            port, s_np - 1);
-    fflush(stderr);
+    {
+        char ips[200];
+        local_addresses(ips, sizeof ips);
+        snprintf(s_host_info, sizeof s_host_info,
+                 "Hosting a network game for %d players on port %d.\n\n"
+                 "The others choose Join and enter this PC's address (%s) and port "
+                 "%d. This PC's firewall must let the game in (UDP and TCP).",
+                 s_np, port, ips[0] ? ips : "see ipconfig", port);
+    }
     while (joined < s_np - 1) {
         char buf[256];
+        np_status("%s\n\nWaiting for players: %d of %d joined.", s_host_info,
+                  joined, s_np - 1);
+        if (s_cancel) {
+            closesocket(ls);
+            return 0;
+        }
         struct sockaddr_in from;
         int fl = sizeof from, i, known = -1;
         int n = recvfrom(s_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
@@ -602,8 +808,27 @@ static int handshake_host(int port, const char *save_src)
     {   /* the saves, to every joiner */
         int k;
         for (k = 0; k < s_np - 1; k++) {
-            SOCKET c = accept(ls, NULL, NULL);
+            SOCKET c;
             uint16_t end = 0;
+            DWORD t0 = GetTickCount();
+            np_status("%s\n\nAll players joined. Sending the saves (%d of %d)...",
+                      s_host_info, k + 1, s_np - 1);
+            /* A joiner fetches them right after its welcome; one that cannot
+             * reach TCP (a firewall) would block this for ever. */
+            while (!wait_readable(ls, 250)) {
+                if (s_cancel) {
+                    closesocket(ls);
+                    return 0;
+                }
+                if (GetTickCount() - t0 > 60000) {
+                    snprintf(s_why, sizeof s_why, "A player joined but could not fetch the "
+                             "saves in 60 s (TCP port %d). This PC's firewall must let the "
+                             "game in on TCP as well as UDP.", port);
+                    closesocket(ls);
+                    return 0;
+                }
+            }
+            c = accept(ls, NULL, NULL);
             if (c == INVALID_SOCKET) {
                 fprintf(stderr, "[NET] a joiner did not fetch the saves\n");
                 closesocket(ls);
@@ -641,19 +866,43 @@ static int handshake_join(const char *ip, int port)
     s_peer[0].sin_family = AF_INET;
     s_peer[0].sin_port = htons((u_short)port);
     if (inet_pton(AF_INET, ip, &s_peer[0].sin_addr) != 1) {
-        fprintf(stderr, "[NET] not an IPv4 address: %s\n", ip);
-        return 0;
+        /* A name (a VPN's, e.g. Tailscale's): its IPv4 address. */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        np_status("Looking up %s ...", ip);
+        if (getaddrinfo(ip, NULL, &hints, &res) || !res) {
+            snprintf(s_why, sizeof s_why, "\"%s\" is not an address this PC can find. "
+                     "Enter the host's IP address (e.g. 192.168.1.23).", ip);
+            return 0;
+        }
+        s_peer[0].sin_addr = ((const struct sockaddr_in *)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
     }
     s_npeer = 1;
     memset(&h, 0, sizeof h);
     h.type = PK_HELLO;
     h.exe = s_exe_hash;
-    fprintf(stderr, "[NET] joining %s:%d ...\n", ip, port);
-    fflush(stderr);
     for (;;) {
         char buf[256];
         struct sockaddr_in from;
         int fl = sizeof from, n;
+        if (s_cancel)
+            return 0;
+        if (!got_welcome) {
+            unsigned secs = (unsigned)((GetTickCount() - t0) / 1000u);
+            if (secs < 5)
+                np_status("Connecting to %s, port %d ...", ip, port);
+            else
+                np_status("No answer yet from %s, port %d (%u s).\n\nCheck that this is "
+                          "the host's address, that the host has started \"Host a game\", "
+                          "and that the host's firewall lets the game in (UDP and TCP port "
+                          "%d). Trying for 2 minutes.", ip, port, secs, port);
+        } else {
+            np_status("Connected: you are player %d of %d.\n\nWaiting for the host to "
+                      "start: it starts when all %d players have joined.",
+                      s_me + 1, s_np, s_np);
+        }
         /* Hello until welcomed, then once a second until the START: the
          * host answers a known player's hello with the START again. */
         if (!got_welcome || GetTickCount() - t_hello >= 1000) {
@@ -669,6 +918,8 @@ static int handshake_join(const char *ip, int port)
             s_np = w->players;
             s_delay = w->delay;
             got_welcome = 1;
+            np_status("Connected: you are player %d of %d.\n\nReceiving the host's "
+                      "saves (TCP port %d) ...", s_me + 1, s_np, port);
             session_dir(s_me, port);
             c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (c == INVALID_SOCKET
@@ -685,6 +936,9 @@ static int handshake_join(const char *ip, int port)
                 return 0;
             }
             fprintf(stderr, "[NET] received the host's saves (%d files)\n", files);
+            np_status("Connected: you are player %d of %d. Saves received.\n\nWaiting for "
+                      "the host to start: it starts when all %d players have joined.",
+                      s_me + 1, s_np, s_np);
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
             return 1;
         } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
@@ -730,6 +984,8 @@ int xbox_NetplayStart(const char *game_dir)
         return 0;
     np_rcvtimeo(s_sock, 200);                       /* handshake polls */
     s_exe_hash = build_identity(game_dir);
+    np_status("Starting the network game ...");
+    stat_open();
     if (!strncmp(e, "host:", 5)) {
         const char *sd = getenv("RECOMP_SAVE_DIR");
         s_is_host = 1;
@@ -744,8 +1000,18 @@ int xbox_NetplayStart(const char *game_dir)
             ok = handshake_join(ip, atoi(c + 1));
         }
     }
+    stat_close();
+    if (!ok && s_cancel) {
+        fprintf(stderr, "[NET] cancelled by the player: no network game\n");
+        fflush(stderr);
+        closesocket(s_sock);
+        s_sock = INVALID_SOCKET;
+        return 0;
+    }
     if (!ok) {
         const char *hl = getenv("RECOMP_HEADLESS");
+        if (!s_why[0])
+            snprintf(s_why, sizeof s_why, "The network game could not start (%s).", e);
         if (s_why[0])
             fprintf(stderr, "[NET] %s\n", s_why);
         fprintf(stderr, "[NET] RECOMP_NET=%s: no network game\n", e);
@@ -759,7 +1025,7 @@ int xbox_NetplayStart(const char *game_dir)
     }
     np_rcvtimeo(s_sock, 10);                        /* the resend cadence */
     {   /* frames before the delay: nothing pressed, for everyone */
-        static const uint8_t zero[18];
+        static const uint8_t zero[NP_REC];
         uint32_t f;
         int p;
         for (p = 0; p < s_np; p++)
@@ -805,6 +1071,69 @@ int xbox_NetplayStart(const char *game_dir)
             "saves: %s\n", s_me + 1, s_np, s_delay, s_session);
     fflush(stderr);
     return 1;
+}
+
+/* ---- cheats ----------------------------------------------------------------------
+ *
+ * xbox_NetplayCheatSend queues a local cheat request; one per frame leaves
+ * with this player's next sampled frame (cheat_take). When the emulated pad of
+ * a port hands a frame's input to the guest, that frame's event becomes due
+ * (cheat_due) -- in the guest's own order, so the same on every peer -- and
+ * cheats.c applies it from xbox_NetplayCheatNext at its poll. */
+#define NP_CQ 64
+static uint8_t s_cq[NP_CQ][22];                  /* local requests not yet sent */
+static unsigned s_cq_head, s_cq_tail;
+static uint8_t s_dq[NP_CQ][22];                  /* due, not yet applied */
+static unsigned s_dq_head, s_dq_tail;
+static uint32_t s_ev_done[NP_MAXP];              /* last frame + 1 taken per port */
+
+int xbox_NetplayCheatSend(const uint8_t ev[22])
+{
+    int ok = 0;
+    if (!s_on)
+        return 0;
+    AcquireSRWLockExclusive(&s_lock);
+    if (s_cq_tail - s_cq_head < NP_CQ) {
+        memcpy(s_cq[s_cq_tail++ % NP_CQ], ev, 22);
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&s_lock);
+    if (!ok)
+        fprintf(stderr, "[NET] cheat request dropped: %d already waiting\n", NP_CQ);
+    return 1;                                   /* taken (or dropped): not local */
+}
+
+/* flag_ev: the record's flag byte, then 22 bytes. */
+static void cheat_take(uint8_t *flag_ev)
+{
+    AcquireSRWLockExclusive(&s_lock);
+    if (s_cq_head != s_cq_tail) {
+        flag_ev[0] = 1;
+        memcpy(flag_ev + 1, s_cq[s_cq_head++ % NP_CQ], 22);
+    }
+    ReleaseSRWLockExclusive(&s_lock);
+}
+
+static void cheat_due(const uint8_t *ev)
+{
+    AcquireSRWLockExclusive(&s_lock);
+    if (s_dq_tail - s_dq_head < NP_CQ)
+        memcpy(s_dq[s_dq_tail++ % NP_CQ], ev, 22);
+    ReleaseSRWLockExclusive(&s_lock);
+}
+
+int xbox_NetplayCheatNext(uint8_t ev[22])
+{
+    int got = 0;
+    if (!s_on)
+        return 0;
+    AcquireSRWLockExclusive(&s_lock);
+    if (s_dq_head != s_dq_tail) {
+        memcpy(ev, s_dq[s_dq_head++ % NP_CQ], 22);
+        got = 1;
+    }
+    ReleaseSRWLockExclusive(&s_lock);
+    return got;
 }
 
 /* ---- the guest side ------------------------------------------------------------- */
@@ -867,10 +1196,54 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
     static uint32_t checked;
     DWORD t0;
 
+    /* RECOMP_NET_TEST_CHEAT=<frame> (testing the cheat path): this peer sends
+     * three requests (op 0xEE, ignored by cheats.c) at that frame; every
+     * peer logs the frame each comes due at, which must be the same. */
+    {
+        static int test = -1;
+        static uint32_t at;
+        if (test < 0) {
+            const char *e = getenv("RECOMP_NET_TEST_CHEAT");
+            test = e && *e;
+            at = test ? (uint32_t)atoi(e) : 0;
+        }
+        if (test && f >= at) {
+            uint8_t ev[22];
+            int k;
+            test = 0;
+            memset(ev, 0, sizeof ev);
+            ev[0] = 0xEE;
+            for (k = 0; k < 3; k++)
+                xbox_NetplayCheatSend(ev);
+        }
+    }
+
+    /* RECOMP_NET_TEST_STALL=<frame>,<ms> (testing): this peer stops for
+     * <ms> at that frame, so the others wait for it that long. */
+    {
+        static int stall = -1;
+        static uint32_t at, ms;
+        if (stall < 0) {
+            const char *e = getenv("RECOMP_NET_TEST_STALL"), *c;
+            stall = e && (c = strchr(e, ',')) != NULL;
+            if (stall) {
+                at = (uint32_t)atoi(e);
+                ms = (uint32_t)atoi(c + 1);
+            }
+        }
+        if (stall && f >= at) {
+            stall = 0;
+            fprintf(stderr, "[NET] test: stalling %u ms at frame %u\n", ms, f);
+            Sleep(ms);
+        }
+    }
+
     /* This peer's own input, sampled once per frame ahead by the delay. */
     while (s_sampled <= f + (uint32_t)s_delay) {
-        uint8_t local[18];
+        uint8_t local[NP_REC];
+        memset(local, 0, sizeof local);
         usb_gamepad_sample_local(local);
+        cheat_take(local + NP_EV_FLAG);         /* one queued cheat rides along */
         store_input(s_me, s_sampled, local);
         s_sampled++;
     }
@@ -919,12 +1292,24 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
     t0 = GetTickCount();
     for (;;) {
         NpIn *e = &s_in[port][f % NP_RING];
-        int ok;
+        int ok, due = 0;
+        uint8_t ev[22];
         AcquireSRWLockShared(&s_lock);
         ok = e->have && e->f == f;
-        if (ok)
+        if (ok) {
             memcpy(state18, e->s, 18);
+            if (e->s[NP_EV_FLAG] && s_ev_done[port] != f + 1u) {
+                memcpy(ev, e->s + NP_EV, 22);
+                due = 1;
+            }
+            s_ev_done[port] = f + 1u;
+        }
         ReleaseSRWLockShared(&s_lock);
+        if (due) {                              /* now, the same on every peer */
+            cheat_due(ev);
+            fprintf(stderr, "[NET] frame %u: cheat request %u from player %d due\n",
+                    f, ev[0], port + 1);
+        }
         if (ok)
             return 1;
         /* A slower player is waited for as long as it takes -- a slow disk,

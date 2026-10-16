@@ -463,10 +463,27 @@ void start_network_game(int host, const char *addr, int port, int players, int d
         *slash = 0;
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
+    /* The new process waits for this one to be gone before it rotates and
+     * reopens blinx2_recomp.log (main.c): while this one still held the log,
+     * the new one's reopen failed and it ran with no log at all. */
+    snprintf(v, sizeof v, "%lu", (unsigned long)GetCurrentProcessId());
+    SetEnvironmentVariableA("RECOMP_NET_PARENT", v);
+    fprintf(stderr, "[NET] restarting into the network game (%s)\n",
+            host ? "host" : "join");
+    fflush(stderr);
     if (CreateProcessA(exe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, dir, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         TerminateProcess(GetCurrentProcess(), 0);
+    } else {
+        char msg[200];
+        snprintf(msg, sizeof msg, "Could not restart the game for the network game "
+                 "(error %lu).", (unsigned long)GetLastError());
+        fprintf(stderr, "[NET] %s\n", msg);
+        fflush(stderr);
+        MessageBoxA(nullptr, msg, "Blinx 2 network game", MB_OK | MB_ICONWARNING);
+        SetEnvironmentVariableA("RECOMP_NET", nullptr);
+        SetEnvironmentVariableA("RECOMP_NET_PARENT", nullptr);
     }
 #endif
 }

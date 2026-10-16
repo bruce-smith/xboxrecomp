@@ -26,6 +26,15 @@ int xbox_NetplayPlayers(void);
  * current frame. */
 int xbox_NetplayPadState(int port, uint8_t *state18);
 
+/* Cheats in a network game (cheats.c): a request (22 bytes, as recorded in
+ * IN_EVT_CHEAT) must apply on every peer at the same frame.
+ * xbox_NetplayCheatSend: 1 if a network game took it -- then do not apply it
+ * locally; it travels with this player's next frame (one a frame, the rest
+ * queue). xbox_NetplayCheatNext: the next request that has come due, 1 if
+ * one was returned; call it in a loop at the poll and apply each. */
+int xbox_NetplayCheatSend(const uint8_t ev[22]);
+int xbox_NetplayCheatNext(uint8_t ev[22]);
+
 #ifdef __cplusplus
 }
 #endif
