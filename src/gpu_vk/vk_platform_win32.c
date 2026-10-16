@@ -4,6 +4,7 @@
  * Wayland, or an SDL window; pthreads) exporting the same functions.
  */
 #include <windows.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "vk_internal.h"
 
@@ -78,3 +79,31 @@ void vk_mutex_lock(void *m)   { AcquireSRWLockExclusive((SRWLOCK *)m); }
 void vk_mutex_unlock(void *m) { ReleaseSRWLockExclusive((SRWLOCK *)m); }
 void vk_yield(void)           { Sleep(0); }
 void vk_store_fence(void)     { MemoryBarrier(); }
+
+/* RECOMP_VK_CACHE_DIR, else %LOCALAPPDATA%\xboxrecomp\vkcache. */
+int vk_cache_dir(char *buf, size_t n)
+{
+    const char *e = getenv("RECOMP_VK_CACHE_DIR");
+    char base[MAX_PATH];
+    DWORD a;
+    if (e && *e) {
+        snprintf(buf, n, "%s", e);
+    } else {
+        DWORD l = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+        if (!l || l >= MAX_PATH)
+            return 0;
+        snprintf(buf, n, "%s\\xboxrecomp", base);
+        CreateDirectoryA(buf, NULL);
+        snprintf(buf, n, "%s\\xboxrecomp\\vkcache", base);
+    }
+    CreateDirectoryA(buf, NULL);
+    a = GetFileAttributesA(buf);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+int vk_file_replace(const char *from, const char *to)
+{
+    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+unsigned vk_process_id(void) { return (unsigned)GetCurrentProcessId(); }

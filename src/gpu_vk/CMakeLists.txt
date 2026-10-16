@@ -42,6 +42,7 @@ set(GPU_VK_SOURCES
     vk_device.c
     vk_present.c
     vk_shader.c
+    vk_cache.c
     vk_backend.c
     vk_psh.c
     vk_vsh.c

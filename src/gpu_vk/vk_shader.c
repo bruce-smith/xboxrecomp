@@ -23,7 +23,7 @@ static uint64_t fnv1a64(const char *s)
     return h;
 }
 
-int vk_glsl_to_spirv(int fragment, const char *src, uint32_t **words, size_t *nwords)
+static int glsl_compile(int fragment, const char *src, uint32_t **words, size_t *nwords)
 {
     glslang_input_t in;
     glslang_shader_t *sh;
@@ -72,6 +72,38 @@ int vk_glsl_to_spirv(int fragment, const char *src, uint32_t **words, size_t *nw
     glslang_program_delete(prog);
     glslang_shader_delete(sh);
     return ok;
+}
+
+static unsigned s_compiled, s_cached;
+static double s_glsl_ms;
+
+/* The on-disk cache first (vk_cache.c), glslang otherwise. */
+int vk_glsl_to_spirv(int fragment, const char *src, uint32_t **words, size_t *nwords)
+{
+    double t0;
+    int ok;
+    if (vk_cache_spirv_get(fragment, src, words, nwords)) {
+        s_cached++;
+        return 1;
+    }
+    t0 = vk_cache_now_ms();
+    ok = glsl_compile(fragment, src, words, nwords);
+    s_glsl_ms += vk_cache_now_ms() - t0;
+    s_compiled++;
+    if (ok)
+        vk_cache_spirv_put(fragment, src, *words, *nwords);
+    return ok;
+}
+
+/* Counted without a lock: the executor compiles nearly all of them, and
+ * these are statistics. */
+void vk_shader_stats(unsigned *compiled, unsigned *cached, double *ms)
+{
+    *compiled = s_compiled;
+    *cached = s_cached;
+    *ms = s_glsl_ms;
+    s_compiled = s_cached = 0;
+    s_glsl_ms = 0;
 }
 
 /* Modules by source hash; collisions are checked against the source. */

@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "vk_internal.h"
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -149,3 +152,33 @@ void vk_mutex_lock(void *m)   { pthread_mutex_lock((pthread_mutex_t *)m); }
 void vk_mutex_unlock(void *m) { pthread_mutex_unlock((pthread_mutex_t *)m); }
 void vk_yield(void)           { sched_yield(); }
 void vk_store_fence(void)     { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
+/* RECOMP_VK_CACHE_DIR, else $XDG_CACHE_HOME/xboxrecomp/vkcache, else
+ * ~/.cache/xboxrecomp/vkcache. */
+int vk_cache_dir(char *buf, size_t n)
+{
+    const char *e = getenv("RECOMP_VK_CACHE_DIR"), *x = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    struct stat st;
+    if (e && *e) {
+        snprintf(buf, n, "%s", e);
+    } else {
+        char base[512];
+        if (x && *x)
+            snprintf(base, sizeof base, "%s", x);
+        else if (home && *home)
+            snprintf(base, sizeof base, "%s/.cache", home);
+        else
+            return 0;
+        mkdir(base, 0755);
+        snprintf(buf, n, "%s/xboxrecomp", base);
+        mkdir(buf, 0755);
+        snprintf(buf, n, "%s/xboxrecomp/vkcache", base);
+    }
+    mkdir(buf, 0755);
+    return stat(buf, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+int vk_file_replace(const char *from, const char *to) { return rename(from, to) == 0; }
+
+unsigned vk_process_id(void) { return (unsigned)getpid(); }

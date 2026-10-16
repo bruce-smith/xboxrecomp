@@ -99,4 +99,27 @@ int   vk_present_extent(uint32_t *w, uint32_t *h);
 /* Presentation frame-rate cap in Hz, 0 = none (RECOMP_VK_FPS_CAP). */
 void  vk_present_set_cap(uint32_t hz);
 
+/* The on-disk shader and pipeline cache (vk_cache.c). */
+void        vk_cache_init(void);
+/* The VkPipelineCache data saved by an earlier run on this device and
+ * driver, or NULL. */
+const void *vk_cache_pipeline_data(size_t *n);
+/* SPIR-V for a GLSL source compiled before (malloc'd copy), 0 if none. */
+int         vk_cache_spirv_get(int fragment, const char *src, uint32_t **words,
+                               size_t *nwords);
+void        vk_cache_spirv_put(int fragment, const char *src, const uint32_t *words,
+                               size_t nwords);
+/* At a flip: write what is new, at most every 10 s and not in the middle of
+ * a burst of new pipelines (force: now). */
+void        vk_cache_save(VkPipelineCache pc, unsigned new_pipelines, int force);
+double      vk_cache_now_ms(void);
+/* GLSL compiles in this process since the last call: compiled, answered by
+ * the cache, and ms spent in glslang. */
+void        vk_shader_stats(unsigned *compiled, unsigned *cached, double *ms);
+/* The platform's part: the cache folder (made if missing; 0 if there is
+ * none), replacing one file by another, and this process's id. */
+int         vk_cache_dir(char *buf, size_t n);
+int         vk_file_replace(const char *from, const char *to);
+unsigned    vk_process_id(void);
+
 #endif

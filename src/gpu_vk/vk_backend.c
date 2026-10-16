@@ -135,6 +135,8 @@ static struct {
     Pipe pipes[VKB_PIPES];
     int npipes;
     uint32_t new_pipes, new_vsh;          /* created since the last stats line */
+    uint32_t frame_pipes;                 /* created since the last flip */
+    double   pipe_ms;                     /* in vkCreateGraphicsPipelines */
     uint32_t zdraws, nreports;            /* counted draws, GET_REPORTs */
     struct { VkPshKey key; VkShaderModule fs; int used; } fsh[VKB_FSH];
     /* Vertex programs, by their instruction words. */
@@ -1187,6 +1189,7 @@ static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModul
     VkPipeline p = VK_NULL_HANDLE;
     unsigned slot, probes;
     int i;
+    double t0;
     VkResult r_;
 
     if (blend)
@@ -1260,9 +1263,12 @@ static VkPipeline pipeline(const Nv2aDrawState *st, VkFormat cfmt, VkShaderModul
     ci.pColorBlendState = &cbs;
     ci.pDynamicState = &dyn;
     ci.layout = B.layout;
+    t0 = vk_cache_now_ms();
     if (!VK_OK(vkCreateGraphicsPipelines(g_vk.device, B.pcache, 1, &ci, NULL, &p)))
         return VK_NULL_HANDLE;
+    B.pipe_ms += vk_cache_now_ms() - t0;
     B.new_pipes++;
+    B.frame_pipes++;
     if (probes < VKB_PIPES && B.npipes < VKB_PIPES * 3 / 4) {
         B.pipes[slot].key = key;
         B.pipes[slot].fs = fs;
@@ -2358,11 +2364,16 @@ static int readback_finish(Readback *r)
 static void frame_stats(void)
 {
     if (getenv("RECOMP_VK_STATS") && B.frame % 60 == 0) {
+        unsigned compiled, cached;
+        double glsl_ms;
+        vk_shader_stats(&compiled, &cached, &glsl_ms);
         fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits,"
-                " %u new pipelines (%d kept), %u new vertex shaders, %u counted draws,"
+                " %u new pipelines (%d kept, %.0f ms), %u new vertex shaders,"
+                " GLSL %u compiled (%.0f ms) %u from the cache, %u counted draws,"
                 " %u visibility reports (last 60 frames)\n",
                 B.frame, B.draws, B.tris, B.uploads, B.submits, B.new_pipes, B.npipes,
-                B.new_vsh, B.zdraws, B.nreports);
+                B.pipe_ms, B.new_vsh, compiled, glsl_ms, cached, B.zdraws, B.nreports);
+        B.pipe_ms = 0;
         B.draws = B.tris = B.uploads = B.submits = B.new_pipes = B.new_vsh = 0;
         B.zdraws = B.nreports = 0;
     }
@@ -3356,9 +3367,17 @@ static int backend_init(void)
     if (!VK_OK(vkCreatePipelineLayout(g_vk.device, &pli, NULL, &B.layout)))
         return 0;
     {
+        /* With what an earlier run left (vk_cache.c); a driver that does not
+         * take the data back starts empty instead. */
         VkPipelineCacheCreateInfo pc = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-        if (!VK_OK(vkCreatePipelineCache(g_vk.device, &pc, NULL, &B.pcache)))
-            return 0;
+        vk_cache_init();
+        pc.pInitialData = vk_cache_pipeline_data(&pc.initialDataSize);
+        if (vkCreatePipelineCache(g_vk.device, &pc, NULL, &B.pcache) != VK_SUCCESS) {
+            pc.pInitialData = NULL;
+            pc.initialDataSize = 0;
+            if (!VK_OK(vkCreatePipelineCache(g_vk.device, &pc, NULL, &B.pcache)))
+                return 0;
+        }
     }
     B.vs = vk_shader_module(0, k_vs);
     if (!B.vs)
@@ -3408,11 +3427,20 @@ static int vk_lost(void)
 }
 
 /* FLIP_STALL: the frame, then any settings change (between frames). */
+/* Between two frames: new settings, and the shader cache to disk. */
+static void between_frames(void)
+{
+    if (!B.ok || g_vk.lost)
+        return;
+    apply_settings();
+    vk_cache_save(B.pcache, B.frame_pipes, 0);
+    B.frame_pipes = 0;
+}
+
 static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h)
 {
     flip_frame(addr, pitch, bpp, w, h);
-    if (B.ok && !g_vk.lost)
-        apply_settings();
+    between_frames();
 }
 
 static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h,
@@ -3433,12 +3461,11 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
         submit(0);
         flip_present(addr, w, h);
         frame_stats();
-        apply_settings();
+        between_frames();
         return;
     }
     compare_frame(addr, pitch, bpp, w, h, flip);
-    if (B.ok && !g_vk.lost)
-        apply_settings();
+    between_frames();
 }
 
 static const Nv2aBackend k_backend = {

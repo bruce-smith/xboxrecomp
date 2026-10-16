@@ -290,10 +290,13 @@ int main(void)
 
     /* Every check reads the frame from guest memory right after its flip.
      * (Set before the backend reads it.) */
+    /* The shader cache in the build folder, not the user's. */
 #ifdef _WIN32
     _putenv("RECOMP_VK_WRITEBACK=1");
+    _putenv("RECOMP_VK_CACHE_DIR=test_vkcache");
 #else
     setenv("RECOMP_VK_WRITEBACK", "1", 1);
+    setenv("RECOMP_VK_CACHE_DIR", "test_vkcache", 1);
 #endif
     g_mem = (uint8_t *)calloc(1, MEM_BYTES);
     be = xbox_vk_backend();
