@@ -279,6 +279,27 @@ void xbox_setting_set(const char *section, const char *key, int value)
     UNLOCK();
 }
 
+/* Text values (a host address, a name): stored as written, not declared. */
+void xbox_setting_get_str(const char *section, const char *key, const char *def,
+                          char *out, int n)
+{
+    Setting *s;
+    LOCK();
+    s = find(section, key);
+    snprintf(out, (size_t)n, "%s", s && s->value[0] ? s->value : (def ? def : ""));
+    UNLOCK();
+}
+
+void xbox_setting_set_str(const char *section, const char *key, const char *value)
+{
+    Setting *s;
+    LOCK();
+    s = add(section, key);
+    if (s)
+        snprintf(s->value, sizeof s->value, "%s", value ? value : "");
+    UNLOCK();
+}
+
 int xbox_setting_to_env(const char *section, const char *key)
 {
     Setting *s;

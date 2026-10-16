@@ -212,6 +212,197 @@ static DWORD WINAPI net_thread(LPVOID unused)
     return 0;
 }
 
+
+/* ---- the session's saves ----------------------------------------------------
+ *
+ * Every peer must start from the same saves. The host's UDATA/TDATA (its own
+ * saves: RECOMP_SAVE_DIR, else the game folder) go to every joiner over TCP
+ * on the session's port, and everyone -- the host too -- plays on a copy in
+ * %LOCALAPPDATA%\xboxrecomp\netplay\p<n> with an empty Z: cache, which the
+ * game rebuilds from the disc the same way everywhere. A network game never
+ * writes to anyone's real saves. */
+static char s_session[MAX_PATH];
+
+static void rm_tree(const char *dir)
+{
+    char pat[MAX_PATH], p[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+                continue;
+            snprintf(p, sizeof p, "%s\\%s", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                rm_tree(p);
+            else {
+                SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(p);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir);
+}
+
+static void mk_dirs(const char *path)            /* every level of path */
+{
+    char p[MAX_PATH];
+    size_t i;
+    snprintf(p, sizeof p, "%s", path);
+    for (i = 3; p[i]; i++)
+        if (p[i] == '\\') {
+            p[i] = 0;
+            CreateDirectoryA(p, NULL);
+            p[i] = '\\';
+        }
+    CreateDirectoryA(p, NULL);
+}
+
+static void session_dir(int player)
+{
+    char base[MAX_PATH];
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH))
+        snprintf(base, sizeof base, ".");
+    snprintf(s_session, sizeof s_session, "%s\\xboxrecomp\\netplay\\p%d", base, player + 1);
+    rm_tree(s_session);
+    mk_dirs(s_session);
+}
+
+/* Each file under dir as: u16 path length, the path (relative), u64 size, bytes. */
+static int send_all(SOCKET s, const void *p, int n)
+{
+    const char *c = (const char *)p;
+    while (n > 0) {
+        int k = send(s, c, n, 0);
+        if (k <= 0)
+            return 0;
+        c += k;
+        n -= k;
+    }
+    return 1;
+}
+
+static int recv_all(SOCKET s, void *p, int n)
+{
+    char *c = (char *)p;
+    while (n > 0) {
+        int k = recv(s, c, n, 0);
+        if (k <= 0)
+            return 0;
+        c += k;
+        n -= k;
+    }
+    return 1;
+}
+
+static int send_tree(SOCKET s, const char *root, const char *rel)
+{
+    char pat[MAX_PATH], full[MAX_PATH], r[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\%s\\*", root, rel);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return 1;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        snprintf(r, sizeof r, "%s\\%s", rel, fd.cFileName);
+        snprintf(full, sizeof full, "%s\\%s", root, r);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!send_tree(s, root, r))
+                break;
+        } else {
+            FILE *f = fopen(full, "rb");
+            uint16_t len = (uint16_t)strlen(r);
+            uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            char buf[65536];
+            size_t n;
+            if (!f)
+                continue;
+            if (!send_all(s, &len, 2) || !send_all(s, r, len) || !send_all(s, &size, 8)) {
+                fclose(f);
+                break;
+            }
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+                if (!send_all(s, buf, (int)n))
+                    break;
+            fclose(f);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return 1;
+}
+
+static int recv_tree(SOCKET s, const char *root)
+{
+    int files = 0;
+    for (;;) {
+        uint16_t len;
+        uint64_t size;
+        char r[MAX_PATH], full[MAX_PATH], buf[65536], *slash;
+        FILE *f;
+        if (!recv_all(s, &len, 2))
+            return -1;
+        if (!len)
+            return files;
+        if (len >= sizeof r || !recv_all(s, r, len) || !recv_all(s, &size, 8))
+            return -1;
+        r[len] = 0;
+        if (strstr(r, ".."))
+            return -1;                          /* nothing outside the session */
+        snprintf(full, sizeof full, "%s\\%s", root, r);
+        slash = strrchr(full, '\\');
+        if (slash) {
+            *slash = 0;
+            mk_dirs(full);
+            *slash = '\\';
+        }
+        f = fopen(full, "wb");
+        while (size > 0) {
+            int k = (int)(size < sizeof buf ? size : sizeof buf);
+            if (!recv_all(s, buf, k)) {
+                if (f)
+                    fclose(f);
+                return -1;
+            }
+            if (f)
+                fwrite(buf, 1, (size_t)k, f);
+            size -= (uint64_t)k;
+        }
+        if (f)
+            fclose(f);
+        files++;
+    }
+}
+
+/* Host: the saves into its own session, then to each joiner. */
+static void copy_tree(const char *src, const char *dst)
+{
+    char pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    mk_dirs(dst);
+    snprintf(pat, sizeof pat, "%s\\*", src);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        snprintf(a, sizeof a, "%s\\%s", src, fd.cFileName);
+        snprintf(b, sizeof b, "%s\\%s", dst, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            copy_tree(a, b);
+        else
+            CopyFileA(a, b, FALSE);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
 /* ---- the session ------------------------------------------------------------ */
 
 static uint64_t exe_hash(void)
@@ -232,10 +423,11 @@ static uint64_t exe_hash(void)
     return h;
 }
 
-static int handshake_host(int port)
+static int handshake_host(int port, const char *save_src)
 {
     struct sockaddr_in a;
     int joined = 0;
+    SOCKET ls;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((u_short)port);
@@ -243,6 +435,24 @@ static int handshake_host(int port)
     if (bind(s_sock, (struct sockaddr *)&a, sizeof a)) {
         fprintf(stderr, "[NET] cannot listen on UDP port %d (%d)\n", port, WSAGetLastError());
         return 0;
+    }
+    /* The saves go out on TCP, same port: listen now so a joiner that
+     * connects right after its welcome is queued. */
+    ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET || bind(ls, (struct sockaddr *)&a, sizeof a)
+        || listen(ls, NP_MAXP)) {
+        fprintf(stderr, "[NET] cannot listen on TCP port %d (%d)\n", port, WSAGetLastError());
+        return 0;
+    }
+    session_dir(0);
+    {
+        char src[MAX_PATH], dst[MAX_PATH];
+        snprintf(src, sizeof src, "%s\\UDATA", save_src);
+        snprintf(dst, sizeof dst, "%s\\UDATA", s_session);
+        copy_tree(src, dst);
+        snprintf(src, sizeof src, "%s\\TDATA", save_src);
+        snprintf(dst, sizeof dst, "%s\\TDATA", s_session);
+        copy_tree(src, dst);
     }
     fprintf(stderr, "[NET] hosting on UDP port %d: waiting for %d player(s)\n",
             port, s_np - 1);
@@ -277,6 +487,25 @@ static int handshake_host(int port)
         w.delay = (uint8_t)s_delay;
         w.exe = s_exe_hash;
         send_to(&from, &w, sizeof w);
+    }
+    {   /* the saves, to every joiner */
+        int k;
+        for (k = 0; k < s_np - 1; k++) {
+            SOCKET c = accept(ls, NULL, NULL);
+            uint16_t end = 0;
+            if (c == INVALID_SOCKET) {
+                fprintf(stderr, "[NET] a joiner did not fetch the saves\n");
+                closesocket(ls);
+                return 0;
+            }
+            send_tree(c, s_session, "UDATA");
+            send_tree(c, s_session, "TDATA");
+            send_all(c, &end, 2);
+            shutdown(c, SD_SEND);
+            closesocket(c);
+        }
+        closesocket(ls);
+        fprintf(stderr, "[NET] saves sent to %d player(s)\n", s_np - 1);
     }
     {
         PkHello st;
@@ -317,12 +546,28 @@ static int handshake_join(const char *ip, int port)
         if (!got_welcome)
             send_to(&s_peer[0], &h, sizeof h);
         n = recvfrom(s_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-        if (n >= (int)sizeof(PkHello) && buf[0] == PK_WELCOME) {
+        if (n >= (int)sizeof(PkHello) && buf[0] == PK_WELCOME && !got_welcome) {
             PkHello *w = (PkHello *)buf;
+            SOCKET c;
+            int files;
             s_me = w->player;
             s_np = w->players;
             s_delay = w->delay;
             got_welcome = 1;
+            session_dir(s_me);
+            c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (c == INVALID_SOCKET
+                || connect(c, (struct sockaddr *)&s_peer[0], sizeof s_peer[0])) {
+                fprintf(stderr, "[NET] cannot fetch the host's saves (TCP %d)\n", port);
+                return 0;
+            }
+            files = recv_tree(c, s_session);
+            closesocket(c);
+            if (files < 0) {
+                fprintf(stderr, "[NET] the host's saves did not arrive whole\n");
+                return 0;
+            }
+            fprintf(stderr, "[NET] received the host's saves (%d files)\n", files);
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
             return 1;
         }
@@ -334,7 +579,7 @@ static int handshake_join(const char *ip, int port)
 }
 
 /* Called by the game before anything reads the schedule or USB settings. */
-int xbox_NetplayStart(void)
+int xbox_NetplayStart(const char *game_dir)
 {
     const char *e = getenv("RECOMP_NET");
     WSADATA wd;
@@ -360,8 +605,9 @@ int xbox_NetplayStart(void)
     }
     s_exe_hash = exe_hash();
     if (!strncmp(e, "host:", 5)) {
+        const char *sd = getenv("RECOMP_SAVE_DIR");
         s_is_host = 1;
-        ok = handshake_host(atoi(e + 5));
+        ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
     } else if (!strncmp(e, "join:", 5)) {
         char ip[64];
         const char *c = strrchr(e + 5, ':');
@@ -393,6 +639,7 @@ int xbox_NetplayStart(void)
     /* What every peer must run alike: virtual mode, one pad per player,
      * software rendering for anything the guest reads back. */
     _putenv_s("RECOMP_SCHED_VIRTUAL", "1");
+    _putenv_s("RECOMP_SAVE_DIR", s_session);
     {
         char n[8];
         snprintf(n, sizeof n, "%d", s_np);
@@ -405,8 +652,8 @@ int xbox_NetplayStart(void)
     s_on = 1;
     usb_gamepad_set_override(xbox_NetplayPadState);
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
-    fprintf(stderr, "[NET] network game: player %d of %d, input delay %d frames\n",
-            s_me + 1, s_np, s_delay);
+    fprintf(stderr, "[NET] network game: player %d of %d, input delay %d frames; "
+            "saves: %s\n", s_me + 1, s_np, s_delay, s_session);
     fflush(stderr);
     return 1;
 }

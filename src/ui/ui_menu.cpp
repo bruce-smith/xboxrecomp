@@ -26,6 +26,9 @@
 #include "imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+extern "C" int xbox_NetplayActive(void);           /* src/net */
+extern "C" int xbox_NetplayPlayer(void);
+extern "C" int xbox_NetplayPlayers(void);
 extern "C" int xbox_settings_enum(const char *section, int i, const char **key,
                                   const char **label, int *type, int *lo, int *hi,
                                   const char *const **names, int *n,
@@ -370,6 +373,98 @@ void section_cheats()
         ImGui::TextDisabled("No cheat engine in this build yet.");
 }
 
+/* Network play (src/net): host or join a lockstep game. A network game
+ * starts from power-on for everyone, so starting one restarts the game with
+ * RECOMP_NET set; during one, this shows who is who. */
+void start_network_game(int host, const char *addr, int port, int players, int delay)
+{
+    char v[96], exe[MAX_PATH], dir[MAX_PATH], *slash;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    if (host)
+        snprintf(v, sizeof v, "host:%d", port);
+    else
+        snprintf(v, sizeof v, "join:%s:%d", addr, port);
+    SetEnvironmentVariableA("RECOMP_NET", v);
+    snprintf(v, sizeof v, "%d", players);
+    SetEnvironmentVariableA("RECOMP_NET_PLAYERS", v);
+    snprintf(v, sizeof v, "%d", delay);
+    SetEnvironmentVariableA("RECOMP_NET_DELAY", v);
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    snprintf(dir, sizeof dir, "%s", exe);
+    if ((slash = strrchr(dir, '\\')) != nullptr)
+        *slash = 0;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    if (CreateProcessA(exe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, dir, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+}
+
+void section_network()
+{
+    static bool loaded;
+    static int mode, port, players, delay;
+    static char addr[64];
+    bool changed = false;
+
+    if (xbox_NetplayActive()) {
+        ImGui::Text("Network game: you are player %d of %d.", xbox_NetplayPlayer() + 1,
+                    xbox_NetplayPlayers());
+        ImGui::TextWrapped("Every player runs the whole game and only pad input travels, "
+                           "so everyone sees the same game. If the games ever drift apart, "
+                           "the game stops and says so (netplay_report.txt next to the exe). "
+                           "Your own saves are not touched: a network game plays on a copy.");
+        return;
+    }
+    if (!loaded) {
+        mode = xbox_setting_get("network", "mode", 0);
+        port = xbox_setting_get("network", "port", 27350);
+        players = xbox_setting_get("network", "players", 2);
+        delay = xbox_setting_get("network", "delay", 3);
+        xbox_setting_get_str("network", "host", "192.168.1.2", addr, sizeof addr);
+        loaded = true;
+    }
+    changed |= ImGui::RadioButton("Host a game", &mode, 0);
+    ImGui::SameLine();
+    changed |= ImGui::RadioButton("Join a game", &mode, 1);
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(160.0f * s_scale);
+    changed |= ImGui::InputInt("Port (UDP and TCP)", &port);
+    if (port < 1024) port = 1024;
+    if (port > 65535) port = 65535;
+    if (mode == 0) {
+        ImGui::SetNextItemWidth(160.0f * s_scale);
+        changed |= ImGui::SliderInt("Players", &players, 2, 4);
+        ImGui::SetNextItemWidth(160.0f * s_scale);
+        changed |= ImGui::SliderInt("Input delay (frames)", &delay, 1, 10);
+        ImGui::TextWrapped("You are player 1. Others join with your IP address and this "
+                           "port (allow it through the firewall). Your saves are sent to "
+                           "every player for this game. More delay hides more lag; 3 "
+                           "frames (50 ms) suits a LAN or a VPN.");
+    } else {
+        ImGui::SetNextItemWidth(220.0f * s_scale);
+        changed |= ImGui::InputText("Host's address", addr, sizeof addr);
+        ImGui::TextWrapped("The host decides the number of players and the delay, and "
+                           "sends its saves. You get the next free controller port.");
+    }
+    if (changed) {
+        xbox_setting_set("network", "mode", mode);
+        xbox_setting_set("network", "port", port);
+        xbox_setting_set("network", "players", players);
+        xbox_setting_set("network", "delay", delay);
+        xbox_setting_set_str("network", "host", addr);
+        xbox_settings_save();
+    }
+    ImGui::Separator();
+    ImGui::TextWrapped("Starting restarts the game: everyone begins from power-on together, "
+                       "and the host's game waits until every player has joined.");
+    if (ImGui::Button(mode == 0 ? "Start network game (host)" : "Join network game"))
+        start_network_game(mode == 0, addr, port, players, delay);
+}
+
 void section_about()
 {
     if (s_about[0])
@@ -395,6 +490,7 @@ void draw_menu(int w, int h)
         if (ImGui::BeginTabItem("Controllers")) { section_controllers(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Graphics"))    { section_graphics();    ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Cheats"))      { section_cheats();      ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Network"))     { section_network();     ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("About"))       { section_about();       ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }

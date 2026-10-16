@@ -46,6 +46,9 @@ int  xbox_setting_choice(const char *section, const char *key, const char *label
 /* Current value of a declared or stored option; def if neither. */
 int  xbox_setting_get(const char *section, const char *key, int def);
 void xbox_setting_set(const char *section, const char *key, int value);
+void xbox_setting_get_str(const char *section, const char *key, const char *def,
+                          char *out, int n);
+void xbox_setting_set_str(const char *section, const char *key, const char *value);
 
 /* For a declared option with an env name: if that variable is unset, set it
  * from the stored value ("1"/"0" or the number) so code that reads the

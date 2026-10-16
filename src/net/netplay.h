@@ -11,7 +11,7 @@ extern "C" {
 /* RECOMP_NET=host:<port> | join:<ip>:<port>: wait for the session, then set
  * up virtual mode and the pads. Call before the schedule or USB start.
  * Returns 1 when a network game is on. */
-int xbox_NetplayStart(void);
+int xbox_NetplayStart(const char *game_dir);
 int xbox_NetplayActive(void);
 int xbox_NetplayPlayer(void);     /* 0-based: the Xbox port this peer plays */
 int xbox_NetplayPlayers(void);
