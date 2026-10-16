@@ -22,6 +22,8 @@
  * through ImGui's SDL2 backend, fed by video/fb_present_sdl.c. */
 #include "platform/xbox_winnt.h"
 #include <SDL.h>
+#include <stdlib.h>
+#include <unistd.h>
 #endif
 #include <stdarg.h>
 #include <stdio.h>
@@ -421,6 +423,25 @@ void section_cheats()
  * RECOMP_NET set; during one, this shows who is who. */
 void start_network_game(int host, const char *addr, int port, int players, int delay)
 {
+#if !defined(_WIN32)
+    /* POSIX: the same restart, by exec'ing ourselves with the variables set. */
+    char v[96], exe[4096];
+    ssize_t n;
+    if (host)
+        snprintf(v, sizeof v, "host:%d", port);
+    else
+        snprintf(v, sizeof v, "join:%s:%d", addr, port);
+    setenv("RECOMP_NET", v, 1);
+    snprintf(v, sizeof v, "%d", players);
+    setenv("RECOMP_NET_PLAYERS", v, 1);
+    snprintf(v, sizeof v, "%d", delay);
+    setenv("RECOMP_NET_DELAY", v, 1);
+    n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) {
+        exe[n] = 0;
+        execl(exe, exe, (char *)nullptr);
+    }
+#else
     char v[96], exe[MAX_PATH], dir[MAX_PATH], *slash;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -444,6 +465,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
         CloseHandle(pi.hProcess);
         TerminateProcess(GetCurrentProcess(), 0);
     }
+#endif
 }
 
 void section_network()

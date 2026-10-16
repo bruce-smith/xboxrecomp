@@ -7,8 +7,9 @@
 #include <stdlib.h>
 #include "netplay.h"
 
-int xbox_NetplayStart(void)
+int xbox_NetplayStart(const char *game_dir)
 {
+    (void)game_dir;
     if (getenv("RECOMP_NET")) {
         fprintf(stderr, "[NET] network play is not available in this build yet\n");
         fflush(stderr);
