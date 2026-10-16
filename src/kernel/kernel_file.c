@@ -897,6 +897,18 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* Files the title opened with FILE_NO_INTERMEDIATE_BUFFERING, by descriptor.
+ *
+ * The Windows backend opens those FILE_FLAG_NO_BUFFERING, and an unbuffered
+ * read moves whole sectors: one that stops at the end of the file leaves the
+ * rest of its last 512-byte sector zero in the title's buffer. Blinx 2 reads
+ * pack headers into one buffer, a shorter file after a longer one, so on
+ * Linux the tail of the earlier file stayed there and a Windows recording's
+ * replay held different bytes from the first loading screen on.
+ * xbox_NtReadFile zeroes the same span here. */
+#define POSIX_UNBUFFERED_FDS 4096
+static uint8_t s_fd_unbuffered[POSIX_UNBUFFERED_FDS];
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -951,6 +963,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return errno_to_status(e);
     }
 
+    if (fd < POSIX_UNBUFFERED_FDS)
+        s_fd_unbuffered[fd] = !(CreateOptions & XBOX_FILE_DIRECTORY_FILE)
+                              && (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING);
     *FileHandle = w32_open_handle(fd, host_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -990,6 +1005,12 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (n == 0 && Length > 0) {
         IoStatusBlock->Status = STATUS_END_OF_FILE;
         return STATUS_END_OF_FILE;
+    }
+    if ((ULONG)n < Length && fd < POSIX_UNBUFFERED_FDS && s_fd_unbuffered[fd]) {
+        size_t end = ((size_t)n + 511u) & ~(size_t)511u;   /* see s_fd_unbuffered */
+        if (end > Length)
+            end = Length;
+        memset((uint8_t *)Buffer + n, 0, end - (size_t)n);
     }
     IoStatusBlock->Status = STATUS_SUCCESS;
     if (Event) SetEvent(Event);
