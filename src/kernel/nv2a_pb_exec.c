@@ -5681,29 +5681,30 @@ static void fsum_flip(void)
 
 /* Is the guest drawing a split screen, and how? A local multiplayer frame
  * is drawn view by view, each through its own viewport: two players get two
- * full-width half-height viewports, three or four get quarter ones. Noted per
- * draw that produced triangles, published at each flip, read by the window's
- * "auto" view (src/video/fb_present.c). Display only; nothing the guest sees.
- * Bits: 0x1 top half, 0x2 bottom half, 0x10 << quarter (0 TL, 1 TR, 2 BL,
- * 3 BR). RECOMP_SPLIT_TRACE=1 logs each change. */
-static uint32_t s_split_seen;
+ * full-width half-height viewports, three or four get quarter ones. The
+ * viewports (c[58] scale, c[59] offset) are noted per draw and classified at
+ * the flip against the whole surface -- while a view is drawn, the surface
+ * clip is that view's size. Published for the window's "auto" view
+ * (src/video/fb_present.c). Display only; nothing the guest sees.
+ * RECOMP_SPLIT_TRACE=1 logs each change, =2 also the viewports every 30 flips. */
+#define SPLIT_MAX 16
+static float s_split_vp[SPLIT_MAX][4];            /* scale x, y, offset x, y */
+static int s_split_n;
 static volatile LONG s_split_layout;
 
 static void split_note(void)
 {
     const float *k = nv2a_vsh_constant(58), *o = nv2a_vsh_constant(59);
-    float W = (float)s_gpu.clip_w, H = (float)s_gpu.clip_h;
-    float w = 2.0f * fabsf(k[0]), h = 2.0f * fabsf(k[1]);
-    int bottom = o[1] > H * 0.5f, right = o[0] > W * 0.5f;
-
-    if (W < 64.0f || H < 64.0f)
+    int i;
+    for (i = 0; i < s_split_n; i++)
+        if (s_split_vp[i][0] == k[0] && s_split_vp[i][1] == k[1]
+            && s_split_vp[i][2] == o[0] && s_split_vp[i][3] == o[1])
+            return;
+    if (s_split_n == SPLIT_MAX)
         return;
-    if (fabsf(h - H * 0.5f) > H * 0.06f)
-        return;
-    if (fabsf(w - W) < W * 0.06f)
-        s_split_seen |= bottom ? 0x2u : 0x1u;
-    else if (fabsf(w - W * 0.5f) < W * 0.06f)
-        s_split_seen |= 0x10u << (bottom * 2 + right);
+    s_split_vp[i][0] = k[0]; s_split_vp[i][1] = k[1];
+    s_split_vp[i][2] = o[0]; s_split_vp[i][3] = o[1];
+    s_split_n++;
 }
 
 /* 2: two views, one above the other; 4: quarters; 0: not split. */
@@ -5715,18 +5716,42 @@ int nv2a_pb_exec_split_layout(void)
 static void split_flip(void)
 {
     static int trace = -1;
-    uint32_t q = s_split_seen >> 4, n = 0;
+    float W = (float)s_gpu.clip_w, H = (float)s_gpu.clip_h;
+    uint32_t seen = 0, q, n = 0;
     LONG lay;
-    for (; q; q >>= 1)
+    int i;
+
+    /* Bits: 0x1 top half, 0x2 bottom half, 0x10 << quarter (TL, TR, BL, BR). */
+    for (i = 0; W >= 64.0f && H >= 64.0f && i < s_split_n; i++) {
+        float w = 2.0f * fabsf(s_split_vp[i][0]), h = 2.0f * fabsf(s_split_vp[i][1]);
+        int bottom = s_split_vp[i][3] > H * 0.5f, right = s_split_vp[i][2] > W * 0.5f;
+        if (fabsf(h - H * 0.5f) > H * 0.06f)
+            continue;
+        if (fabsf(w - W) < W * 0.06f)
+            seen |= bottom ? 0x2u : 0x1u;
+        else if (fabsf(w - W * 0.5f) < W * 0.06f)
+            seen |= 0x10u << (bottom * 2 + right);
+    }
+    for (q = seen >> 4; q; q >>= 1)
         n += q & 1u;
-    lay = n >= 2 ? 4 : (s_split_seen & 3u) == 3u ? 2 : 0;
-    if (trace < 0)
-        trace = getenv("RECOMP_SPLIT_TRACE") != NULL;
+    lay = n >= 2 ? 4 : (seen & 3u) == 3u ? 2 : 0;
+    if (trace < 0) {
+        const char *e = getenv("RECOMP_SPLIT_TRACE");
+        trace = e ? (*e == '2' ? 2 : 1) : 0;
+    }
+    if (trace == 2 && s_gpu.flips % 30 == 0) {
+        fprintf(stderr, "[SPLIT] flip %u surface %ux%u, views 0x%02X:", s_gpu.flips,
+                s_gpu.clip_w, s_gpu.clip_h, seen);
+        for (i = 0; i < s_split_n; i++)
+            fprintf(stderr, " s(%.1f,%.1f) o(%.1f,%.1f)", s_split_vp[i][0],
+                    s_split_vp[i][1], s_split_vp[i][2], s_split_vp[i][3]);
+        fputc(10, stderr);
+    }
     if (trace && lay != s_split_layout)
         fprintf(stderr, "[SPLIT] flip %u: layout %ld (views 0x%02X)%c",
-                s_gpu.flips, (long)lay, s_split_seen, 10);
+                s_gpu.flips, (long)lay, seen, 10);
     InterlockedExchange(&s_split_layout, lay);
-    s_split_seen = 0;
+    s_split_n = 0;
 }
 
 static void draw_primitive(void)
@@ -5765,9 +5790,11 @@ static void draw_primitive(void)
         uint32_t g0 = s_gpu.xf_degenerate, o0 = s_gpu.xf_offscreen;
         uint32_t b0 = s_gpu.tris_behind, z0 = s_gpu.zpass_count;
         uint64_t p0 = s_gpu.pixels, f0 = s_gpu.xf_depth_fail;
-        raster_batch();
-        if (s_gpu.tris_drawn != t0)
+        /* Before the batch: rasterising is deferred to the pool, so what it
+         * drew is not known here. */
+        if (s_gpu.idx_count >= 3)
             split_note();
+        raster_batch();
         if (s_fsum < 0)
         {
             const char *e = getenv("RECOMP_FRAME_SUMMARY");
