@@ -317,10 +317,22 @@ class DisasmEngine:
             if back:
                 self._jt_base[tbl] = tbl - back * 4
                 tbl -= back * 4
-            if entries < min_entries:
+            if entries < min_entries and not (
+                    entries == 2 and sites
+                    and all(abs(a - tbl) <= ARM_WINDOW for a, _ in sites)
+                    and all(abs((self.image.read_u32_at_va(tbl + k * 4) or 0)
+                                - tbl) <= ARM_WINDOW for k in range(2))):
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
+                #
+                # Except a two-case switch with its dispatch and both arms
+                # right there: Blinx 2's `jmp [ecx*4 + 0x1CE000]` at 0x1CDFCC
+                # with arms 0x1CDFD3/0x1CDFE8. Left alone, the sweep read the
+                # table as `call 0x1CFCE8`, a "function" in the middle of an
+                # instruction of the shop's state machine sub_001CFCA0. The
+                # split turned that function's own `jp` into an unresolved
+                # stub, and Carlos's dialogue never advanced.
                 continue
 
             end = tbl + entries * 4
