@@ -89,7 +89,20 @@ int xbox_NetplayPlayers(void) { return s_np; }
 typedef struct { uint8_t type, player, players, delay; uint64_t exe; } PkHello;
 typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][18]; } PkInput;
 typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t hash; } PkHash;
-typedef struct { uint8_t type, player; uint16_t pad; uint32_t desync_frame; } PkBye;
+/* A refused hello is answered with a BYE whose reason says why. */
+enum { BYE_LEFT = 0, BYE_BUILD = 1, BYE_FULL = 2 };
+typedef struct { uint8_t type, player; uint16_t reason; uint32_t desync_frame; } PkBye;
+
+static void send_to(const struct sockaddr_in *a, const void *p, int n);
+
+static void refuse(const struct sockaddr_in *to, int reason)
+{
+    PkBye no;
+    memset(&no, 0, sizeof no);
+    no.type = PK_BYE;
+    no.reason = (uint16_t)reason;
+    send_to(to, &no, sizeof no);
+}
 #pragma pack(pop)
 
 static void send_to(const struct sockaddr_in *a, const void *p, int n)
@@ -242,6 +255,24 @@ static DWORD WINAPI net_thread(LPVOID unused)
             note_hash(pk->player, pk->frame, pk->hash);
             if (s_is_host)
                 broadcast(pk, n, pk->player);
+        } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_HELLO && s_is_host) {
+            /* After the start: a joiner that missed every START says hello
+             * again and gets it again; anyone else is too late. */
+            int i, known = 0;
+            for (i = 0; i < s_npeer; i++)
+                if (s_peer[i].sin_addr.s_addr == from.sin_addr.s_addr
+                    && s_peer[i].sin_port == from.sin_port)
+                    known = 1;
+            if (known) {
+                PkHello st;
+                memset(&st, 0, sizeof st);
+                st.type = PK_START;
+                st.players = (uint8_t)s_np;
+                st.delay = (uint8_t)s_delay;
+                send_to(&from, &st, sizeof st);
+            } else {
+                refuse(&from, BYE_FULL);
+            }
         } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
             PkBye *b = (PkBye *)buf;
             char why[160];
@@ -561,10 +592,7 @@ static int handshake_host(int port, const char *save_src)
                 && s_peer[i].sin_port == from.sin_port)
                 known = i;
         if (((PkHello *)buf)->exe != s_exe_hash) {
-            PkBye no;
-            memset(&no, 0, sizeof no);
-            no.type = PK_BYE;
-            send_to(&from, &no, sizeof no);      /* so it can say why */
+            refuse(&from, BYE_BUILD);              /* so it can say why */
             fprintf(stderr, "[NET] a player with a different build or game files tried to join; refused\n");
             continue;
         }
@@ -620,7 +648,7 @@ static int handshake_join(const char *ip, int port)
 {
     PkHello h;
     int got_welcome = 0;
-    DWORD t0 = GetTickCount();
+    DWORD t0 = GetTickCount(), t_hello = 0;
     memset(&s_peer[0], 0, sizeof s_peer[0]);
     s_peer[0].sin_family = AF_INET;
     s_peer[0].sin_port = htons((u_short)port);
@@ -638,8 +666,12 @@ static int handshake_join(const char *ip, int port)
         char buf[256];
         struct sockaddr_in from;
         int fl = sizeof from, n;
-        if (!got_welcome)
+        /* Hello until welcomed, then once a second until the START: the
+         * host answers a known player's hello with the START again. */
+        if (!got_welcome || GetTickCount() - t_hello >= 1000) {
             send_to(&s_peer[0], &h, sizeof h);
+            t_hello = GetTickCount();
+        }
         n = recvfrom(s_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
         if (n >= (int)sizeof(PkHello) && buf[0] == PK_WELCOME && !got_welcome) {
             PkHello *w = (PkHello *)buf;
@@ -667,10 +699,16 @@ static int handshake_join(const char *ip, int port)
             fprintf(stderr, "[NET] received the host's saves (%d files)\n", files);
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
             return 1;
-        } else if (n >= 1 && buf[0] == PK_BYE && !got_welcome) {
-            snprintf(s_why, sizeof s_why, "The host refused: it runs a different build or "
-                     "different game files. Every player needs the same build of the "
-                     "game and the same disc's files.");
+        } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
+            if (((PkBye *)buf)->reason == BYE_FULL)
+                snprintf(s_why, sizeof s_why, "The host's game is full or has already "
+                         "started. Ask the host to start a new network game.");
+            else if (((PkBye *)buf)->reason == BYE_BUILD)
+                snprintf(s_why, sizeof s_why, "The host refused: it runs a different build "
+                         "or different game files. Every player needs the same build of "
+                         "the game and the same disc's files.");
+            else
+                snprintf(s_why, sizeof s_why, "The host left before the game started.");
             return 0;
         }
         if (!got_welcome && GetTickCount() - t0 > 120000) {
