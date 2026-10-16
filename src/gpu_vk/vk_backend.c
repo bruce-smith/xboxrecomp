@@ -158,6 +158,11 @@ static struct {
     } sets[VKB_SETCACHE];
     uint32_t view_gen;
     int rebind;    /* RECOMP_VK_REBIND=1: a new set and all state each draw (A/B) */
+    /* The last draw's uniforms and where they are, valid while u_gen ==
+     * slot_gen: an identical draw uses that copy. */
+    VkDrawUniforms u_last;
+    VkDeviceSize u_off;
+    uint32_t u_gen;
     /* What the command buffer being recorded has bound and set, so a draw
      * sends only what changed. Valid while gen == slot_gen; anything else
      * binding a pipeline into it (down, fx, area passes) clears gen. */
@@ -1598,7 +1603,9 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     void *vp;
     uint32_t *ix, nix, maxix;
     VkCommandBuffer cb;
-    VkDrawUniforms *U;
+    VkDrawUniforms *U, *Uw;
+    static VkDrawUniforms uh;
+    int32_t vo = 0;                      /* vertexOffset */
     VkViewport view;
     VkRect2D sc;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -1787,7 +1794,9 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     if (!nix)
         return;
 
-    /* The uniforms. */
+    /* The uniforms, built in host memory (the ring is write-combined). */
+    Uw = U;
+    U = &uh;
     memset(U, 0, sizeof *U);
     U->vp[0] = 2.0f / (float)rt->w;
     U->vp[1] = 2.0f / (float)rt->h;
@@ -1845,7 +1854,21 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
                           | (a->size && aoff[i] == 0xFFFFFFFFu ? 0x100u : 0u);
             memcpy(U->imm[i], g->imm[i], sizeof U->imm[i]);
         }
-        U->imin[0] = imin;
+        /* The element index minus imin is the vertex's place in the copied
+         * data: the draw's vertexOffset (-imin) subtracts it, so uniforms of
+         * draws with the same layout are the same. */
+        U->imin[0] = 0;
+        vo = -(int32_t)imin;
+    }
+    /* The same uniforms as the last draw in this command buffer: its copy
+     * again (nothing written, and the bound set's offsets stay). */
+    if (B.u_gen == B.slot_gen && !B.rebind && !memcmp(U, &B.u_last, sizeof *U)) {
+        uoff = B.u_off;
+    } else {
+        memcpy(Uw, U, sizeof *U);
+        B.u_last = *U;
+        B.u_off = uoff;
+        B.u_gen = B.slot_gen;
     }
 
     s = &B.slot[B.cur];
@@ -1988,22 +2011,22 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
             vkCmdSetDepthWriteEnable(cb, VK_FALSE);
             vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
             vkCmdBeginQuery(cb, s->qpool, s->nq, VK_QUERY_CONTROL_PRECISE_BIT);
-            vkCmdDrawIndexed(cb, nix, 1, 0, 0, 0);
+            vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
             vkCmdEndQuery(cb, s->qpool, s->nq);
             s->qepoch[s->nq++] = B.epoch;
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
             vkCmdSetDepthWriteEnable(cb, st->depth_mask != 0);
             vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_wmask & 0xFF);
         }
-        vkCmdDrawIndexed(cb, nix, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
     } else if (st->zpass_enable) {
         B.zdraws++;
         vkCmdBeginQuery(cb, s->qpool, s->nq, VK_QUERY_CONTROL_PRECISE_BIT);
-        vkCmdDrawIndexed(cb, nix, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
         vkCmdEndQuery(cb, s->qpool, s->nq);
         s->qepoch[s->nq++] = B.epoch;
     } else {
-        vkCmdDrawIndexed(cb, nix, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cb, nix, 1, 0, vo, 0);
     }
     rt->dirty = 1;
     if (zt)
