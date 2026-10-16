@@ -10,7 +10,8 @@
  * a 60th of a second of virtual time, so it is the same frame everywhere.
  *
  * - Session: the host waits for its players; each joiner says hello with a
- *   hash of its exe (it must be the same build) and gets its player number
+ *   hash of its build and game files (build_identity: they must match) and
+ *   gets its player number
  *   (= Xbox port, the host is port 1). Then all start from power-on.
  * - Input: each peer samples its own pad (its port-1 bindings) once per
  *   frame and sends it for frame f + delay, the last 16 frames in every
@@ -458,22 +459,59 @@ static void copy_tree(const char *src, const char *dst)
 
 /* ---- the session ------------------------------------------------------------ */
 
-static uint64_t exe_hash(void)
+static const char *s_build_id;    /* xbox_NetplaySetBuild */
+
+void xbox_NetplaySetBuild(const char *id)
 {
-    char path[MAX_PATH];
-    uint64_t h = 1469598103934665603ull;
-    FILE *f;
-    unsigned char b[65536];
-    size_t n, i;
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-    f = fopen(path, "rb");
+    s_build_id = id;
+}
+
+static uint64_t fnv(uint64_t h, const void *p, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    size_t i;
+    for (i = 0; i < n; i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+static uint64_t fnv_file(uint64_t h, const char *path)
+{
+    static unsigned char b[65536];
+    FILE *f = fopen(path, "rb");
+    size_t n;
     if (!f)
-        return 0;
+        return fnv(h, "missing", 7);
     while ((n = fread(b, 1, sizeof b, f)) > 0)
-        for (i = 0; i < n; i++)
-            h = (h ^ b[i]) * 1099511628211ull;
+        h = fnv(h, b, n);
     fclose(f);
     return h;
+}
+
+/* What every player must have alike, as one number in the hello:
+ * - the code: the game's build identity (both repos' commits and a hash of
+ *   the generated C, from xbox_NetplaySetBuild) -- builds of the same
+ *   commits match whichever compiler or OS made them. A build with
+ *   uncommitted changes, or none given, uses the exe's own bytes instead.
+ * - the game: default.xbe (another disc or region is another game).
+ * - the maths: portable x87 transcendentals, on for every network game. */
+static uint64_t build_identity(const char *game_dir)
+{
+    uint64_t h = 1469598103934665603ull;
+    char path[MAX_PATH];
+    if (s_build_id && *s_build_id && !strstr(s_build_id, "dirty")
+        && !strstr(s_build_id, "unknown")) {
+        h = fnv(h, s_build_id, strlen(s_build_id));
+        fprintf(stderr, "[NET] build: %s\n", s_build_id);
+    } else {
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        h = fnv_file(h, path);
+        fprintf(stderr, "[NET] build: %s; matching the exe's bytes\n",
+                s_build_id && *s_build_id ? s_build_id : "(no identity)");
+    }
+    snprintf(path, sizeof path, "%s\\default.xbe", game_dir ? game_dir : ".");
+    h = fnv_file(h, path);
+    return fnv(h, "portable-math", 13);
 }
 
 static int handshake_host(int port, const char *save_src)
@@ -527,7 +565,7 @@ static int handshake_host(int port, const char *save_src)
             memset(&no, 0, sizeof no);
             no.type = PK_BYE;
             send_to(&from, &no, sizeof no);      /* so it can say why */
-            fprintf(stderr, "[NET] a player with a different build tried to join; refused\n");
+            fprintf(stderr, "[NET] a player with a different build or game files tried to join; refused\n");
             continue;
         }
         if (known < 0) {
@@ -630,8 +668,9 @@ static int handshake_join(const char *ip, int port)
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
             return 1;
         } else if (n >= 1 && buf[0] == PK_BYE && !got_welcome) {
-            snprintf(s_why, sizeof s_why, "The host refused: it runs a different build. "
-                     "Every player needs the very same blinx_2_recomp.exe.");
+            snprintf(s_why, sizeof s_why, "The host refused: it runs a different build or "
+                     "different game files. Every player needs the same build of the "
+                     "game and the same disc's files.");
             return 0;
         }
         if (!got_welcome && GetTickCount() - t0 > 120000) {
@@ -668,7 +707,7 @@ int xbox_NetplayStart(const char *game_dir)
         DWORD to = 200;                             /* handshake polls */
         setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof to);
     }
-    s_exe_hash = exe_hash();
+    s_exe_hash = build_identity(game_dir);
     if (!strncmp(e, "host:", 5)) {
         const char *sd = getenv("RECOMP_SAVE_DIR");
         s_is_host = 1;
@@ -732,8 +771,9 @@ int xbox_NetplayStart(const char *game_dir)
         }
     }
     /* One implementation of the x87 maths (fsin, fcos, ...) on every peer:
-     * each OS's C library differs in the last bit (P12, RECOMP_PORTABLE_MATH). */
+     * each OS's C library differs in the last bit (src/kernel/recomp_math.c). */
     _putenv_s("RECOMP_PORTABLE_MATH", "1");
+    recomp_set_portable_math(1);
     s_on = 1;
     usb_gamepad_set_override(xbox_NetplayPadState);
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));

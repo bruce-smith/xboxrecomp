@@ -17,6 +17,7 @@ int xbox_NetplayStart(const char *game_dir)
     return 0;
 }
 
+void xbox_NetplaySetBuild(const char *id) { (void)id; }
 int xbox_NetplayActive(void)  { return 0; }
 int xbox_NetplayPlayer(void)  { return 0; }
 int xbox_NetplayPlayers(void) { return 1; }
