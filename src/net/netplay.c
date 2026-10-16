@@ -59,8 +59,25 @@ static uint32_t s_hash_f[NP_MAXP];
 static uint64_t s_hash_v[NP_MAXP][2];            /* last two checks per player */
 static uint32_t s_hash_fr[NP_MAXP][2];
 static volatile LONG s_failed;
+static void broadcast(const void *p, int n, int except);
+static void dump_pages(uint32_t f);         /* below, with the hashing */
 
 int xbox_NetplayActive(void) { return s_on; }
+
+/* Leaving (the window closed): tell the others, who stop with "player n
+ * left" at once instead of after 15 s of silence. */
+void xbox_NetplayLeave(void)
+{
+    struct { uint8_t type, player; uint16_t pad; uint32_t desync_frame; } b;
+    int k;
+    if (!s_on || s_sock == INVALID_SOCKET)
+        return;
+    memset(&b, 0, sizeof b);
+    b.type = 6;                                  /* PK_BYE */
+    b.player = (uint8_t)s_me;
+    for (k = 0; k < 3; k++)
+        broadcast(&b, sizeof b, -1);
+}
 int xbox_NetplayPlayer(void) { return s_me; }
 int xbox_NetplayPlayers(void) { return s_np; }
 
@@ -70,6 +87,7 @@ int xbox_NetplayPlayers(void) { return s_np; }
 typedef struct { uint8_t type, player, players, delay; uint64_t exe; } PkHello;
 typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][18]; } PkInput;
 typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t hash; } PkHash;
+typedef struct { uint8_t type, player; uint16_t pad; uint32_t desync_frame; } PkBye;
 #pragma pack(pop)
 
 static void send_to(const struct sockaddr_in *a, const void *p, int n)
@@ -121,11 +139,26 @@ static void send_local_inputs(void)
     broadcast(&pk, (int)sizeof pk, -1);
 }
 
+static uint32_t s_fail_frame;                    /* a desync's frame, for the others */
+
+/* The game stops: say why (log, netplay_report.txt, a message box unless
+ * headless), and tell the other players first -- a desync's frame with it,
+ * so each of them dumps its own page hashes for that frame too. */
 static void fail(const char *why)
 {
     char msg[512];
     if (InterlockedExchange(&s_failed, 1))
         return;
+    if (s_sock != INVALID_SOCKET) {
+        PkBye b;
+        int k;
+        memset(&b, 0, sizeof b);
+        b.type = PK_BYE;
+        b.player = (uint8_t)s_me;
+        b.desync_frame = s_fail_frame;
+        for (k = 0; k < 3; k++)
+            broadcast(&b, sizeof b, -1);
+    }
     snprintf(msg, sizeof msg, "Network game stopped: %s", why);
     fprintf(stderr, "[NET] %s\n", msg);
     fflush(stderr);
@@ -156,11 +189,14 @@ static void check_hashes(int p)
                 continue;
             for (m = 0; m < 2; m++)
                 if (s_hash_fr[j][m] == f && s_hash_v[j][m] != v) {
-                    char why[160];
+                    char why[200];
+                    dump_pages(f);
+                    s_fail_frame = f;
                     snprintf(why, sizeof why, "desync at frame %u (player %d "
-                             "%016llX, player %d %016llX)", f, p + 1,
+                             "%016llX, player %d %016llX); compare every player's "
+                             "netplay_desync_f%u_p*.bin", f, p + 1,
                              (unsigned long long)v, j + 1,
-                             (unsigned long long)s_hash_v[j][m]);
+                             (unsigned long long)s_hash_v[j][m], f);
                     fail(why);
                 }
         }
@@ -204,8 +240,21 @@ static DWORD WINAPI net_thread(LPVOID unused)
             note_hash(pk->player, pk->frame, pk->hash);
             if (s_is_host)
                 broadcast(pk, n, pk->player);
-        } else if (n >= 1 && buf[0] == PK_BYE) {
-            fail("another player left the game");
+        } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
+            PkBye *b = (PkBye *)buf;
+            char why[160];
+            if (s_is_host)
+                broadcast(b, n, b->player);
+            if (b->desync_frame) {
+                dump_pages(b->desync_frame);
+                s_fail_frame = b->desync_frame;
+                snprintf(why, sizeof why, "player %d found a desync at frame %u; "
+                         "compare every player's netplay_desync_f%u_p*.bin",
+                         b->player + 1, b->desync_frame, b->desync_frame);
+            } else {
+                snprintf(why, sizeof why, "player %d left the game", b->player + 1);
+            }
+            fail(why);
         }
         send_local_inputs();
     }
@@ -660,14 +709,53 @@ int xbox_NetplayStart(const char *game_dir)
 
 /* ---- the guest side ------------------------------------------------------------- */
 
-static uint64_t hash_guest(void)
+/* Guest RAM 0x10000-0x4000000 by 4 KB page; the sync hash is the hash of
+ * the page hashes. The page hashes of the last two checks are kept, so a
+ * desync can say which pages differ (dump_pages). */
+#define NP_PAGE_LO  0x10000u
+#define NP_PAGES    ((0x4000000u - NP_PAGE_LO) / 4096u)
+static uint64_t s_pg[2][NP_PAGES];
+static volatile uint32_t s_pg_frame[2];
+static int s_pg_i;
+
+static uint64_t hash_guest(uint32_t f)
 {
-    const uint64_t *p = (const uint64_t *)((uintptr_t)xbox_GetMemoryOffset() + 0x10000);
-    const uint64_t *e = (const uint64_t *)((uintptr_t)xbox_GetMemoryOffset() + 0x4000000);
-    uint64_t h = 1469598103934665603ull;
-    for (; p < e; p++)
-        h = (h ^ *p) * 1099511628211ull;
-    return h;
+    const uint64_t *p = (const uint64_t *)((uintptr_t)xbox_GetMemoryOffset() + NP_PAGE_LO);
+    uint64_t total = 1469598103934665603ull;
+    uint32_t i, k;
+    s_pg_i ^= 1;
+    for (i = 0; i < NP_PAGES; i++) {
+        uint64_t h = 1469598103934665603ull;
+        for (k = 0; k < 512; k++, p++)
+            h = (h ^ *p) * 1099511628211ull;
+        s_pg[s_pg_i][i] = h;
+        total = (total ^ h) * 1099511628211ull;
+    }
+    s_pg_frame[s_pg_i] = f;
+    return total;
+}
+
+/* netplay_desync_f<frame>_p<player>.bin next to the exe: u32 frame, u32 page
+ * count, u32 first page's address, then a u64 hash per 4 KB page. The files
+ * of two players, compared, name the pages that differ. */
+static void dump_pages(uint32_t f)
+{
+    int k;
+    for (k = 0; k < 2; k++)
+        if (s_pg_frame[k] == f) {
+            char name[64];
+            FILE *o;
+            uint32_t hdr[3] = { f, NP_PAGES, NP_PAGE_LO };
+            snprintf(name, sizeof name, "netplay_desync_f%u_p%d.bin", f, s_me + 1);
+            o = fopen(name, "wb");
+            if (o) {
+                fwrite(hdr, 4, 3, o);
+                fwrite(s_pg[k], 8, NP_PAGES, o);
+                fclose(o);
+                fprintf(stderr, "[NET] page hashes of frame %u in %s\n", f, name);
+            }
+            return;
+        }
 }
 
 /* The emulated pad of `port` for the current frame (usb_gamepad.c): exactly
@@ -688,6 +776,24 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
     }
     send_local_inputs();
 
+    /* RECOMP_NET_TEST_DESYNC=<frame> (testing the desync report): this peer
+     * changes one byte of guest RAM at that frame, so the next check fails
+     * and the page dumps name exactly that page (0x02FF0000). */
+    {
+        static int test = -1;
+        static uint32_t at;
+        if (test < 0) {
+            const char *e = getenv("RECOMP_NET_TEST_DESYNC");
+            test = e && *e;
+            at = test ? (uint32_t)atoi(e) : 0;
+        }
+        if (test && f >= at) {
+            test = 0;
+            (*(volatile uint8_t *)((uintptr_t)xbox_GetMemoryOffset() + 0x02FF0000u))++;
+            fprintf(stderr, "[NET] test: changed guest 0x02FF0000 at frame %u\n", f);
+        }
+    }
+
     /* The sync check, at the first pad report of every 60th frame. */
     if (f && f % NP_CHECK == 0 && f != checked) {
         PkHash pk;
@@ -696,7 +802,7 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         pk.type = PK_HASH;
         pk.player = (uint8_t)s_me;
         pk.frame = f;
-        pk.hash = hash_guest();
+        pk.hash = hash_guest(f);
         note_hash(s_me, f, pk.hash);
         if (f % (NP_CHECK * 10) == 0) {     /* a line every 10 s of play */
             fprintf(stderr, "[NET] frame %u: guest hash %016llX\n", f,

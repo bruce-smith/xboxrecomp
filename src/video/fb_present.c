@@ -324,8 +324,68 @@ static int fb_show_menu(HWND hwnd, HDC hdc, const uint32_t *px)
 #endif
 }
 
+/* Split-screen enlarged: show only one part of the frame -- this player's
+ * viewport -- stretched to the whole frame, which also undoes the squeeze a
+ * split viewport is drawn with. Display only: the guest's frame is untouched.
+ * Graphics option "view" (RECOMP_FB_VIEW); "auto" picks by network player
+ * (two players: top / bottom; three or four: quarters). */
+static const char *const k_views[] = {
+    "full", "auto", "top", "bottom", "left", "right",
+    "top-left", "top-right", "bottom-left", "bottom-right"
+};
+
+static int fb_view_rect(int *x0, int *y0, int *w, int *h)
+{
+#if defined(XBOXRECOMP_HAVE_UI)
+    extern int xbox_NetplayActive(void);
+    extern int xbox_NetplayPlayer(void);
+    extern int xbox_NetplayPlayers(void);
+    int v = xbox_setting_get("graphics", "view", 0);
+    int W = (int)s_fb_width, H = (int)s_fb_height;
+    if (v == 1) {                                   /* auto */
+        if (!xbox_NetplayActive())
+            return 0;
+        if (xbox_NetplayPlayers() == 2)
+            v = xbox_NetplayPlayer() == 0 ? 2 : 3;
+        else
+            v = 6 + xbox_NetplayPlayer();
+    }
+    if (v <= 1 || v >= (int)(sizeof k_views / sizeof k_views[0]))
+        return 0;
+    *x0 = 0; *y0 = 0; *w = W; *h = H;
+    if (v == 2 || v == 3)  { *h = H / 2; *y0 = v == 3 ? H / 2 : 0; }
+    if (v == 4 || v == 5)  { *w = W / 2; *x0 = v == 5 ? W / 2 : 0; }
+    if (v >= 6) {
+        *w = W / 2; *h = H / 2;
+        *x0 = (v == 7 || v == 9) ? W / 2 : 0;
+        *y0 = v >= 8 ? H / 2 : 0;
+    }
+    return 1;
+#else
+    (void)x0; (void)y0; (void)w; (void)h;
+    return 0;
+#endif
+}
+
 static void fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, const uint32_t *px)
 {
+    static uint32_t *view;
+    int x0, y0, w, h;
+    if (fb_view_rect(&x0, &y0, &w, &h)) {
+        uint32_t x, y;
+        if (!view)
+            view = (uint32_t *)malloc((size_t)s_fb_width * s_fb_height * 4);
+        if (view) {
+            for (y = 0; y < s_fb_height; y++) {
+                const uint32_t *src = px + (size_t)(y0 + (int)(y * (uint32_t)h / s_fb_height))
+                                           * s_fb_width + x0;
+                uint32_t *dst = view + (size_t)y * s_fb_width;
+                for (x = 0; x < s_fb_width; x++)
+                    dst[x] = src[x * (uint32_t)w / s_fb_width];
+            }
+            px = view;
+        }
+    }
     if (!fb_show_menu(hwnd, hdc, px))
         fb_blit(hwnd, hdc, bi, px);
 }
@@ -346,6 +406,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * TerminateProcess rather than exit(): guest threads are mid-flight,
          * and CRT teardown under them can hang. */
         InterlockedExchange(&s_fb_running, 0);
+        {   /* a network game: tell the other players (src/net) */
+            extern void xbox_NetplayLeave(void);
+            xbox_NetplayLeave();
+        }
         fprintf(stderr, "  [FBWIN] window closed; exiting\n");
         fflush(stderr);
         {
@@ -507,6 +571,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     RECT r;
 
     (void)unused;
+#if defined(XBOXRECOMP_HAVE_UI)
+    xbox_setting_choice("graphics", "view", "View (split-screen: this part only)",
+                        k_views, (int)(sizeof k_views / sizeof k_views[0]), 0,
+                        "RECOMP_FB_VIEW", 0);
+#endif
 
     {
         WNDCLASSA wc;

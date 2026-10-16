@@ -13,6 +13,7 @@ extern "C" {
  * Returns 1 when a network game is on. */
 int xbox_NetplayStart(const char *game_dir);
 int xbox_NetplayActive(void);
+void xbox_NetplayLeave(void);     /* tell the others this player left */
 int xbox_NetplayPlayer(void);     /* 0-based: the Xbox port this peer plays */
 int xbox_NetplayPlayers(void);
 
