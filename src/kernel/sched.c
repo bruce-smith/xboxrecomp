@@ -1057,7 +1057,10 @@ int xbox_SchedBlockBegin(void)
             SchedQueue *q = &s_q[t_agent];
             if (q->i < q->n && q->kind[q->i] == 0) {
                 uint64_t rec = q->val[q->i++];
-                if (rec != tag) {
+                /* Named only while reports are left: symbolising both tags
+                 * at every let-go made a replay of another build's (or
+                 * another OS's) recording, whose tags all differ, crawl. */
+                if (rec != tag && s_site_reports < 6) {
                     /* The same function counts as the same let-go: some
                      * (the loop check) let go from one branch per mode. */
                     char d1[300], d2[300];

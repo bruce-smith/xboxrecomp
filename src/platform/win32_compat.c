@@ -2251,14 +2251,16 @@ DWORD GetThreadId(HANDLE h)
 
 HMODULE GetModuleHandleA(LPCSTR name)
 {
+    static HMODULE self;
     Dl_info di;
     if (name)
         return NULL;
     /* This layer is linked into the executable, so its own address names
-     * the executable's image. */
-    if (dladdr((void *)&GetModuleHandleA, &di) && di.dli_fbase)
-        return (HMODULE)di.dli_fbase;
-    return NULL;
+     * the executable's image. Looked up once: dladdr walks the symbol
+     * tables, and the schedule's RECOMP_SCHED_SITES asks at every turn. */
+    if (!self && dladdr((void *)&GetModuleHandleA, &di) && di.dli_fbase)
+        self = (HMODULE)di.dli_fbase;
+    return self;
 }
 
 USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)
