@@ -57,6 +57,7 @@ static uint32_t s_hash_f[NP_MAXP];
 static uint64_t s_hash_v[NP_MAXP][2];            /* last two checks per player */
 static uint32_t s_hash_fr[NP_MAXP][2];
 static volatile LONG s_failed;
+static volatile DWORD s_heard[NP_MAXP];          /* when each player was last heard from */
 static void broadcast(const void *p, int n, int except);
 static void dump_pages(uint32_t f);         /* below, with the hashing */
 
@@ -239,6 +240,9 @@ static DWORD WINAPI net_thread(LPVOID unused)
         struct sockaddr_in from;
         int fl = sizeof from;
         int n = recvfrom(s_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+        if (n >= 2 && (buf[0] == PK_INPUT || buf[0] == PK_HASH)
+            && (uint8_t)buf[1] < NP_MAXP)
+            s_heard[(uint8_t)buf[1]] = GetTickCount();
         if (n >= (int)sizeof(PkInput) && buf[0] == PK_INPUT) {
             PkInput *pk = (PkInput *)buf;
             int i;
@@ -789,6 +793,11 @@ int xbox_NetplayStart(const char *game_dir)
      * each OS's C library differs in the last bit (src/kernel/recomp_math.c). */
     np_setenv("RECOMP_PORTABLE_MATH", "1");
     recomp_set_portable_math(1);
+    {
+        int p;
+        for (p = 0; p < NP_MAXP; p++)
+            s_heard[p] = GetTickCount();
+    }
     s_on = 1;
     usb_gamepad_set_override(xbox_NetplayPadState);
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
@@ -918,11 +927,21 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         ReleaseSRWLockShared(&s_lock);
         if (ok)
             return 1;
-        if (GetTickCount() - t0 > 15000) {
+        /* A slower player is waited for as long as it takes -- a slow disk,
+         * or one OS logging slower than another, can put a peer many
+         * seconds behind -- but one not heard from at all for 15 s is gone:
+         * every peer resends its recent inputs every 10 ms. */
+        if (GetTickCount() - s_heard[port] > 15000) {
             char why[96];
-            snprintf(why, sizeof why, "no input from player %d for 15 s (frame %u)",
+            snprintf(why, sizeof why, "nothing from player %d for 15 s (frame %u)",
                      port + 1, f);
             fail(why);
+        }
+        if (GetTickCount() - t0 >= 10000) {
+            fprintf(stderr, "[NET] frame %u: waiting for player %d, who is behind\n",
+                    f, port + 1);
+            fflush(stderr);
+            t0 = GetTickCount();
         }
         Sleep(1);
     }
