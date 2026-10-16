@@ -45,7 +45,9 @@
  * agent through xbox_SchedWaitUntil). A replay does not sleep between a
  * device model's turns.
  *
- * File: "BX2SCHED", u32 version, then tagged records:
+ * File: "BX2SCHED", u32 version, then tagged records (0x03 is written only
+ * when it says something, so a file without it is what older builds wrote):
+ *   0x03 varint flags                           bit 0: RECOMP_PORTABLE_MATH
  *   0x01 varint agent, varint count            a run
  *   0x02 varint agent, varint kind, zigzag-varint delta   a value (delta
  *        from the previous value of that agent and kind)
@@ -280,6 +282,9 @@ static int sched_load(const char *path)
     fclose(f);
     memcpy(&ver, buf + 8, 4);
     s_file_ver = ver;
+    /* How the recording computed the x87 transcendentals; absent: the C
+     * library's. A replay must match it whatever the environment says. */
+    recomp_set_portable_math(0);
     p = buf + 12;
     end = buf + size;
     s_runs = (SchedRun *)malloc(cap * sizeof(SchedRun));
@@ -321,6 +326,13 @@ static int sched_load(const char *path)
             q->kind[q->n] = (uint8_t)b;
             q->val[q->n] = prev;
             q->n++;
+        } else if (tag == 0x03) {
+            if (!sched_get_varint((const uint8_t **)&p, end, &a))
+                break;
+            recomp_set_portable_math((int)(a & 1));
+            if (a & 1)
+                fprintf(stderr, "  [SCHED] recorded with RECOMP_PORTABLE_MATH: "
+                        "portable math on for this replay\n");
         } else
             break;
     }
@@ -381,6 +393,10 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                 setvbuf(s_out, NULL, _IOFBF, 1 << 20);
                 fwrite("BX2SCHED", 1, 8, s_out);
                 fwrite(&ver, 4, 1, s_out);
+                if (recomp_portable_math_enabled()) {
+                    fputc(0x03, s_out);
+                    sched_put_varint(1);
+                }
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));

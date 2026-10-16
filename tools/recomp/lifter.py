@@ -3645,32 +3645,39 @@ class Lifter:
         # These are exact-enough mappings onto libm. The 80-bit intermediates of
         # real x87 are not reproduced -- fp_stack is double -- which is the same
         # approximation every other op here already makes.
+        #
+        # Through the runtime's recomp_f* (src/kernel/recomp_math.c), not libm
+        # directly: by default those are the same libm calls, but with
+        # RECOMP_PORTABLE_MATH=1 they are one implementation that gives the
+        # same bits under every compiler and C library -- MSVC's and glibc's
+        # cos differ in the last bit, and that alone parts two runs of the
+        # same input (Windows/Linux replays, network play).
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return [f"fp_top() = recomp_fsin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return [f"fp_top() = recomp_fcos(fp_top()); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
-                    f" fp_push(cos(_a)); }} /* fsincos */"]
+            return [f"{{ double _a = fp_top(); fp_top() = recomp_fsin(_a);"
+                    f" fp_push(recomp_fcos(_a)); }} /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            return [f"{{ fp_top() = recomp_ftan(fp_top()); fp_push(1.0); }} /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
-            return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
+            return [f"{{ fp_st1() = recomp_fatan2(fp_st1(), fp_top()); fp_pop(); }}"
                     f" /* fpatan */"]
         if m == "fyl2x":
             # st1 = st1 * log2(st0), pop.
-            return [f"{{ fp_st1() = fp_st1() * log2(fp_top()); fp_pop(); }}"
+            return [f"{{ fp_st1() = fp_st1() * recomp_flog2(fp_top()); fp_pop(); }}"
                     f" /* fyl2x */"]
         if m == "fyl2xp1":
-            return [f"{{ fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop(); }}"
+            return [f"{{ fp_st1() = fp_st1() * recomp_flog2(fp_top() + 1.0); fp_pop(); }}"
                     f" /* fyl2xp1 */"]
         if m == "f2xm1":
-            return [f"fp_top() = exp2(fp_top()) - 1.0; /* f2xm1 */"]
+            return [f"fp_top() = recomp_fexp2(fp_top()) - 1.0; /* f2xm1 */"]
         if m in ("fprem", "fprem1"):
             # Both leave the remainder in st0 and clear C2 to say "complete".
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which

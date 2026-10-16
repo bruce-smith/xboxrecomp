@@ -169,6 +169,13 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+/* The runtime's x87 transcendentals (src/kernel/recomp_math.c), as libm. */
+double recomp_fsin(double x) { return sin(x); }
+double recomp_fcos(double x) { return cos(x); }
+double recomp_ftan(double x) { return tan(x); }
+double recomp_fatan2(double y, double x) { return atan2(y, x); }
+double recomp_flog2(double x) { return log2(x); }
+double recomp_fexp2(double x) { return exp2(x); }
 
 """
 

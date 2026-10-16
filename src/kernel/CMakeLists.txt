@@ -28,9 +28,17 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
+    recomp_math.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+
+# recomp_math.c's portable functions must round the same everywhere: no fused
+# multiply-add (gcc and clang contract a*b+c into one when the target has FMA,
+# e.g. -march=native). MSVC does not contract under its default /fp:precise.
+if(NOT MSVC)
+    set_source_files_properties(recomp_math.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

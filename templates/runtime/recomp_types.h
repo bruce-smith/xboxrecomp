@@ -64,6 +64,17 @@
 #include <xmmintrin.h>
 #endif
 
+/* The x87 transcendentals (fsin, fcos, fsincos, fptan, fpatan, fyl2x,
+ * fyl2xp1, f2xm1), in the runtime's src/kernel/recomp_math.c: libm by
+ * default, one bit-reproducible implementation with RECOMP_PORTABLE_MATH=1
+ * (cross-platform replays, network play). */
+double recomp_fsin(double x);
+double recomp_fcos(double x);
+double recomp_ftan(double x);
+double recomp_fatan2(double y, double x);
+double recomp_flog2(double x);
+double recomp_fexp2(double x);
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))

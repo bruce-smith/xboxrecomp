@@ -828,6 +828,11 @@ enum {                                          /* xbox_SchedValue kinds */
     XBOX_SCHED_PREEMPT, XBOX_SCHED_FILETIME, XBOX_SCHED_DISKSPACE,
     XBOX_SCHED_APU
 };
+/* RECOMP_PORTABLE_MATH (recomp_math.c): the lifted x87 transcendentals give
+ * the same bits on every host. Fixed before guest code runs: from the
+ * environment, a replayed schedule's header, or a network session. */
+int      recomp_portable_math_enabled(void);
+void     recomp_set_portable_math(int on);
 int      xbox_SchedMode(void);                  /* 0 off, 1 record, 2 replay */
 int      xbox_SchedReplaying(void);
 void     xbox_SchedBind(int agent);             /* this host thread is that agent */
