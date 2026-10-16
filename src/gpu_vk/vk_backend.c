@@ -3371,7 +3371,7 @@ static int backend_init(void)
         if (!VK_OK(vkCreateSemaphore(g_vk.device, &sci, NULL, &B.timeline)))
             return 0;
     }
-    B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL;
+    B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL || getenv("RECOMP_VK_SHADOW") != NULL;
     settings_declare();
     B.mtx = vk_mutex_new();
     B.rep_event = vk_event_new();
@@ -3418,6 +3418,24 @@ static void vk_flip(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uin
 static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h,
                        uint32_t flip)
 {
+    /* RECOMP_VK_SHADOW=1 (netplay): the software renderer is authoritative
+     * for everything the guest sees -- it renders into guest memory and
+     * answers the visibility tests, exactly as with RECOMP_GPU=software --
+     * and this renderer only draws what is shown (supersampling, FXAA and
+     * the menu included). Nothing from it reaches guest memory; no diff. */
+    static int shadow = -1;
+    if (shadow < 0)
+        shadow = getenv("RECOMP_VK_SHADOW") != NULL;
+    if (shadow) {
+        if (!B.ok || g_vk.lost)
+            return;
+        B.frame++;
+        submit(0);
+        flip_present(addr, w, h);
+        frame_stats();
+        apply_settings();
+        return;
+    }
     compare_frame(addr, pitch, bpp, w, h, flip);
     if (B.ok && !g_vk.lost)
         apply_settings();

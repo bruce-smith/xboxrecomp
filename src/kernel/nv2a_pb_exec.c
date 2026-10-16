@@ -5020,10 +5020,15 @@ static void backend_select(void)
     if (want)
         s_backend = xbox_vk_backend();
 #endif
-    s_backend_compare = s_backend && getenv("RECOMP_VK_COMPARE") != NULL;
+    /* RECOMP_VK_SHADOW (netplay): the same split as compare mode -- software
+     * owns every guest-visible result -- with Vulkan only presenting. */
+    s_backend_compare = s_backend && (getenv("RECOMP_VK_COMPARE") != NULL
+                                      || getenv("RECOMP_VK_SHADOW") != NULL);
     if (s_backend)
         fprintf(stderr, "  [GPU] renderer: %s (%s)%s\n", s_backend->name, why,
-                s_backend_compare ? ", compared against software, which renders" : "");
+                !s_backend_compare ? ""
+                : getenv("RECOMP_VK_SHADOW") ? ", display only; software renders for the guest"
+                : ", compared against software, which renders");
     else
         fprintf(stderr, "  [GPU] renderer: software (%s%s)\n", why,
                 want ? "; vulkan not available" : "");
