@@ -311,12 +311,15 @@ static void mk_dirs(const char *path)            /* every level of path */
     CreateDirectoryA(p, NULL);
 }
 
-static void session_dir(int player)
+/* %LOCALAPPDATA%\xboxrecomp\netplay\<port>\p<n>: by port too, so two games
+ * on one PC (a loopback test) do not share a folder. */
+static void session_dir(int player, int port)
 {
     char base[MAX_PATH];
     if (!GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH))
         snprintf(base, sizeof base, ".");
-    snprintf(s_session, sizeof s_session, "%s\\xboxrecomp\\netplay\\p%d", base, player + 1);
+    snprintf(s_session, sizeof s_session, "%s\\xboxrecomp\\netplay\\%d\\p%d", base, port,
+             player + 1);
     rm_tree(s_session);
     mk_dirs(s_session);
 }
@@ -494,7 +497,7 @@ static int handshake_host(int port, const char *save_src)
         fprintf(stderr, "[NET] cannot listen on TCP port %d (%d)\n", port, WSAGetLastError());
         return 0;
     }
-    session_dir(0);
+    session_dir(0, port);
     {
         char src[MAX_PATH], dst[MAX_PATH];
         snprintf(src, sizeof src, "%s\\UDATA", save_src);
@@ -608,7 +611,7 @@ static int handshake_join(const char *ip, int port)
             s_np = w->players;
             s_delay = w->delay;
             got_welcome = 1;
-            session_dir(s_me);
+            session_dir(s_me, port);
             c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (c == INVALID_SOCKET
                 || connect(c, (struct sockaddr *)&s_peer[0], sizeof s_peer[0])) {
