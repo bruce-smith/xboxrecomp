@@ -556,8 +556,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
      * when something else may have the focus, and the keyboard pad
      * stand-in only sees keys sent to this window. */
     SetWindowTextW(hwnd, s_title);
-    ShowWindow(hwnd, SW_SHOWNORMAL);
-    SetForegroundWindow(hwnd);
+    /* RECOMP_FB_NOACTIVATE: shown without taking the focus -- for agents
+     * testing in a window while someone else uses the machine. */
+    if (getenv("RECOMP_FB_NOACTIVATE")) {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+    }
     /* RECOMP_FB_FULLSCREEN=1 (the menu's "Start in fullscreen"): borderless
      * fullscreen from the start, as F11 / Alt+Enter toggle it. On a flip-model
      * Vulkan swapchain (RECOMP_VK_PRESENT) a window covering the monitor gets

@@ -221,6 +221,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/xbox_input_map.h"   /* xbox_input_blocked */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -644,6 +645,15 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     return n;
 }
 
+/* While the in-game menu is open the game sees nothing pressed: the host
+ * pad and keyboard are blocked in xinput_device.c, and scripted input
+ * (RECOMP_PAD_PRESS/_SCRIPT/_LIVE), added after them, here. */
+static void menu_blank(uint8_t *out)
+{
+    if (xbox_input_blocked())
+        memset(out + 2, 0, 18);
+}
+
 static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -700,6 +710,7 @@ static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
         out[2] = synth;
         pad_rest_apply(pad, out);
         pad_script_apply(pad, out);
+        menu_blank(out);
         return 20;
     }
 
@@ -718,5 +729,6 @@ static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_rest_apply(pad, out);
     pad_script_apply(pad, out);
+    menu_blank(out);
     return 20;
 }

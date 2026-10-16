@@ -265,6 +265,11 @@ void xbox_input_set_blocked(int blocked)
     InterlockedExchange(&s_blocked, blocked ? 1 : 0);
 }
 
+int xbox_input_blocked(void)
+{
+    return s_blocked != 0;
+}
+
 int xbox_input_host_pad_connected(int pad)
 {
     XINPUT_STATE st;

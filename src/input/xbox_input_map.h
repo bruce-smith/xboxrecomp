@@ -56,6 +56,7 @@ int  xbox_input_host_pad_connected(int pad);
 
 /* While set (the menu is open), every port reports nothing pressed. */
 void xbox_input_set_blocked(int blocked);
+int  xbox_input_blocked(void);
 
 #ifdef __cplusplus
 }
