@@ -1229,8 +1229,13 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             }
             /* Recorded under a guest-CPU schedule, as in the Windows backend:
              * host free space moves, and a replay must see the recorded one
-             * (and take the same two values, or every later value is off). */
-            if (xbox_SchedMode()) {
+             * (and take the same two values, or every later value is off).
+             * In virtual mode (network play) it is a constant, the same as
+             * the Windows backend's: every peer must see the same disk. */
+            if (xbox_SchedVirtual()) {
+                info->TotalAllocationUnits.QuadPart = 1048576;
+                info->AvailableAllocationUnits.QuadPart = 524288;
+            } else if (xbox_SchedMode()) {
                 info->TotalAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
                     XBOX_SCHED_DISKSPACE, (uint64_t)info->TotalAllocationUnits.QuadPart);
                 info->AvailableAllocationUnits.QuadPart = (LONGLONG)xbox_SchedValue(
