@@ -421,7 +421,8 @@ void section_cheats()
 /* Network play (src/net): host or join a lockstep game. A network game
  * starts from power-on for everyone, so starting one restarts the game with
  * RECOMP_NET set; during one, this shows who is who. */
-void start_network_game(int host, const char *addr, int port, int players, int delay)
+void start_network_game(int host, const char *addr, int port, int players, int delay,
+                        int vk_display)
 {
 #if !defined(_WIN32)
     /* POSIX: the same restart, by exec'ing ourselves with the variables set. */
@@ -436,6 +437,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     setenv("RECOMP_NET_PLAYERS", v, 1);
     snprintf(v, sizeof v, "%d", delay);
     setenv("RECOMP_NET_DELAY", v, 1);
+    setenv("RECOMP_NET_VK", vk_display ? "1" : "0", 1);
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
         exe[n] = 0;
@@ -454,6 +456,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     SetEnvironmentVariableA("RECOMP_NET_PLAYERS", v);
     snprintf(v, sizeof v, "%d", delay);
     SetEnvironmentVariableA("RECOMP_NET_DELAY", v);
+    SetEnvironmentVariableA("RECOMP_NET_VK", vk_display ? "1" : "0");
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     snprintf(dir, sizeof dir, "%s", exe);
     if ((slash = strrchr(dir, '\\')) != nullptr)
@@ -472,6 +475,7 @@ void section_network()
 {
     static bool loaded;
     static int mode, port, players, delay;
+    static bool vk_display;
     static char addr[64];
     bool changed = false;
 
@@ -489,6 +493,7 @@ void section_network()
         port = xbox_setting_get("network", "port", 27350);
         players = xbox_setting_get("network", "players", 2);
         delay = xbox_setting_get("network", "delay", 3);
+        vk_display = xbox_setting_get("network", "vk_display", 0) != 0;
         xbox_setting_get_str("network", "host", "192.168.1.2", addr, sizeof addr);
         loaded = true;
     }
@@ -515,7 +520,13 @@ void section_network()
         ImGui::TextWrapped("The host decides the number of players and the delay, and "
                            "sends its saves. You get the next free controller port.");
     }
+    changed |= ImGui::Checkbox("Vulkan display (AA)", &vk_display);
+    ImGui::TextWrapped("Off: the software renderer draws and shows the game. On: it still "
+                       "draws everything the game reads back, so the players stay in step, "
+                       "and Vulkan shows the picture, smoothed. Not faster, and the first "
+                       "time an effect appears it may hitch. Only your own screen changes.");
     if (changed) {
+        xbox_setting_set("network", "vk_display", vk_display ? 1 : 0);
         xbox_setting_set("network", "mode", mode);
         xbox_setting_set("network", "port", port);
         xbox_setting_set("network", "players", players);
@@ -527,7 +538,7 @@ void section_network()
     ImGui::TextWrapped("Starting restarts the game: everyone begins from power-on together, "
                        "and the host's game waits until every player has joined.");
     if (ImGui::Button(mode == 0 ? "Start network game (host)" : "Join network game"))
-        start_network_game(mode == 0, addr, port, players, delay);
+        start_network_game(mode == 0, addr, port, players, delay, vk_display ? 1 : 0);
 }
 
 void section_about()

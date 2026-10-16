@@ -55,6 +55,7 @@ static NpIn s_in[NP_MAXP][NP_RING];
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static uint32_t s_sampled;                       /* local frames sampled so far */
 static uint64_t s_exe_hash;
+static char s_why[256];                          /* why the session did not start */
 static uint32_t s_hash_f[NP_MAXP];
 static uint64_t s_hash_v[NP_MAXP][2];            /* last two checks per player */
 static uint32_t s_hash_fr[NP_MAXP][2];
@@ -519,6 +520,10 @@ static int handshake_host(int port, const char *save_src)
                 && s_peer[i].sin_port == from.sin_port)
                 known = i;
         if (((PkHello *)buf)->exe != s_exe_hash) {
+            PkBye no;
+            memset(&no, 0, sizeof no);
+            no.type = PK_BYE;
+            send_to(&from, &no, sizeof no);      /* so it can say why */
             fprintf(stderr, "[NET] a player with a different build tried to join; refused\n");
             continue;
         }
@@ -607,21 +612,29 @@ static int handshake_join(const char *ip, int port)
             c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (c == INVALID_SOCKET
                 || connect(c, (struct sockaddr *)&s_peer[0], sizeof s_peer[0])) {
-                fprintf(stderr, "[NET] cannot fetch the host's saves (TCP %d)\n", port);
+                snprintf(s_why, sizeof s_why, "Could not fetch the host's saves (TCP port "
+                         "%d). The host's firewall must allow the game on TCP as well as "
+                         "UDP.", port);
                 return 0;
             }
             files = recv_tree(c, s_session);
             closesocket(c);
             if (files < 0) {
-                fprintf(stderr, "[NET] the host's saves did not arrive whole\n");
+                snprintf(s_why, sizeof s_why, "The host's saves did not arrive whole.");
                 return 0;
             }
             fprintf(stderr, "[NET] received the host's saves (%d files)\n", files);
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
             return 1;
+        } else if (n >= 1 && buf[0] == PK_BYE && !got_welcome) {
+            snprintf(s_why, sizeof s_why, "The host refused: it runs a different build. "
+                     "Every player needs the very same blinx_2_recomp.exe.");
+            return 0;
         }
         if (!got_welcome && GetTickCount() - t0 > 120000) {
-            fprintf(stderr, "[NET] no answer from the host in 2 minutes\n");
+            snprintf(s_why, sizeof s_why, "No answer from the host at %s:%d in 2 minutes. "
+                     "Check the address, that the host is waiting, and its firewall.",
+                     ip, port);
             return 0;
         }
     }
@@ -668,8 +681,16 @@ int xbox_NetplayStart(const char *game_dir)
         }
     }
     if (!ok) {
+        const char *hl = getenv("RECOMP_HEADLESS");
+        if (s_why[0])
+            fprintf(stderr, "[NET] %s\n", s_why);
         fprintf(stderr, "[NET] RECOMP_NET=%s: no network game\n", e);
         fflush(stderr);
+        if (s_why[0] && !(hl && *hl == '1')) {
+            char msg[400];
+            snprintf(msg, sizeof msg, "%s\n\nThe game continues on its own.", s_why);
+            MessageBoxA(NULL, msg, "Blinx 2 network game", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        }
         return 0;
     }
     {
@@ -686,7 +707,10 @@ int xbox_NetplayStart(const char *game_dir)
         s_sampled = (uint32_t)s_delay;
     }
     /* What every peer must run alike: virtual mode, one pad per player,
-     * software rendering for anything the guest reads back. */
+     * software rendering for anything the guest reads back. RECOMP_NET_VK=1
+     * (the Network tab's "Vulkan display") changes only what this player
+     * sees: software stays authoritative and Vulkan presents (P10's shadow
+     * mode). Headless there is nothing to present. */
     _putenv_s("RECOMP_SCHED_VIRTUAL", "1");
     _putenv_s("RECOMP_SAVE_DIR", s_session);
     {
@@ -694,7 +718,16 @@ int xbox_NetplayStart(const char *game_dir)
         snprintf(n, sizeof n, "%d", s_np);
         _putenv_s("RECOMP_USB_PADS", n);
     }
-    _putenv_s("RECOMP_GPU", "software");
+    {
+        const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
+        if (vk && *vk == '1' && !(hl && *hl == '1')) {
+            _putenv_s("RECOMP_GPU", "vulkan");
+            _putenv_s("RECOMP_VK_SHADOW", "1");
+            _putenv_s("RECOMP_VK_PRESENT", "1");
+        } else {
+            _putenv_s("RECOMP_GPU", "software");
+        }
+    }
     /* One implementation of the x87 maths (fsin, fcos, ...) on every peer:
      * each OS's C library differs in the last bit (P12, RECOMP_PORTABLE_MATH). */
     _putenv_s("RECOMP_PORTABLE_MATH", "1");
