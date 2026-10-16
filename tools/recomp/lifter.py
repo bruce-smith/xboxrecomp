@@ -3683,7 +3683,14 @@ class Lifter:
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
             # is the difference between fmod and remainder.
             fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            # The library call is the whole reduction, so the status word must
+            # say "complete" too: the CRT's fmod loops `fprem; fnstsw ax; sahf;
+            # jp again` until C2 clears, and the jp reads g_fp_cmp. Left alone,
+            # that was whatever the last compare set -- after an unordered one
+            # (a NaN), 2, and the loop spun forever (Blinx 2 hung entering
+            # stage 4-3 in sub_002E0144). C2/C3/C0 cleared, compare "greater".
+            return [f"fp_top() = {fn}(fp_top(), fp_st1()); "
+                    f"g_fp_cc = (uint16_t)(g_fp_cc & ~0x4500u); g_fp_cmp = 1; /* {m} */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
