@@ -339,6 +339,47 @@ static void test_interlocked(void)
           && l == 0x3C, "interlocked and/or return the old value");
 }
 
+/* PulseEvent releases the threads already waiting (one of them for an
+ * auto-reset event) and leaves the event reset. */
+static HANDLE s_pulse_ev;
+static volatile LONG s_pulse_woken;
+
+static DWORD WINAPI pulse_waiter(LPVOID p)
+{
+    (void)p;
+    if (WaitForSingleObject(s_pulse_ev, 3000) == WAIT_OBJECT_0)
+        InterlockedIncrement(&s_pulse_woken);
+    return 0;
+}
+
+static int pulse_round(BOOL manual)
+{
+    HANDLE t[2];
+    int i;
+    s_pulse_ev = CreateEventA(NULL, manual, FALSE, NULL);
+    s_pulse_woken = 0;
+    for (i = 0; i < 2; i++)
+        t[i] = CreateThread(NULL, 0, pulse_waiter, NULL, 0, NULL);
+    Sleep(200);                              /* both blocked */
+    PulseEvent(s_pulse_ev);
+    Sleep(200);
+    i = (int)s_pulse_woken;
+    WaitForSingleObject(t[0], INFINITE);
+    WaitForSingleObject(t[1], INFINITE);
+    CloseHandle(t[0]);
+    CloseHandle(t[1]);
+    check(WaitForSingleObject(s_pulse_ev, 0) == WAIT_TIMEOUT,
+          manual ? "pulse: manual-reset event left reset" : "pulse: auto-reset event left reset");
+    CloseHandle(s_pulse_ev);
+    return i;
+}
+
+static void test_pulse(void)
+{
+    check(pulse_round(TRUE) == 2, "pulse: manual-reset event releases every waiter");
+    check(pulse_round(FALSE) == 1, "pulse: auto-reset event releases one waiter");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -349,6 +390,7 @@ int main(void)
     test_suspend_stress();
     test_waits();
     test_interlocked();
+    test_pulse();
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures,
            failures == 1 ? "" : "s");
     return failures ? 1 : 0;

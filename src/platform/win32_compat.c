@@ -301,6 +301,11 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    /* PulseEvent: a waiter blocked when pulse_seq moves is released (one
+     * of them for an auto-reset event, while pulse_left says so). */
+    unsigned        pulse_seq;
+    int             pulse_left;
+    int             event_waiters;
 
     /* semaphore */
     long            sem_count;
@@ -555,11 +560,21 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned pulse0 = o->pulse_seq;
+    int pulsed = 0;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled;
+            if (!ready && o->pulse_seq != pulse0
+                && (o->manual_reset || o->pulse_left > 0)) {
+                if (!o->manual_reset)
+                    o->pulse_left--;
+                ready = pulsed = 1;
+            }
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -580,8 +595,12 @@ static DWORD wait_single(w32_object *o, DWORD ms)
             until = o->waitable_due_time;
             bounded = 1;
         }
+        if (o->kind == K_EVENT)
+            o->event_waiters++;
         int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
                          : pthread_cond_wait(&o->cond, &o->lock);
+        if (o->kind == K_EVENT)
+            o->event_waiters--;
         if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
             result = WAIT_TIMEOUT; break;
         }
@@ -589,7 +608,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT: if (!o->manual_reset && !pulsed) o->signaled = 0; break;
         case K_WAITABLE_TIMER:
             if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
             break;
@@ -701,9 +720,16 @@ BOOL PulseEvent(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
+    /* Releases the threads waiting at this moment (one of them for an
+     * auto-reset event) and leaves the event reset, as Win32. Setting
+     * signaled around the broadcast released nobody: a waiter wakes only
+     * after the lock is released, and by then it read 0 again. */
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->event_waiters > 0) {
+        o->pulse_seq++;
+        o->pulse_left = o->manual_reset ? 0 : 1;
+        pthread_cond_broadcast(&o->cond);
+    }
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);
     return TRUE;
