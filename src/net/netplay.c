@@ -1116,10 +1116,15 @@ static void cheat_take(uint8_t *flag_ev)
 
 static void cheat_due(const uint8_t *ev)
 {
+    int full;
     AcquireSRWLockExclusive(&s_lock);
-    if (s_dq_tail - s_dq_head < NP_CQ)
+    full = s_dq_tail - s_dq_head >= NP_CQ;
+    if (!full)
         memcpy(s_dq[s_dq_tail++ % NP_CQ], ev, 22);
     ReleaseSRWLockExclusive(&s_lock);
+    if (full)          /* the same on every peer, so no desync; but say so */
+        fprintf(stderr, "[NET] cheat request %u dropped: %d due and not yet applied\n",
+                ev[0], NP_CQ);
 }
 
 int xbox_NetplayCheatNext(uint8_t ev[22])
@@ -1294,7 +1299,7 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         NpIn *e = &s_in[port][f % NP_RING];
         int ok, due = 0;
         uint8_t ev[22];
-        AcquireSRWLockShared(&s_lock);
+        AcquireSRWLockExclusive(&s_lock);       /* s_ev_done is written here */
         ok = e->have && e->f == f;
         if (ok) {
             memcpy(state18, e->s, 18);
@@ -1304,7 +1309,7 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
             }
             s_ev_done[port] = f + 1u;
         }
-        ReleaseSRWLockShared(&s_lock);
+        ReleaseSRWLockExclusive(&s_lock);
         if (due) {                              /* now, the same on every peer */
             cheat_due(ev);
             fprintf(stderr, "[NET] frame %u: cheat request %u from player %d due\n",
