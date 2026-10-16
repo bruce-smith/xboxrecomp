@@ -40,8 +40,15 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_SchedMode(void);          /* kernel: 0 off, 1 record, 2 replay */
 
-#define VKB_SLOTS     2
-#define VKB_RING      (64u << 20)        /* upload bytes per slot */
+/* Command buffers in flight: RECOMP_VK_SLOTS (2-8, default 2). Every
+ * visibility report submits one, so a frame submits 5-20, and with two a new
+ * one waits for the GPU to finish the one two back; whether more help could
+ * not be measured on a loaded machine (2026-10-16). The upload memory stays
+ * 128 MB, split between them (64 MB each at the default; a draw reading
+ * more than 32 MB is skipped anyway). */
+#define VKB_SLOTS     8                  /* at most */
+#define VKB_RING_ALL  (128u << 20)
+#define VKB_RING      B.ring_size        /* upload bytes per slot */
 #define VKB_QUERIES   8192               /* occlusion queries per slot */
 #define VKB_SETS      8192               /* descriptor sets per slot */
 #define VKB_SETCACHE  1024               /* of them found again by textures */
@@ -126,6 +133,8 @@ typedef struct {
 static struct {
     int ok;
     Slot slot[VKB_SLOTS];
+    int nslots;
+    uint32_t ring_size;
     int cur;
     int recording;
     VkCommandPool pool;
@@ -312,23 +321,6 @@ static int wait_steps(void)
     return steps;
 }
 
-static int fence_wait(VkFence f)
-{
-    int i;
-    for (i = 0; i < wait_steps() && !g_vk.lost; i++) {
-        VkResult r = vkWaitForFences(g_vk.device, 1, &f, VK_TRUE, 100000000ull);
-        if (r == VK_SUCCESS)
-            return 1;
-        if (r != VK_TIMEOUT) {
-            mark_lost("a fence wait failed");
-            return 0;
-        }
-    }
-    if (!g_vk.lost)
-        mark_lost("a fence did not signal in time (RECOMP_VK_LOST_MS)");
-    return 0;
-}
-
 static int timeline_wait(uint64_t value)
 {
     VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
@@ -353,12 +345,27 @@ static int timeline_wait(uint64_t value)
 static void slot_complete(Slot *s)
 {
     uint32_t i;
+    uint64_t seq;
+    int ok;
     vk_mutex_lock(B.mtx);
     if (!s->pending) {
         vk_mutex_unlock(B.mtx);
         return;
     }
-    if (!fence_wait(s->fence)) {
+    /* The wait without the lock: the executor (reusing the slot) and the
+     * report thread (counting its queries) may both wait, and whoever gets
+     * the lock first afterwards takes the results. On the timeline, not the
+     * fence: the executor resets the fence when it reuses the slot, and a
+     * wait on a reset fence would end as a lost device. */
+    seq = s->seq;
+    vk_mutex_unlock(B.mtx);
+    ok = timeline_wait(seq);
+    vk_mutex_lock(B.mtx);
+    if (!s->pending || s->seq != seq) {
+        vk_mutex_unlock(B.mtx);
+        return;
+    }
+    if (!ok) {
         s->pending = 0;                  /* lost: its queries count nothing */
         vk_mutex_unlock(B.mtx);
         return;
@@ -471,7 +478,7 @@ static void submit(int wait)
 
     if (!B.recording) {
         if (wait)
-            slot_complete(&B.slot[(B.cur + VKB_SLOTS - 1) % VKB_SLOTS]);
+            slot_complete(&B.slot[(B.cur + B.nslots - 1) % B.nslots]);
         return;
     }
     end_rendering();
@@ -510,7 +517,7 @@ static void submit(int wait)
             s->seq = ++B.seq;
             if (!ok) {
                 B.recording = 0;
-                B.cur = (B.cur + 1) % VKB_SLOTS;
+                B.cur = (B.cur + 1) % B.nslots;
                 return;
             }
         }
@@ -524,7 +531,7 @@ static void submit(int wait)
     B.pending_barrier = 1;
     if (wait)
         slot_complete(s);
-    B.cur = (B.cur + 1) % VKB_SLOTS;
+    B.cur = (B.cur + 1) % B.nslots;
 }
 
 /* Nothing in flight: before destroying anything a slot may reference. */
@@ -532,7 +539,7 @@ static void wait_idle(void)
 {
     int i;
     submit(1);
-    for (i = 0; i < VKB_SLOTS; i++)
+    for (i = 0; i < B.nslots; i++)
         slot_complete(&B.slot[i]);
 }
 
@@ -2297,7 +2304,7 @@ static void report_thread(void *unused)
             vk_mutex_unlock(B.mtx);
             done = timeline_wait(seq);
             /* Every submission up to seq is done: count its queries. */
-            for (i = 0; done && i < VKB_SLOTS; i++)
+            for (i = 0; done && i < B.nslots; i++)
                 if (B.slot[i].pending && B.slot[i].seq <= seq)
                     slot_complete(&B.slot[i]);
             vk_mutex_lock(B.mtx);
@@ -3696,7 +3703,18 @@ static int backend_init(void)
     qpi.queryCount = VKB_QUERIES;
     if (!VK_OK(vkAllocateCommandBuffers(g_vk.device, &ai, &B.sink)))
         return 0;
-    for (i = 0; i < VKB_SLOTS; i++) {
+    {
+        const char *e = getenv("RECOMP_VK_SLOTS");
+        B.nslots = e ? atoi(e) : 2;
+        if (B.nslots < 2)
+            B.nslots = 2;
+        if (B.nslots > VKB_SLOTS)
+            B.nslots = VKB_SLOTS;
+        B.ring_size = VKB_RING_ALL / (uint32_t)B.nslots;
+        if (B.ring_size < (32u << 20))
+            B.ring_size = 32u << 20;
+    }
+    for (i = 0; i < B.nslots; i++) {
         Slot *s = &B.slot[i];
         if (!VK_OK(vkAllocateCommandBuffers(g_vk.device, &ai, &s->cb))
             || !VK_OK(vkCreateFence(g_vk.device, &fci, NULL, &s->fence))
