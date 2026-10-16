@@ -61,6 +61,10 @@ if(WIN32)
     add_library(xbox_net STATIC src/net/netplay.c)
     target_include_directories(xbox_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
     target_link_libraries(xbox_net PUBLIC platform xbox_usb ws2_32)
+else()
+    # POSIX: the same API, inert, until netplay.c has a BSD-sockets port.
+    add_library(xbox_net STATIC src/net/netplay_none.c)
+    target_include_directories(xbox_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
 endif()
 
 # GPU: Vulkan backend (RECOMP_VK_PRESENT / RECOMP_GPU=vulkan). Fetches

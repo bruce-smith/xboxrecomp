@@ -63,6 +63,9 @@ void xbox_ui_menu_toggle(void);
 /* The framebuffer window's message procedure calls this first; nonzero means
  * the menu consumed the message. */
 int  xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam);
+/* The SDL framebuffer window's equivalent (POSIX): an SDL_Event, and the
+ * Windows virtual-key code the window maps its key to (0 for none). */
+int  xbox_ui_sdl_event(const void *sdl_event, int vk);
 
 /* Render the menu for this frame into the overlay; returns 1 when it is open.
  * Called on the window thread. */

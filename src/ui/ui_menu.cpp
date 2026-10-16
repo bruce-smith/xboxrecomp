@@ -15,7 +15,14 @@
 #include "xbox_ui.h"
 #include "xbox_input_map.h"
 
+#if defined(_WIN32)
 #include <windows.h>
+#else
+/* POSIX: the Win32 names (SRWLOCK, Interlocked*) from win32_compat; input
+ * through ImGui's SDL2 backend, fed by video/fb_present_sdl.c. */
+#include "platform/xbox_winnt.h"
+#include <SDL.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,9 +30,13 @@
 #include <vector>
 
 #include "imgui.h"
+#if defined(_WIN32)
 #include "imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#else
+#include "imgui_impl_sdl2.h"
+#endif
 extern "C" int xbox_NetplayActive(void);           /* src/net */
 extern "C" int xbox_NetplayPlayer(void);
 extern "C" int xbox_NetplayPlayers(void);
@@ -181,6 +192,7 @@ const char *key_name(int vk, char *buf, size_t n)
         snprintf(buf, n, "-");
         return buf;
     }
+#if defined(_WIN32)
     UINT sc = MapVirtualKeyA((UINT)vk, MAPVK_VK_TO_VSC);
     LONG lp = (LONG)(sc << 16);
     switch (vk) {                     /* extended keys GetKeyNameText needs */
@@ -192,6 +204,37 @@ const char *key_name(int vk, char *buf, size_t n)
     if (!GetKeyNameTextA(lp, buf, (int)n))
         snprintf(buf, n, "key 0x%02X", vk);
     return buf;
+#else
+    /* The keys the SDL window maps to VK codes (fb_present_sdl.c, vk_of). */
+    const char *s = NULL;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        snprintf(buf, n, "%c", vk);
+    else if (vk >= 0x70 && vk <= 0x7B)
+        snprintf(buf, n, "F%d", vk - 0x6F);
+    else if (vk >= 0x60 && vk <= 0x69)
+        snprintf(buf, n, "Num %d", vk - 0x60);
+    else {
+        switch (vk) {
+        case 0x08: s = "Backspace"; break;
+        case 0x09: s = "Tab";       break;
+        case 0x0D: s = "Enter";     break;
+        case 0x10: s = "Shift";     break;
+        case 0x11: s = "Ctrl";      break;
+        case 0x12: s = "Alt";       break;
+        case 0x1B: s = "Esc";       break;
+        case 0x20: s = "Space";     break;
+        case 0x25: s = "Left";      break;
+        case 0x26: s = "Up";        break;
+        case 0x27: s = "Right";     break;
+        case 0x28: s = "Down";      break;
+        }
+        if (s)
+            snprintf(buf, n, "%s", s);
+        else
+            snprintf(buf, n, "key 0x%02X", vk);
+    }
+    return buf;
+#endif
 }
 
 void section_controllers()
@@ -507,7 +550,11 @@ void ensure_context(HWND hwnd, int h)
         io.IniFilename = nullptr;               /* no imgui.ini next to the exe */
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard
                         | ImGuiConfigFlags_NavEnableGamepad;
+#if defined(_WIN32)
         ImGui_ImplWin32_Init(hwnd);
+#else
+        ImGui_ImplSDL2_InitForOther((SDL_Window *)hwnd);
+#endif
         unsigned char *px;
         io.Fonts->GetTexDataAsRGBA32(&px, &s_tw, &s_th);
         io.Fonts->SetTexID((ImTextureID)1);
@@ -545,6 +592,7 @@ int xbox_ui_menu_open(void) { return s_open != 0; }
 
 void xbox_ui_menu_toggle(void) { set_open(!s_open); }
 
+#if defined(_WIN32)
 int xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam)
 {
     HWND h = (HWND)hwnd;
@@ -591,6 +639,51 @@ int xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam)
     }
     return 0;
 }
+#else
+int xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam)
+{
+    (void)hwnd; (void)msg; (void)wparam; (void)lparam;
+    return 0;
+}
+
+/* The SDL window's events, as xbox_ui_wndproc takes the GDI window's:
+ * Escape opens and closes the menu, a key being bound is taken (vk: the
+ * Windows virtual-key code the window maps the key to, 0 for none), and
+ * while the menu is open everything else is its own. */
+int xbox_ui_sdl_event(const void *event, int vk)
+{
+    const SDL_Event *e = (const SDL_Event *)event;
+    bool down = e->type == SDL_KEYDOWN && !e->key.repeat;
+    if (down && e->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+        if (s_open && s_cap_ctl >= 0)
+            s_cap_ctl = -1;                     /* cancel a "press a key" */
+        else
+            set_open(!s_open);
+        return 1;
+    }
+    if (!s_open)
+        return 0;
+    if (down && s_cap_ctl >= 0 && !s_cap_pad) {
+        XboxPortMap m;
+        if (vk > 0 && vk < 256) {
+            xbox_input_map_get(s_cap_port, &m);
+            m.key[s_cap_ctl] = vk & 0xFF;
+            xbox_input_map_set(s_cap_port, &m);
+        }
+        s_cap_ctl = -1;
+        return 1;
+    }
+    if (s_ctx_ready)
+        ImGui_ImplSDL2_ProcessEvent(e);
+    switch (e->type) {                          /* input is the menu's now */
+    case SDL_KEYDOWN: case SDL_KEYUP: case SDL_TEXTINPUT:
+    case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP:
+    case SDL_MOUSEWHEEL:
+        return 1;
+    }
+    return 0;
+}
+#endif
 
 int xbox_ui_render(void *hwnd, int w, int h)
 {
@@ -602,7 +695,11 @@ int xbox_ui_render(void *hwnd, int w, int h)
         s_oh = h;
         s_overlay.assign((size_t)w * h, 0u);
     }
+#if defined(_WIN32)
     ImGui_ImplWin32_NewFrame();
+#else
+    ImGui_ImplSDL2_NewFrame();
+#endif
     ImGui::GetIO().DisplaySize = ImVec2((float)w, (float)h);
     ImGui::NewFrame();
     draw_menu(w, h);

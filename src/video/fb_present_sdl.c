@@ -29,6 +29,7 @@
 #if defined(XBOXRECOMP_HAVE_VULKAN)
 #include "xbox_vk.h"
 #endif
+#include "xbox_ui.h"            /* the in-game menu (Escape) */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -283,12 +284,74 @@ static int start_fullscreen(void)
         || (de && strcasestr(de, "gamescope") != NULL);
 }
 
+/* The menu over the frame, as the GDI window composites it: the frame
+ * letterboxed at the window size and dimmed to half, the menu's
+ * premultiplied overlay on top. Fills *comp (cw x ch, 0x00RRGGBB); 0 when
+ * the menu is closed or its overlay is not this size yet. */
+static int menu_composite(void *win, const uint32_t *px, int cw, int ch,
+                          uint32_t **comp, int *comp_n)
+{
+    const uint32_t *ov;
+    int ow, oh, dw, dh, dx, dy, x, y;
+
+    if (!xbox_ui_render(win, cw, ch) || !xbox_ui_overlay(&ov, &ow, &oh, NULL))
+        return 0;
+    if (ow != cw || oh != ch) {
+        xbox_ui_overlay_release();
+        return 0;
+    }
+    if (*comp_n < cw * ch) {
+        free(*comp);
+        *comp = (uint32_t *)malloc((size_t)cw * ch * 4);
+        *comp_n = *comp ? cw * ch : 0;
+        if (!*comp) {
+            xbox_ui_overlay_release();
+            return 0;
+        }
+    }
+    if ((long long)cw * s_fb_height >= (long long)ch * s_fb_width) {
+        dh = ch;
+        dw = (int)((long long)ch * s_fb_width / s_fb_height);
+    } else {
+        dw = cw;
+        dh = (int)((long long)cw * s_fb_height / s_fb_width);
+    }
+    dx = (cw - dw) / 2;
+    dy = (ch - dh) / 2;
+    for (y = 0; y < ch; y++) {
+        uint32_t *row = *comp + (size_t)y * cw;
+        const uint32_t *orow = ov + (size_t)y * cw;
+        int sy = y - dy;
+        const uint32_t *srow = (px && sy >= 0 && sy < dh)
+            ? px + (size_t)((long long)sy * s_fb_height / dh) * s_fb_width : NULL;
+        for (x = 0; x < cw; x++) {
+            uint32_t o = orow[x], a = o >> 24, g = 0, ia;
+            int sx = x - dx;
+            if (srow && sx >= 0 && sx < dw)
+                g = (srow[(long long)sx * s_fb_width / dw] >> 1) & 0x7F7F7Fu;
+            if (a == 255) {
+                row[x] = o & 0xFFFFFFu;
+                continue;
+            }
+            ia = 255 - a;
+            row[x] = ((((g >> 16) & 0xFF) * ia / 255 + ((o >> 16) & 0xFF)) << 16)
+                   | ((((g >> 8) & 0xFF) * ia / 255 + ((o >> 8) & 0xFF)) << 8)
+                   | ((g & 0xFF) * ia / 255 + (o & 0xFF));
+        }
+    }
+    xbox_ui_overlay_release();
+    return 1;
+}
+
 static int fb_thread(void *unused)
 {
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_Texture *tex;
     int k = 2, linear, shown_linear = -1;
+    uint32_t *comp = NULL;             /* the menu over the frame */
+    int comp_n = 0, menu_shown = 0, mtex_w = 0, mtex_h = 0;
+    SDL_Texture *mtex = NULL;
     Uint32 t0 = 0;
     int f0 = 0;
     const char *e = getenv("RECOMP_FB_SCALE");
@@ -367,6 +430,12 @@ static int fb_thread(void *unused)
         int have = 0;
 
         while (SDL_PollEvent(&ev)) {
+            /* The menu first (Escape toggles it; while it is open the keys
+             * and the mouse are its own), as the GDI window does. */
+            if (ev.type != SDL_QUIT && ev.type != SDL_WINDOWEVENT
+                && xbox_ui_sdl_event(&ev, (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP)
+                                          ? vk_of(ev.key.keysym.scancode) : 0))
+                continue;
             switch (ev.type) {
             case SDL_QUIT:
                 window_closed();
@@ -398,6 +467,40 @@ static int fb_thread(void *unused)
                          s_fb_pitch, s_fb_pitch / s_fb_width);
             have = 1;
         }
+        if (xbox_ui_menu_open()) {
+            int cw = 0, ch = 0;
+            SDL_GetWindowSize(win, &cw, &ch);
+            if (cw > 0 && ch > 0
+                && menu_composite(win, have ? s_rgb : NULL, cw, ch, &comp, &comp_n)) {
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+                if (s_vk)
+                    xbox_vk_present_frame(comp, (uint32_t)cw, (uint32_t)ch, 0);
+                else
+#endif
+                {
+                    if (!mtex || cw != mtex_w || ch != mtex_h) {
+                        if (mtex)
+                            SDL_DestroyTexture(mtex);
+                        mtex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                                 SDL_TEXTUREACCESS_STREAMING, cw, ch);
+                        mtex_w = cw;
+                        mtex_h = ch;
+                    }
+                    if (mtex) {
+                        SDL_RenderSetLogicalSize(ren, cw, ch);
+                        SDL_UpdateTexture(mtex, NULL, comp, cw * 4);
+                        SDL_RenderCopy(ren, mtex, NULL, NULL);
+                        SDL_RenderPresent(ren);
+                        menu_shown = 1;
+                    }
+                }
+                goto presented;
+            }
+        }
+        if (menu_shown && ren) {
+            SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
+            menu_shown = 0;
+        }
 #if defined(XBOXRECOMP_HAVE_VULKAN)
         if (s_vk) {
             /* Skipped inside while the GPU renderer presents its own frame. */
@@ -419,6 +522,7 @@ static int fb_thread(void *unused)
             }
             SDL_RenderPresent(ren);
         }
+presented:
         {
             const char *dump = getenv("RECOMP_FB_DUMP");
             const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
@@ -451,6 +555,9 @@ static int fb_thread(void *unused)
         xbox_vk_present_shutdown();
     s_vk = 0;
 #endif
+    if (mtex)
+        SDL_DestroyTexture(mtex);
+    free(comp);
     if (tex)
         SDL_DestroyTexture(tex);
     if (ren)
