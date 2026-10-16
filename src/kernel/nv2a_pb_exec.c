@@ -5030,11 +5030,14 @@ static void backend_select(void)
      * owns every guest-visible result -- with Vulkan only presenting. */
     s_backend_compare = s_backend && (getenv("RECOMP_VK_COMPARE") != NULL
                                       || getenv("RECOMP_VK_SHADOW") != NULL);
-    if (s_backend)
+    /* Shadow mode names software: it answers the guest, and tools that pick
+     * a replay's renderer from this line (replay_blinx2.bat) must too. */
+    if (s_backend && s_backend_compare && getenv("RECOMP_VK_SHADOW"))
+        fprintf(stderr, "  [GPU] renderer: software (%s; RECOMP_VK_SHADOW: %s displays)\n",
+                why, s_backend->name);
+    else if (s_backend)
         fprintf(stderr, "  [GPU] renderer: %s (%s)%s\n", s_backend->name, why,
-                !s_backend_compare ? ""
-                : getenv("RECOMP_VK_SHADOW") ? ", display only; software renders for the guest"
-                : ", compared against software, which renders");
+                s_backend_compare ? ", compared against software, which renders" : "");
     else
         fprintf(stderr, "  [GPU] renderer: software (%s%s)\n", why,
                 want ? "; vulkan not available" : "");
