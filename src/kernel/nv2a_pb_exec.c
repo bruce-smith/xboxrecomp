@@ -3661,6 +3661,12 @@ void nv2a_pb_exec_counts(uint32_t *draws, uint64_t *pixels)
     *pixels = s_gpu.xf_pixels;
 }
 
+/* For the [PERF] line: frames presented so far (FLIP_INCREMENT_WRITE). */
+uint32_t nv2a_pb_exec_flips(void)
+{
+    return s_gpu.flips;
+}
+
 /* Hand the batch being filled to the workers (or draw it here, with no
  * pool) and start filling the next one. */
 static void rq_kick(void)
