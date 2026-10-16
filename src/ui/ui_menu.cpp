@@ -570,6 +570,14 @@ int xbox_ui_wndproc(void *hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam)
         s_cap_ctl = -1;
         return 1;
     }
+    /* Mouse messages posted to a window that is not in front (agents
+     * driving the menu with PostMessage while the human uses another app):
+     * the backend answers WM_MOUSEMOVE with TrackMouseEvent, and with the
+     * real cursor elsewhere Windows sends WM_MOUSELEAVE at once, so the
+     * click lands nowhere. A window that is not in front keeps its last
+     * mouse position instead; in front, nothing changes. */
+    if (msg == WM_MOUSELEAVE && GetForegroundWindow() != h)
+        return 1;
     if (s_ctx_ready)
         ImGui_ImplWin32_WndProcHandler(h, msg, (WPARAM)wparam, (LPARAM)lparam);
     switch (msg) {                              /* input is the menu's now */

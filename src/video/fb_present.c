@@ -612,8 +612,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         r.bottom = (LONG)(s_fb_height * (uint32_t)k);
     }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    /* RECOMP_FB_NOACTIVATE creates the window hidden: WS_VISIBLE would show
+     * it, and activate it, before the ShowWindow below gets a say. */
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           WS_OVERLAPPEDWINDOW
+                           | (getenv("RECOMP_FB_NOACTIVATE") ? 0 : WS_VISIBLE),
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
