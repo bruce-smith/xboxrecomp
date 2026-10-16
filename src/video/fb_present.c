@@ -760,8 +760,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
+    const char *w = getenv("RECOMP_FB_WINDOW");
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (!w || *w == '0')        /* =0 is off: a variable that is set is not a yes */
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

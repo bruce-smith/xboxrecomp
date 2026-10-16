@@ -571,8 +571,9 @@ presented:
 void xbox_FramebufferWindowStart(void)
 {
     SDL_Thread *th;
+    const char *w = getenv("RECOMP_FB_WINDOW");
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (!w || *w == '0')        /* =0 is off: a variable that is set is not a yes */
         return;
     if (!__sync_bool_compare_and_swap(&s_fb_running, 0, 1))
         return;
