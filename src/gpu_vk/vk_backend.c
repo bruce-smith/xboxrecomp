@@ -1423,9 +1423,13 @@ static void scissor_of(const Nv2aDrawState *st, const Surf *rt, VkRect2D *r)
     r->extent.height = (y1 - y0) * rt->sc;
 }
 
+static void ds_clear(const Nv2aDrawState *st);   /* RECOMP_VK_DRAWSTATS */
+static void ds_report(void);
+
 static void vk_clear(const Nv2aDrawState *st, uint32_t what)
 {
     Surf *rt, *zt;
+    ds_clear(st);
     VkClearAttachment ca[2];
     VkClearRect cr;
     uint32_t n = 0;
@@ -2035,6 +2039,201 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     B.tris += nix / 3;
 }
 
+/* RECOMP_VK_DRAWSTATS=<n>: for a frame with at least n draws (at most one
+ * a second), what the title drew: per render target, the commonest draws
+ * by signature (vertex program, texture 0, primitive, vertex count, target),
+ * exact repeats (same signature, vertex data address and constants), the
+ * spread of vertex counts, clears and visibility reports. For finding why a
+ * scene submits tens of thousands of draws. */
+#define DS_RTS  32
+#define DS_SIGS 4096
+static struct {
+    long min;                            /* -1: off */
+    uint32_t draws, tris, zdraws, clears, reports, repeats, small;
+    uint32_t nbin[8];                    /* vertex counts: 3, <=6, <=16, ... */
+    struct { uint32_t addr, w, h, draws, tris, zdraws, clears; } rt[DS_RTS];
+    uint32_t nrt;
+    struct {
+        uint64_t key;
+        uint32_t count, tris, n, prim, tex0, rt, prog_n, zdraws, repeats;
+        uint32_t last_attr;
+        uint64_t last_cst;
+    } sig[DS_SIGS];
+    double last_print;
+} DS = { -2 };
+
+static int ds_on(void)
+{
+    if (DS.min == -2) {
+        const char *e = getenv("RECOMP_VK_DRAWSTATS");
+        DS.min = e ? atol(e) : -1;
+    }
+    return DS.min >= 0;
+}
+
+static unsigned ds_rt(const Nv2aDrawState *st)
+{
+    unsigned i;
+    for (i = 0; i < DS.nrt; i++)
+        if (DS.rt[i].addr == st->color_addr)
+            return i;
+    if (DS.nrt == DS_RTS)
+        return DS_RTS - 1;
+    DS.rt[DS.nrt].addr = st->color_addr;
+    DS.rt[DS.nrt].w = st->clip_x + st->clip_w;
+    DS.rt[DS.nrt].h = st->clip_y + st->clip_h;
+    return DS.nrt++;
+}
+
+static uint32_t ds_tris(uint32_t prim, uint32_t n)
+{
+    switch (prim) {
+    case NV_PRIM_TRIANGLES:      return n / 3;
+    case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        return n >= 3 ? n - 2 : 0;
+    case NV_PRIM_QUADS:          return n / 4 * 2;
+    case NV_PRIM_QUAD_STRIP:     return n >= 4 ? (n - 2) / 2 * 2 : 0;
+    default:                     return 0;
+    }
+}
+
+static void ds_print(const char *when);
+
+static void ds_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
+{
+    uint64_t pk, key, cst;
+    uint32_t tris = ds_tris(g->prim, g->n), b, attr;
+    unsigned r, i, k;
+    if (!ds_on())
+        return;
+    DS.draws++;
+    DS.tris += tris;
+    if (st->zpass_enable)
+        DS.zdraws++;
+    if (g->n <= 4)
+        DS.small++;
+    for (b = 0, k = 3; k < g->n && b < 7; b++)
+        k = b ? k * 4 : 6;
+    DS.nbin[b]++;
+    r = ds_rt(st);
+    DS.rt[r].draws++;
+    DS.rt[r].tris += tris;
+    if (st->zpass_enable)
+        DS.rt[r].zdraws++;
+    pk = g->prog ? hash_bytes((const uint8_t *)g->prog, (size_t)g->prog_n * 16,
+                              1469598103934665603ull) : 0;
+    key = pk ^ ((uint64_t)st->tex[0].offset << 1) ^ ((uint64_t)g->prim << 40)
+        ^ ((uint64_t)g->n << 44) ^ ((uint64_t)st->color_addr * 0x9E3779B97F4A7C15ull);
+    attr = g->v ? 0 : g->attr[0].offset;
+    cst = g->constants ? hash_bytes((const uint8_t *)g->constants, NV2A_VSH_CONSTANTS * 16,
+                                    1469598103934665603ull) : 0;
+    i = (unsigned)(key % DS_SIGS);
+    for (k = 0; k < DS_SIGS; k++, i = (i + 1) % DS_SIGS) {
+        if (!DS.sig[i].count || DS.sig[i].key == key)
+            break;
+    }
+    if (k == DS_SIGS)
+        return;
+    if (DS.sig[i].count) {
+        if (DS.sig[i].last_attr == attr && DS.sig[i].last_cst == cst) {
+            DS.sig[i].repeats++;
+            DS.repeats++;
+        }
+    } else {
+        DS.sig[i].key = key;
+        DS.sig[i].n = g->n;
+        DS.sig[i].prim = g->prim;
+        DS.sig[i].tex0 = st->tex[0].valid ? st->tex[0].offset : 0;
+        DS.sig[i].rt = st->color_addr;
+        DS.sig[i].prog_n = g->prog ? g->prog_n : 0;
+    }
+    DS.sig[i].count++;
+    DS.sig[i].tris += tris;
+    if (st->zpass_enable)
+        DS.sig[i].zdraws++;
+    DS.sig[i].last_attr = attr;
+    DS.sig[i].last_cst = cst;
+    /* A frame that does not end: say so every 2 s, from what it drew. */
+    if ((DS.draws & 1023) == 0 && DS.draws >= (uint32_t)DS.min) {
+        double now = vk_cache_now_ms();
+        if (now - DS.last_print >= 2000.0) {
+            DS.last_print = now;
+            ds_print("not flipped yet");
+        }
+    }
+}
+
+static void ds_clear(const Nv2aDrawState *st)
+{
+    if (!ds_on())
+        return;
+    DS.clears++;
+    DS.rt[ds_rt(st)].clears++;
+}
+
+static void ds_report(void)
+{
+    if (ds_on())
+        DS.reports++;
+}
+
+static int ds_cmp(const void *a, const void *b)
+{
+    uint32_t x = DS.sig[*(const unsigned *)a].count, y = DS.sig[*(const unsigned *)b].count;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void ds_print(const char *when)
+{
+    static unsigned idx[DS_SIGS];
+    unsigned i, n = 0;
+    {
+        fprintf(stderr, "[VKDRAWS] frame %u (%s): %u draws, %u tris, %u counted, %u reports,"
+                " %u clears, %u exact repeats, %u with <= 4 vertices;"
+                " vertex counts 3/6/24/96/384/1536/6144/more: %u %u %u %u %u %u %u %u\n",
+                B.frame, when, DS.draws, DS.tris, DS.zdraws, DS.reports, DS.clears, DS.repeats,
+                DS.small, DS.nbin[0], DS.nbin[1], DS.nbin[2], DS.nbin[3], DS.nbin[4],
+                DS.nbin[5], DS.nbin[6], DS.nbin[7]);
+        for (i = 0; i < DS.nrt; i++)
+            fprintf(stderr, "[VKDRAWS]   target %08X %ux%u: %u draws, %u tris, %u counted,"
+                    " %u clears\n", DS.rt[i].addr, DS.rt[i].w, DS.rt[i].h, DS.rt[i].draws,
+                    DS.rt[i].tris, DS.rt[i].zdraws, DS.rt[i].clears);
+        for (i = 0; i < DS_SIGS; i++)
+            if (DS.sig[i].count)
+                idx[n++] = i;
+        qsort(idx, n, sizeof idx[0], ds_cmp);
+        fprintf(stderr, "[VKDRAWS]   %u signatures; commonest:\n", n);
+        for (i = 0; i < n && i < 15; i++) {
+            const unsigned j = idx[i];
+            fprintf(stderr, "[VKDRAWS]     %6u x prim %u n %u (%u tris) prog %u words tex0 %08X"
+                    " -> %08X; %u counted, %u exact repeats\n", DS.sig[j].count,
+                    DS.sig[j].prim, DS.sig[j].n, DS.sig[j].tris, DS.sig[j].prog_n,
+                    DS.sig[j].tex0, DS.sig[j].rt, DS.sig[j].zdraws, DS.sig[j].repeats);
+        }
+    }
+    fflush(stderr);
+}
+
+static void ds_flip(void)
+{
+    double now;
+    if (!ds_on())
+        return;
+    now = vk_cache_now_ms();
+    if (DS.draws >= (uint32_t)DS.min && now - DS.last_print >= 1000.0) {
+        DS.last_print = now;
+        ds_print("at its flip");
+    }
+    {
+        long min = DS.min;
+        double lp = DS.last_print;
+        memset(&DS, 0, sizeof DS);
+        DS.min = min;
+        DS.last_print = lp;
+    }
+}
+
 /* RECOMP_VK_STATS: the executor thread's CPU cycles in draws (the counter
  * costs a little per call, so only then). */
 static int s_stats = -1;
@@ -2043,6 +2242,7 @@ static uint64_t s_draw_cycles;
 static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
 {
     uint64_t c0;
+    ds_draw(st, g);
     if (s_stats < 0)
         s_stats = getenv("RECOMP_VK_STATS") != NULL;
     if (!s_stats) {
@@ -2120,6 +2320,7 @@ static void report_thread(void *unused)
 static void vk_report(uint32_t at, uint64_t stamp, int force)
 {
     int k;
+    ds_report();
     if (!B.ok)
         return;
     B.nreports++;
@@ -3607,6 +3808,7 @@ static int vk_lost(void)
 /* Between two frames: new settings, and the shader cache to disk. */
 static void between_frames(void)
 {
+    ds_flip();
     if (!B.ok || g_vk.lost)
         return;
     apply_settings();
