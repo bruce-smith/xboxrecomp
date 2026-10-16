@@ -121,5 +121,7 @@ void        vk_shader_stats(unsigned *compiled, unsigned *cached, double *ms);
 int         vk_cache_dir(char *buf, size_t n);
 int         vk_file_replace(const char *from, const char *to);
 unsigned    vk_process_id(void);
+/* CPU cycles (or ns) the calling thread has run: for statistics. */
+uint64_t    vk_thread_cycles(void);
 
 #endif

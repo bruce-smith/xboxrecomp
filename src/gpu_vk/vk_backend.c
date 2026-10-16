@@ -44,6 +44,7 @@ extern int xbox_SchedMode(void);          /* kernel: 0 off, 1 record, 2 replay *
 #define VKB_RING      (64u << 20)        /* upload bytes per slot */
 #define VKB_QUERIES   8192               /* occlusion queries per slot */
 #define VKB_SETS      8192               /* descriptor sets per slot */
+#define VKB_SETCACHE  1024               /* of them found again by textures */
 #define VKB_SURFS     64
 #define VKB_TEXS      1024
 #define VKB_TEXMAP    4096               /* texture lookup hash slots */
@@ -145,6 +146,31 @@ static struct {
     float cst[192][4];
     VkDeviceSize cst_off;
     uint32_t cst_gen, slot_gen;
+    /* Descriptor sets of the slot being recorded, by the textures they hold
+     * (the buffers in them are dynamic, so draws with the same textures share
+     * one). Valid while slot_gen and view_gen hold: a destroyed view's handle
+     * may come back for another image. */
+    struct {
+        uint32_t gen, vgen;
+        VkImageView v[4];
+        VkSampler s[4];
+        VkDescriptorSet set;
+    } sets[VKB_SETCACHE];
+    uint32_t view_gen;
+    int rebind;    /* RECOMP_VK_REBIND=1: a new set and all state each draw (A/B) */
+    /* What the command buffer being recorded has bound and set, so a draw
+     * sends only what changed. Valid while gen == slot_gen; anything else
+     * binding a pipeline into it (down, fx, area passes) clears gen. */
+    struct {
+        uint32_t gen;
+        VkPipeline pipe;
+        VkDescriptorSet set;
+        uint32_t dyn[3];
+        VkViewport view;
+        VkRect2D sc;
+        float bc[4];
+        uint32_t cull, front, dte, dwe, dop, ste, sop[4], fmask, wmask, ref;
+    } bound;
     VkSampler samplers[2][8][8];         /* [linear][addr_u][addr_v] */
     Surf surf[VKB_SURFS];
     Tex tex[VKB_TEXS];
@@ -544,6 +570,7 @@ static void surf_destroy(Surf *s)
         return;
     }
     if (s->view) vkDestroyImageView(g_vk.device, s->view, NULL);
+    B.view_gen++;                        /* cached descriptor sets name it */
     if (s->img) vkDestroyImage(g_vk.device, s->img, NULL);
     if (s->mem) vkFreeMemory(g_vk.device, s->mem, NULL);
     memset(s, 0, sizeof *s);
@@ -786,6 +813,7 @@ static void tex_destroy(Tex *x)
         return;
     }
     if (x->view) vkDestroyImageView(g_vk.device, x->view, NULL);
+    B.view_gen++;
     if (x->img) vkDestroyImage(g_vk.device, x->img, NULL);
     if (x->mem) vkFreeMemory(g_vk.device, x->mem, NULL);
     memset(x, 0, sizeof *x);
@@ -1477,7 +1505,89 @@ static uint32_t prim_indices(uint32_t prim, uint32_t n, uint32_t *ix)
     return m;
 }
 
-static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
+/* The draw's descriptor set: the textures (views and samplers) it samples,
+ * the ring's buffers at dynamic offsets. Found again when an earlier draw in
+ * the slot had the same textures; made otherwise. */
+static VkDescriptorSet draw_set(Slot *s, const Nv2aDrawState *st, const VkImageView tv[4])
+{
+    VkSampler sm[4];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkDescriptorBufferInfo bi[3];
+    VkDescriptorImageInfo ii[4];
+    VkWriteDescriptorSet w[4];
+    uint32_t h = 2166136261u;
+    unsigned i, k, at, free_at = VKB_SETCACHE;
+    const uint8_t *b;
+
+    for (i = 0; i < 4; i++)
+        sm[i] = sampler(&st->tex[i]);
+    b = (const uint8_t *)tv;
+    for (i = 0; i < 4 * sizeof tv[0]; i++)
+        h = (h ^ b[i]) * 16777619u;
+    b = (const uint8_t *)sm;
+    for (i = 0; i < sizeof sm; i++)
+        h = (h ^ b[i]) * 16777619u;
+    at = h % VKB_SETCACHE;
+    for (k = 0; k < 8 && !B.rebind; k++, at = (at + 1) % VKB_SETCACHE) {
+        if (B.sets[at].gen != B.slot_gen || B.sets[at].vgen != B.view_gen) {
+            free_at = at;                /* from an earlier slot: free */
+            break;
+        }
+        if (!memcmp(B.sets[at].v, tv, sizeof B.sets[at].v)
+            && !memcmp(B.sets[at].s, sm, sizeof sm))
+            return B.sets[at].set;
+    }
+
+    ai.descriptorPool = s->dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &B.dsl;
+    if (vkAllocateDescriptorSets(g_vk.device, &ai, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    s->nsets++;
+    for (i = 0; i < 3; i++) {
+        bi[i].buffer = s->ring;
+        bi[i].offset = 0;
+    }
+    bi[0].range = sizeof(VkDrawUniforms);
+    bi[1].range = sizeof B.cst;
+    bi[2].range = VK_WHOLE_SIZE;
+    for (i = 0; i < 4; i++) {
+        ii[i].sampler = sm[i];
+        ii[i].imageView = tv[i];
+        ii[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    memset(w, 0, sizeof w);
+    for (i = 0; i < 4; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = set;
+        w[i].descriptorCount = 1;
+    }
+    w[0].dstBinding = 0;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    w[0].pBufferInfo = &bi[0];
+    w[1].dstBinding = 1;                 /* rolls over bindings 1-4 */
+    w[1].descriptorCount = 4;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[1].pImageInfo = ii;
+    w[2].dstBinding = 5;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    w[2].pBufferInfo = &bi[1];
+    w[3].dstBinding = 6;
+    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+    w[3].pBufferInfo = &bi[2];
+    vkUpdateDescriptorSets(g_vk.device, 4, w, 0, NULL);
+    if (free_at < VKB_SETCACHE) {
+        B.sets[free_at].gen = B.slot_gen;
+        B.sets[free_at].vgen = B.view_gen;
+        memcpy(B.sets[free_at].v, tv, sizeof B.sets[free_at].v);
+        memcpy(B.sets[free_at].s, sm, sizeof sm);
+        B.sets[free_at].set = set;
+    }
+    return set;
+}
+
+static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
 {
     Surf *rt, *zt;
     VkPipeline p;
@@ -1658,7 +1768,9 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
             memcpy(ix, tmp, (size_t)nix * 4);
         }
     } else {
-        VkDeviceSize vbytes = ((VkDeviceSize)g->n * sizeof(Nv2aVshOutput) + 15) & ~(VkDeviceSize)15;
+        /* The uniforms' dynamic offset must be a multiple of ualign. */
+        VkDeviceSize vbytes = ((VkDeviceSize)g->n * sizeof(Nv2aVshOutput) + ualign - 1)
+                            & ~(ualign - 1);
         VkDeviceSize ibytes = ((VkDeviceSize)maxix * 4 + ualign - 1) & ~(ualign - 1);
         uint8_t *base;
         voff = ring_alloc(vbytes + ibytes + sizeof(VkDrawUniforms), ualign, (void **)&base);
@@ -1737,65 +1849,36 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     }
 
     s = &B.slot[B.cur];
-    {
-        VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        VkDescriptorBufferInfo bi, ci, bb;
-        VkDescriptorImageInfo ii[4];
-        VkWriteDescriptorSet w[4];
-        ai.descriptorPool = s->dpool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &B.dsl;
-        if (vkAllocateDescriptorSets(g_vk.device, &ai, &set) != VK_SUCCESS)
-            return;
-        s->nsets++;
-        bi.buffer = s->ring;
-        bi.offset = uoff;
-        bi.range = sizeof(VkDrawUniforms);
-        for (i = 0; i < 4; i++) {
-            ii[i].sampler = sampler(&st->tex[i]);
-            ii[i].imageView = tv[i];
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-        memset(w, 0, sizeof w);
-        w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[0].dstSet = w[1].dstSet = set;
-        w[0].dstBinding = 0;
-        w[0].descriptorCount = 1;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w[0].pBufferInfo = &bi;
-        w[1].dstBinding = 1;             /* rolls over bindings 1-4 */
-        w[1].descriptorCount = 4;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[1].pImageInfo = ii;
-        if (raw) {
-            ci.buffer = s->ring;
-            ci.offset = B.cst_off;
-            ci.range = sizeof B.cst;
-            bb.buffer = s->ring;
-            bb.offset = boff;
-            bb.range = bbytes;
-            w[2].sType = w[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[2].dstSet = w[3].dstSet = set;
-            w[2].dstBinding = 5;
-            w[2].descriptorCount = 1;
-            w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            w[2].pBufferInfo = &ci;
-            w[3].dstBinding = 6;
-            w[3].descriptorCount = 1;
-            w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            w[3].pBufferInfo = &bb;
-        }
-        vkUpdateDescriptorSets(g_vk.device, raw ? 4 : 2, w, 0, NULL);
-    }
+    set = draw_set(s, st, tv);
+    if (!set)
+        return;
 
     p = pipeline(st, rt->fmt, vs, fs);
     if (!p)
         return;
     begin_rendering(rt, zt);
     cb = cmd();
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, 1, &set,
-                            0, NULL);
+    if (B.bound.gen != B.slot_gen || B.rebind) {
+        memset(&B.bound, 0xFF, sizeof B.bound);     /* matches nothing */
+        B.bound.gen = B.slot_gen;
+    }
+    if (B.bound.pipe != p) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        B.bound.pipe = p;
+    }
+    {
+        /* Bindings 0, 5 and 6: the uniforms, the constants, the raw data. */
+        uint32_t dyn[3];
+        dyn[0] = (uint32_t)uoff;
+        dyn[1] = raw ? (uint32_t)B.cst_off : 0;
+        dyn[2] = raw ? (uint32_t)boff : 0;
+        if (B.bound.set != set || memcmp(B.bound.dyn, dyn, sizeof dyn)) {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, 1, &set,
+                                    3, dyn);
+            B.bound.set = set;
+            memcpy(B.bound.dyn, dyn, sizeof dyn);
+        }
+    }
     if (!raw)
         vkCmdBindVertexBuffers(cb, 0, 1, &s->ring, &voff);
     vkCmdBindIndexBuffer(cb, s->ring, ioff, VK_INDEX_TYPE_UINT32);
@@ -1804,21 +1887,39 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
      * the native pixel centre, which the counting pass below counts, with no
      * shift of the picture. (An even scale would need the picture moved by
      * half a sub-pixel, which loses coverage along pixel-aligned edges.) */
-    view.x = view.y = 0.0f;
+    memset(&view, 0, sizeof view);
     view.width = (float)(rt->w * rt->sc);
     view.height = (float)(rt->h * rt->sc);
-    view.minDepth = 0.0f;
     view.maxDepth = 1.0f;
-    vkCmdSetViewport(cb, 0, 1, &view);
+    if (memcmp(&B.bound.view, &view, sizeof view)) {
+        vkCmdSetViewport(cb, 0, 1, &view);
+        B.bound.view = view;
+    }
+    memset(&sc, 0, sizeof sc);
     scissor_of(st, rt, &sc);
     if (!sc.extent.width || !sc.extent.height)
         return;
-    vkCmdSetScissor(cb, 0, 1, &sc);
+    if (memcmp(&B.bound.sc, &sc, sizeof sc)) {
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        B.bound.sc = sc;
+    }
     {
         float bc[4];
         unpack_argb(st->blend_color, bc);
-        vkCmdSetBlendConstants(cb, bc);
+        if (memcmp(B.bound.bc, bc, sizeof bc)) {
+            vkCmdSetBlendConstants(cb, bc);
+            memcpy(B.bound.bc, bc, sizeof bc);
+        }
     }
+/* The dynamic state the draw wants, sent only when it differs from what the
+ * command buffer has. */
+#define SET_DYN(field, value, call) do {                                    \
+        uint32_t v_ = (uint32_t)(value);                                    \
+        if (B.bound.field != v_) {                                          \
+            B.bound.field = v_;                                             \
+            call;                                                           \
+        }                                                                   \
+    } while (0)
     /* Culling, judged as the software path does (geo_cull): its winding is
      * the screen-space area's sign, flipped for a y-up viewport, and Vulkan's
      * framebuffer space is the same screen space. */
@@ -1826,6 +1927,7 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         int yup = st->vp_scale[1] > 0.0f;
         int ccw = (st->front_face == 0x901) ^ yup;
         VkCullModeFlags cm = VK_CULL_MODE_NONE;
+        VkFrontFace ff = ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         if (st->cull_enable) {
             switch (st->cull_face) {
             case 0x404: cm = VK_CULL_MODE_FRONT_BIT; break;
@@ -1833,22 +1935,39 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
             default:    cm = VK_CULL_MODE_BACK_BIT; break;
             }
         }
-        vkCmdSetCullMode(cb, cm);
-        vkCmdSetFrontFace(cb, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+        SET_DYN(cull, cm, vkCmdSetCullMode(cb, cm));
+        SET_DYN(front, ff, vkCmdSetFrontFace(cb, ff));
     }
     /* Depth: the software path writes depth whenever the mask is set, test
      * or no test. */
-    vkCmdSetDepthTestEnable(cb, (st->depth_test || st->depth_mask) && zt);
-    vkCmdSetDepthWriteEnable(cb, st->depth_mask != 0);
-    vkCmdSetDepthCompareOp(cb, st->depth_test ? compare_op(st->depth_func)
-                                              : VK_COMPARE_OP_ALWAYS);
-    vkCmdSetStencilTestEnable(cb, st->st_test && zt);
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_op(st->st_fail),
-                      stencil_op(st->st_zpass), stencil_op(st->st_zfail),
-                      compare_op(st->st_func));
-    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_fmask & 0xFF);
-    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_wmask & 0xFF);
-    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
+    {
+        VkBool32 dte = (st->depth_test || st->depth_mask) && zt;
+        VkBool32 dwe = st->depth_mask != 0;
+        VkCompareOp dop = st->depth_test ? compare_op(st->depth_func) : VK_COMPARE_OP_ALWAYS;
+        VkBool32 ste = st->st_test && zt;
+        VkStencilOp f = stencil_op(st->st_fail), zp = stencil_op(st->st_zpass);
+        VkStencilOp zf = stencil_op(st->st_zfail);
+        VkCompareOp sf = compare_op(st->st_func);
+        SET_DYN(dte, dte, vkCmdSetDepthTestEnable(cb, dte));
+        SET_DYN(dwe, dwe, vkCmdSetDepthWriteEnable(cb, dwe));
+        SET_DYN(dop, dop, vkCmdSetDepthCompareOp(cb, dop));
+        SET_DYN(ste, ste, vkCmdSetStencilTestEnable(cb, ste));
+        if (B.bound.sop[0] != (uint32_t)f || B.bound.sop[1] != (uint32_t)zp
+            || B.bound.sop[2] != (uint32_t)zf || B.bound.sop[3] != (uint32_t)sf) {
+            vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_AND_BACK, f, zp, zf, sf);
+            B.bound.sop[0] = (uint32_t)f;
+            B.bound.sop[1] = (uint32_t)zp;
+            B.bound.sop[2] = (uint32_t)zf;
+            B.bound.sop[3] = (uint32_t)sf;
+        }
+        SET_DYN(fmask, st->st_fmask & 0xFF,
+                vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, v_));
+        SET_DYN(wmask, st->st_wmask & 0xFF,
+                vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, v_));
+        SET_DYN(ref, st->st_ref & 0xFF,
+                vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, v_));
+    }
+#undef SET_DYN
 
     if (st->zpass_enable && rt->sc > 1) {
         /* Supersampled: the count must be the native one (the title steers
@@ -1891,6 +2010,25 @@ static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         zt->dirty = 1;
     B.draws++;
     B.tris += nix / 3;
+}
+
+/* RECOMP_VK_STATS: the executor thread's CPU cycles in draws (the counter
+ * costs a little per call, so only then). */
+static int s_stats = -1;
+static uint64_t s_draw_cycles;
+
+static void vk_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
+{
+    uint64_t c0;
+    if (s_stats < 0)
+        s_stats = getenv("RECOMP_VK_STATS") != NULL;
+    if (!s_stats) {
+        draw_one(st, g);
+        return;
+    }
+    c0 = vk_thread_cycles();
+    draw_one(st, g);
+    s_draw_cycles += vk_thread_cycles() - c0;
 }
 
 static void vk_report_clear(void)
@@ -2246,6 +2384,7 @@ static VkImage downsampled(Surf *s, uint32_t w, uint32_t h)
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cb, &ri);
+    B.bound.gen = 0;                     /* a draw binds and sets everything again */
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, D.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(cb, D.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &scale);
@@ -2366,7 +2505,16 @@ static void frame_stats(void)
     if (getenv("RECOMP_VK_STATS") && B.frame % 60 == 0) {
         unsigned compiled, cached;
         double glsl_ms;
+        static uint64_t last;
+        uint64_t now = vk_thread_cycles();
         vk_shader_stats(&compiled, &cached, &glsl_ms);
+        if (last)
+            fprintf(stderr, "[VKCPU] frame %u: executor %.1f Mcycles a frame, %.1f in draws"
+                    " (%.2f kcycles a draw)\n", B.frame, (double)(now - last) / 60e6,
+                    (double)s_draw_cycles / 60e6,
+                    B.draws ? (double)s_draw_cycles / 1e3 / B.draws : 0.0);
+        last = now;
+        s_draw_cycles = 0;
         fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits,"
                 " %u new pipelines (%d kept, %.0f ms), %u new vertex shaders,"
                 " GLSL %u compiled (%.0f ms) %u from the cache, %u counted draws,"
@@ -2714,6 +2862,7 @@ static VkImage fx_pass(VkImageView src, uint32_t w, uint32_t h)
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cb, &ri);
+    B.bound.gen = 0;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, FX.p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, D.layout, 0, 1, &set, 0, NULL);
     vp.x = vp.y = 0.0f;
@@ -2936,6 +3085,7 @@ static VkImage area_resize(Surf *s, uint32_t w, uint32_t h, uint32_t dw, uint32_
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cb, &ri);
+    B.bound.gen = 0;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, AR.p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, AR.layout, 0, 1, &set, 0, NULL);
     pc[0] = (float)(w * s->sc);
@@ -3309,9 +3459,9 @@ static int backend_init(void)
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps[0].descriptorCount = VKB_SETS * 4;
-    ps[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ps[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     ps[1].descriptorCount = VKB_SETS * 2;
-    ps[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
     ps[2].descriptorCount = VKB_SETS;
     dpi.maxSets = VKB_SETS;
     dpi.poolSizeCount = 3;
@@ -3341,7 +3491,7 @@ static int backend_init(void)
     /* Binding 0: the draw's uniforms (both stages); 1-4: texture stages. */
     memset(lb, 0, sizeof lb);
     lb[0].binding = 0;
-    lb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    lb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     lb[0].descriptorCount = 1;
     lb[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     for (i = 1; i <= 4; i++) {          /* one each: 2D or cube per shader */
@@ -3351,11 +3501,11 @@ static int backend_init(void)
         lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     lb[5].binding = 5;                  /* vertex-program constants */
-    lb[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    lb[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     lb[5].descriptorCount = 1;
     lb[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     lb[6].binding = 6;                  /* the draw's vertex data */
-    lb[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    lb[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
     lb[6].descriptorCount = 1;
     lb[6].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     dli.bindingCount = 7;
@@ -3391,6 +3541,10 @@ static int backend_init(void)
             return 0;
     }
     B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL || getenv("RECOMP_VK_SHADOW") != NULL;
+    {
+        const char *e = getenv("RECOMP_VK_REBIND");
+        B.rebind = e && *e == '1';
+    }
     settings_declare();
     B.mtx = vk_mutex_new();
     B.rep_event = vk_event_new();

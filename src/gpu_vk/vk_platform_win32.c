@@ -107,3 +107,10 @@ int vk_file_replace(const char *from, const char *to)
 }
 
 unsigned vk_process_id(void) { return (unsigned)GetCurrentProcessId(); }
+
+uint64_t vk_thread_cycles(void)
+{
+    ULONG64 c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return c;
+}

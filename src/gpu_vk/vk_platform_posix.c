@@ -182,3 +182,10 @@ int vk_cache_dir(char *buf, size_t n)
 int vk_file_replace(const char *from, const char *to) { return rename(from, to) == 0; }
 
 unsigned vk_process_id(void) { return (unsigned)getpid(); }
+
+uint64_t vk_thread_cycles(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
