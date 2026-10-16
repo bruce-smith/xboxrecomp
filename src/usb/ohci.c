@@ -169,6 +169,13 @@ static int s_device_hc;
  * pad is decided somewhere in here and the mapping is worth measuring. */
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
+
+/* The root-hub port XAPI numbers controller port N+1 -- measured in Blinx 2's
+ * four-player split screen, and the same table xemu uses: root ports 3, 4,
+ * 1, 2 are players 1-4. With more than one pad, pad N goes where the game
+ * looks for player N; a single pad keeps root port 1 (titles take player 1
+ * from any port, and recorded inputs depend on its enumeration). */
+static const unsigned k_player_port[4] = { 2, 3, 0, 1 };
 static int s_enabled;
 static int s_trace;
 
@@ -1221,7 +1228,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
              * mapping can be found by measurement rather than assumed. */
             const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
+            unsigned port = pspec ? (unsigned)atoi(pspec)
+                          : s_npads > 1 ? k_player_port[0] : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             STATUS_SET(hc, INTR_RHSC);
@@ -1229,8 +1237,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n",
-                    (unsigned)(GetTickCount() - started));
+                            "arriving on port %u\n",
+                    (unsigned)(GetTickCount() - started), port + 1);
             fflush(stderr);
         }
 
@@ -1241,7 +1249,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (plugged && s_plugged_pads < s_npads
             && usb_gamepad_configured(s_plugged_pads - 1)) {
             if (++settle > 50) {                 /* ~1 s after the last */
-                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                unsigned port = s_npads > 1 ? k_player_port[s_plugged_pads]
+                              : (first_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
                 STATUS_SET(hc, INTR_RHSC);
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
@@ -1459,8 +1468,8 @@ void xbox_OhciInit(void)
             int n = atoi(padspec);
             if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
         }
-        if ((unsigned)s_npads > s_ndp)
-            s_ndp = (unsigned)s_npads;      /* a port for every pad */
+        if (s_npads > 1)
+            s_ndp = 4;                      /* every player's port */
     }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);

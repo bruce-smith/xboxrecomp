@@ -327,8 +327,12 @@ static int fb_show_menu(HWND hwnd, HDC hdc, const uint32_t *px)
 /* Split-screen enlarged: show only one part of the frame -- this player's
  * viewport -- stretched to the whole frame, which also undoes the squeeze a
  * split viewport is drawn with. Display only: the guest's frame is untouched.
- * Graphics option "view" (RECOMP_FB_VIEW); "auto" picks by network player
- * (two players: top / bottom; three or four: quarters). */
+ * Graphics option "view" (RECOMP_FB_VIEW). "auto", in a network game, follows
+ * what the guest is drawing (nv2a_pb_exec_split_layout): the whole frame
+ * until it splits, then this player's view. Measured in Blinx 2's Vs. Mode:
+ * two players are top (port 1) and bottom (port 2); three or four are
+ * quarters in column order -- port 1 top-left, 2 bottom-left, 3 top-right,
+ * 4 bottom-right -- in the menus and the arena alike. */
 static const char *const k_views[] = {
     "full", "auto", "top", "bottom", "left", "right",
     "top-left", "top-right", "bottom-left", "bottom-right"
@@ -339,16 +343,20 @@ static int fb_view_rect(int *x0, int *y0, int *w, int *h)
 #if defined(XBOXRECOMP_HAVE_UI)
     extern int xbox_NetplayActive(void);
     extern int xbox_NetplayPlayer(void);
-    extern int xbox_NetplayPlayers(void);
+    extern int nv2a_pb_exec_split_layout(void);
+    static const int k_quarter[4] = { 6, 8, 7, 9 };
     int v = xbox_setting_get("graphics", "view", 0);
     int W = (int)s_fb_width, H = (int)s_fb_height;
     if (v == 1) {                                   /* auto */
-        if (!xbox_NetplayActive())
+        int p = xbox_NetplayPlayer(), lay = nv2a_pb_exec_split_layout();
+        if (!xbox_NetplayActive() || p < 0 || p > 3)
             return 0;
-        if (xbox_NetplayPlayers() == 2)
-            v = xbox_NetplayPlayer() == 0 ? 2 : 3;
+        if (lay == 2 && p < 2)
+            v = 2 + p;
+        else if (lay == 4)
+            v = k_quarter[p];
         else
-            v = 6 + xbox_NetplayPlayer();
+            return 0;
     }
     if (v <= 1 || v >= (int)(sizeof k_views / sizeof k_views[0]))
         return 0;

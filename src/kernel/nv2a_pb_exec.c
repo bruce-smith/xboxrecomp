@@ -5679,6 +5679,56 @@ static void fsum_flip(void)
     s_fsum_draws = 0;
 }
 
+/* Is the guest drawing a split screen, and how? A local multiplayer frame
+ * is drawn view by view, each through its own viewport: two players get two
+ * full-width half-height viewports, three or four get quarter ones. Noted per
+ * draw that produced triangles, published at each flip, read by the window's
+ * "auto" view (src/video/fb_present.c). Display only; nothing the guest sees.
+ * Bits: 0x1 top half, 0x2 bottom half, 0x10 << quarter (0 TL, 1 TR, 2 BL,
+ * 3 BR). RECOMP_SPLIT_TRACE=1 logs each change. */
+static uint32_t s_split_seen;
+static volatile LONG s_split_layout;
+
+static void split_note(void)
+{
+    const float *k = nv2a_vsh_constant(58), *o = nv2a_vsh_constant(59);
+    float W = (float)s_gpu.clip_w, H = (float)s_gpu.clip_h;
+    float w = 2.0f * fabsf(k[0]), h = 2.0f * fabsf(k[1]);
+    int bottom = o[1] > H * 0.5f, right = o[0] > W * 0.5f;
+
+    if (W < 64.0f || H < 64.0f)
+        return;
+    if (fabsf(h - H * 0.5f) > H * 0.06f)
+        return;
+    if (fabsf(w - W) < W * 0.06f)
+        s_split_seen |= bottom ? 0x2u : 0x1u;
+    else if (fabsf(w - W * 0.5f) < W * 0.06f)
+        s_split_seen |= 0x10u << (bottom * 2 + right);
+}
+
+/* 2: two views, one above the other; 4: quarters; 0: not split. */
+int nv2a_pb_exec_split_layout(void)
+{
+    return (int)s_split_layout;
+}
+
+static void split_flip(void)
+{
+    static int trace = -1;
+    uint32_t q = s_split_seen >> 4, n = 0;
+    LONG lay;
+    for (; q; q >>= 1)
+        n += q & 1u;
+    lay = n >= 2 ? 4 : (s_split_seen & 3u) == 3u ? 2 : 0;
+    if (trace < 0)
+        trace = getenv("RECOMP_SPLIT_TRACE") != NULL;
+    if (trace && lay != s_split_layout)
+        fprintf(stderr, "[SPLIT] flip %u: layout %ld (views 0x%02X)%c",
+                s_gpu.flips, (long)lay, s_split_seen, 10);
+    InterlockedExchange(&s_split_layout, lay);
+    s_split_seen = 0;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -5716,6 +5766,8 @@ static void draw_primitive(void)
         uint32_t b0 = s_gpu.tris_behind, z0 = s_gpu.zpass_count;
         uint64_t p0 = s_gpu.pixels, f0 = s_gpu.xf_depth_fail;
         raster_batch();
+        if (s_gpu.tris_drawn != t0)
+            split_note();
         if (s_fsum < 0)
         {
             const char *e = getenv("RECOMP_FRAME_SUMMARY");
@@ -6596,6 +6648,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         frame_trace_flip();
+        split_flip();
         return;
 
     case NV097_FLIP_STALL:
