@@ -147,6 +147,7 @@ static struct {
     uint32_t new_pipes, new_vsh;          /* created since the last stats line */
     uint32_t frame_pipes;                 /* created since the last flip */
     double   pipe_ms;                     /* in vkCreateGraphicsPipelines */
+    double   slot_wait_ms;                /* reusing a slot the GPU still ran */
     uint32_t zdraws, nreports;            /* counted draws, GET_REPORTs */
     struct { VkPshKey key; VkShaderModule fs; int used; } fsh[VKB_FSH];
     /* Vertex programs, by their instruction words. */
@@ -403,8 +404,10 @@ static void slot_begin(void)
 {
     Slot *s = &B.slot[B.cur];
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    double t0 = vk_cache_now_ms();
 
     slot_complete(s);
+    B.slot_wait_ms += vk_cache_now_ms() - t0;   /* the GPU still had it */
     if (g_vk.lost)
         return;                           /* the slot may still be in use */
     vkResetFences(g_vk.device, 1, &s->fence);
@@ -2749,12 +2752,15 @@ static void frame_stats(void)
         last = now;
         s_draw_cycles = 0;
         fprintf(stderr, "[VKSTATS] frame %u: %u draws, %u tris, %u uploads, %u submits,"
-                " %u new pipelines (%d kept, %.0f ms), %u new vertex shaders,"
+                " %u new pipelines (%d kept, %.0f ms), %u new vertex shaders, %.0f ms"
+                " waiting for a command buffer (%d),"
                 " GLSL %u compiled (%.0f ms) %u from the cache, %u counted draws,"
                 " %u visibility reports (last 60 frames)\n",
                 B.frame, B.draws, B.tris, B.uploads, B.submits, B.new_pipes, B.npipes,
-                B.pipe_ms, B.new_vsh, compiled, glsl_ms, cached, B.zdraws, B.nreports);
+                B.pipe_ms, B.new_vsh, B.slot_wait_ms, B.nslots, compiled, glsl_ms, cached,
+                B.zdraws, B.nreports);
         B.pipe_ms = 0;
+        B.slot_wait_ms = 0;
         B.draws = B.tris = B.uploads = B.submits = B.new_pipes = B.new_vsh = 0;
         B.zdraws = B.nreports = 0;
     }
