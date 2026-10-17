@@ -1248,6 +1248,18 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         uint8_t local[NP_REC];
         memset(local, 0, sizeof local);
         usb_gamepad_sample_local(local);
+        {   /* RECOMP_NET_TEST_INPUT=1 (testing): this player's input is a
+             * function of the frame -- Start for 15 of every 120 frames, as
+             * scratch/fakehost.py plays -- so runs can be compared. */
+            static int ti = -1;
+            if (ti < 0)
+                ti = getenv("RECOMP_NET_TEST_INPUT") != NULL;
+            if (ti) {
+                memset(local, 0, 18);
+                if (s_sampled >= (uint32_t)s_delay && s_sampled % 120u < 15u)
+                    local[0] = 0x10;
+            }
+        }
         cheat_take(local + NP_EV_FLAG);         /* one queued cheat rides along */
         store_input(s_me, s_sampled, local);
         s_sampled++;
