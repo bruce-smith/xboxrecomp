@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>                     /* getenv: not implicit, it returns a pointer */
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -149,6 +150,94 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* Z: cache files the title opens unbuffered, given a buffered host handle.
+ *
+ * Blinx 2 rewrites its z:\blinx2_NNN.rec files (929,792 bytes each, one
+ * every ~0.4 s in play) with FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED:
+ * on the console those writes go on in the background. Here they are
+ * synchronous, and with a host handle opened FILE_FLAG_NO_BUFFERING each
+ * one waited for the disk on the game thread (16% of it in stage 4-3).
+ *
+ * So a file under Partition5 (Z:, the title's scratch cache) that asks for
+ * no intermediate buffering gets a normal, buffered host handle, and what
+ * the guest can see of unbuffered I/O is kept: an offset or length that is
+ * not a multiple of the 512-byte sector fails as before, and a read that
+ * stops at the end of the file zeroes the rest of its last sector in the
+ * guest's buffer (what the POSIX backend's s_fd_unbuffered does too).
+ * Completion stays synchronous, at the same points. Before such a file is
+ * renamed (the cache's .tmp -> .ipk) its data is flushed, so a crash cannot
+ * leave a complete-looking .ipk with missing contents. Saves (UDATA, TDATA:
+ * Partition1) keep their unbuffered handles. RECOMP_Z_BUFFERED=0: off. */
+#define ZBUF_SLOTS 256
+static HANDLE s_zbuf[ZBUF_SLOTS];
+static SRWLOCK s_zbuf_lock = SRWLOCK_INIT;
+
+static int zbuf_wanted(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    static int on = -1;
+    const char *p = get_xbox_path(ObjectAttributes);
+    if (on < 0) {
+        const char *e = getenv("RECOMP_Z_BUFFERED");
+        on = !(e && *e == '0');
+    }
+    if (!on || !p || ObjectAttributes->RootDirectory)
+        return 0;
+    if (!_strnicmp(p, "\\??\\", 4))
+        p += 4;
+    return !_strnicmp(p, "z:\\", 3)
+        || !_strnicmp(p, "\\Device\\Harddisk0\\Partition5\\", 29);
+}
+
+static void zbuf_add(HANDLE h)
+{
+    int i;
+    AcquireSRWLockExclusive(&s_zbuf_lock);
+    for (i = 0; i < ZBUF_SLOTS; i++)
+        if (!s_zbuf[i]) {
+            s_zbuf[i] = h;
+            break;
+        }
+    ReleaseSRWLockExclusive(&s_zbuf_lock);
+}
+
+/* 1 if h is one of them (and, with drop, forget it). */
+static int zbuf_find(HANDLE h, int drop)
+{
+    int i, found = 0;
+    if (!h)
+        return 0;
+    if (drop)
+        AcquireSRWLockExclusive(&s_zbuf_lock);
+    else
+        AcquireSRWLockShared(&s_zbuf_lock);
+    for (i = 0; i < ZBUF_SLOTS; i++)
+        if (s_zbuf[i] == h) {
+            found = 1;
+            if (drop)
+                s_zbuf[i] = NULL;
+            break;
+        }
+    if (drop)
+        ReleaseSRWLockExclusive(&s_zbuf_lock);
+    else
+        ReleaseSRWLockShared(&s_zbuf_lock);
+    return found;
+}
+
+/* Unbuffered I/O moves whole sectors. */
+static int zbuf_misaligned(PLARGE_INTEGER ByteOffset, ULONG Length)
+{
+    return (Length & 511u) || (ByteOffset && ByteOffset->QuadPart >= 0
+                                && (ByteOffset->QuadPart & 511));
+}
+
+/* For the bridge's rename: flush a buffered Z: file before it is renamed. */
+void xbox_file_flush_before_rename(HANDLE h)
+{
+    if (zbuf_find(h, 0))
+        FlushFileBuffers(h);
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -158,6 +247,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    int zbuf = 0;                       /* a buffered Z: file (zbuf_wanted) */
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -199,7 +289,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+        zbuf = (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+               && zbuf_wanted(ObjectAttributes);
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !zbuf)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
@@ -251,6 +343,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    if (zbuf)
+        zbuf_add(h);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -267,12 +361,16 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    int zbuf = zbuf_find(FileHandle, 0);
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+    if (zbuf && zbuf_misaligned(ByteOffset, Length)) {
+        result = FALSE;                 /* as the unbuffered handle refused it */
+        SetLastError(ERROR_INVALID_PARAMETER);
+    } else if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
@@ -286,6 +384,13 @@ NTSTATUS __stdcall xbox_NtReadFile(
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
             return STATUS_END_OF_FILE;
+        }
+        if (zbuf && bytes_read < Length) {
+            /* The rest of the last sector, as an unbuffered read leaves it. */
+            DWORD end = (bytes_read + 511u) & ~511u;
+            if (end > Length)
+                end = Length;
+            memset((uint8_t *)Buffer + bytes_read, 0, end - bytes_read);
         }
         IoStatusBlock->Status = STATUS_SUCCESS;
         if (Event) SetEvent(Event);
@@ -312,7 +417,10 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+    if (zbuf_misaligned(ByteOffset, Length) && zbuf_find(FileHandle, 0)) {
+        result = FALSE;                 /* as the unbuffered handle refused it */
+        SetLastError(ERROR_INVALID_PARAMETER);
+    } else if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
@@ -340,6 +448,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
+        zbuf_find(Handle, 1);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }

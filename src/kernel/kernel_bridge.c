@@ -4022,6 +4022,7 @@ static NTSTATUS bridge_rename_file(HANDLE handle, uint32_t info_va)
         BOOL ok;
         if (!fri)
             return (NTSTATUS)0xC0000017;            /* NO_MEMORY */
+        xbox_file_flush_before_rename(handle);   /* a buffered Z: file's data first */
         fri->ReplaceIfExists = replace ? TRUE : FALSE;
         fri->RootDirectory = NULL;
         fri->FileNameLength = (DWORD)bytes;

@@ -684,6 +684,9 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
 void xbox_dir_context_drop(HANDLE FileHandle);
+/* Win32: flush a Z: cache file opened buffered (kernel_file.c) before the
+ * bridge renames it. */
+void xbox_file_flush_before_rename(HANDLE FileHandle);
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
