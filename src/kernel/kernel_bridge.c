@@ -3533,19 +3533,26 @@ static void bridge_NtCreateFile(void)
      * was asked for, this says whether it opened. A failed open is not itself
      * a bug -- a title probing the cache partition before the disc expects one
      * -- so the status is what separates a probe from a real miss. */
+    /* The [PATH] line is RECOMP_FILE_LOG=1 only now, so a failure names its
+     * file itself; a success is logged only with it. */
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
-        if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
-                    g_eax, _e,
+        if (g_eax) {
+            XBOX_OBJECT_ATTRIBUTES oa_;
+            XBOX_ANSI_STRING name_;
+            bridge_build_oa(obj_attrs, &oa_, &name_);
+            fprintf(stderr, "  [FILE] %s -> 0x%08X FAILED (win32 err=%u%s)\n",
+                    name_.Buffer ? name_.Buffer : "?", g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
-        else
+            fflush(stderr);
+        } else if (xbox_file_log_verbose()) {
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
+            fflush(stderr);
+        }
     }
-    fflush(stderr);
 }
 
 /* ── NtOpenFile (ordinal 202, 6 args = 24 bytes) ──────── */

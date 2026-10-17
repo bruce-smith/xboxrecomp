@@ -14,6 +14,7 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -173,6 +174,20 @@ const wchar_t *xbox_LastHostPath(void)
  * saves and caches don't overwrite it. Racy by design: a torn read gives a
  * garbled name in a log line, nothing more. */
 static char s_last_asset[64];
+
+/* The [PATH] line of every file open, and the [FILE] line of every
+ * successful one (kernel_bridge.c): RECOMP_FILE_LOG=1 only. Each was a
+ * flushed stderr write, and the title opens its 360 z:\blinx2_NNN.rec files
+ * twice at every boot. Failed opens are still logged. */
+int xbox_file_log_verbose(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FILE_LOG");
+        on = e && *e == '1';
+    }
+    return on;
+}
 
 static int ext_is(const char *dot, const char *ext)
 {
@@ -508,8 +523,10 @@ translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
     xbox_path_note_asset(xbox_path);
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    fflush(stderr);
+    if (xbox_file_log_verbose()) {
+        fprintf(stderr, "  [PATH] %s\n", xbox_path);
+        fflush(stderr);
+    }
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
@@ -815,8 +832,10 @@ translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
     xbox_path_note_asset(xbox_path);
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    fflush(stderr);
+    if (xbox_file_log_verbose()) {
+        fprintf(stderr, "  [PATH] %s\n", xbox_path);
+        fflush(stderr);
+    }
     {
         char remainder_posix[MAX_PATH];
         size_t keep;
