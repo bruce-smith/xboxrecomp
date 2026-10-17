@@ -22,6 +22,16 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# A call with no declaration in scope is an error, not an implicit
+# "int f()": on Windows that cut getenv's pointer to 32 bits in
+# kernel_file.c (02a896f). Runtime sources only -- the game's generated C
+# is the parent project's.
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/we4013>)
+else()
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────
