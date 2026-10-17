@@ -541,13 +541,19 @@ static void monitor_submit_xa2(MCPXAPUState *d, int samples)
      *
      * Under a guest-CPU schedule the CPU is let go once here whether or not
      * the device makes us wait, so how often the APU lets go does not depend
-     * on the sound card. */
+     * on the sound card.
+     *
+     * Virtual mode (network play) neither waits nor lets go: whether this
+     * runs at all, and how often (the device's buffer size), depends on the
+     * sound device -- XAudio2 here, SDL on Linux, none on a PC without one --
+     * and the extra turn put a Windows and a Linux peer out of step. */
+    const int virt = xbox_SchedVirtual();
     qemu_mutex_unlock(&d->lock);
-    sched_b = xbox_SchedBlockBegin();
+    sched_b = virt ? 0 : xbox_SchedBlockBegin();
     qemu_mutex_lock(&d->lock);
     /* Virtual mode paces the APU by virtual time; the sound card does not
      * hold it back (a full queue drops the period). */
-    while (!xbox_SchedVirtual() && xa2_queued_buffers() >= xa2_max_queued_buffers()) {
+    while (!virt && xa2_queued_buffers() >= xa2_max_queued_buffers()) {
         if (++waited > 200) {
             if (g_mon_xa2_paced)
                 fprintf(stderr, "[APU] XAudio2 queue not draining; pacing on"
@@ -567,9 +573,11 @@ static void monitor_submit_xa2(MCPXAPUState *d, int samples)
         }
         g_lt_waits++;
     }
-    qemu_mutex_unlock(&d->lock);
-    xbox_SchedBlockEnd(sched_b);
-    qemu_mutex_lock(&d->lock);
+    if (!virt) {
+        qemu_mutex_unlock(&d->lock);
+        xbox_SchedBlockEnd(sched_b);
+        qemu_mutex_lock(&d->lock);
+    }
     g_mon_xa2_paced = true;
     /* An empty queue at submit time is an underrun: the device played out
      * everything it had and went silent until now -- a dropout. Logged
