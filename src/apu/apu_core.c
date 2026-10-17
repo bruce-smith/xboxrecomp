@@ -854,10 +854,16 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        if (!xbox_SchedReplaying())     /* a replay: the schedule paces it */
-            throttle(d);
+        /* A replay or virtual mode (network play): virtual time paces it, 32
+         * samples at 48 kHz a frame. throttle() paces on the host clock unless
+         * the sound device paces the thread (XAudio2 up, an SDL device open),
+         * so in virtual mode when the APU next wanted the CPU depended on the
+         * sound device and on wall time: a Windows and a Linux peer diverged
+         * at boot, and any peer without a working sound device would. */
+        if (xbox_SchedReplaying() || xbox_SchedVirtual())
+            xbox_SchedVirtualPause(666667ull);
         else
-            xbox_SchedVirtualPause(666667ull);  /* virtual: 32 samples at 48 kHz */
+            throttle(d);
 
         qemu_mutex_unlock(&d->lock);
         turn = xbox_SchedEnter();
