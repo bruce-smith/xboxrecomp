@@ -40,12 +40,12 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_SchedMode(void);          /* kernel: 0 off, 1 record, 2 replay */
 
-/* Command buffers in flight: RECOMP_VK_SLOTS (2-8, default 2). Every
- * visibility report submits one, so a frame submits 5-20, and with two a new
- * one waits for the GPU to finish the one two back; whether more help could
- * not be measured on a loaded machine (2026-10-16). The upload memory stays
- * 128 MB, split between them (64 MB each at the default; a draw reading
- * more than 32 MB is skipped anyway). */
+/* Command buffers in flight: RECOMP_VK_SLOTS (2-8, default 8). Every
+ * visibility report submits one -- stage 4-3 makes ~30 a frame -- and a new
+ * one waits for the GPU to finish the slot it reuses: 197 / 151 / 55 ms per
+ * 60 frames there with 2 / 4 / 8. The upload memory stays 128 MB, split
+ * between them (16 MB each at the default); a draw whose vertex data would
+ * not fit in one is skipped (logged once). */
 #define VKB_SLOTS     8                  /* at most */
 #define VKB_RING_ALL  (128u << 20)
 #define VKB_RING      B.ring_size        /* upload bytes per slot */
@@ -1702,7 +1702,8 @@ static void draw_one(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         }
         whole = hi > lo && hi - lo <= 4 * sum + 65536;
         bbytes = hi <= lo ? 16 : whole ? (hi - (lo & ~3u)) + 8 : sum + 16 * 4 + 8;
-        if (bbytes > (32u << 20)) {
+        /* Room left for its indices, uniforms and constants. */
+        if (bbytes > VKB_RING - (4u << 20)) {
             static int said;
             if (!said++)
                 fprintf(stderr, "  [VK] draw reads %u bytes of vertex data; skipped\n",
@@ -3711,14 +3712,12 @@ static int backend_init(void)
         return 0;
     {
         const char *e = getenv("RECOMP_VK_SLOTS");
-        B.nslots = e ? atoi(e) : 2;
+        B.nslots = e ? atoi(e) : 8;
         if (B.nslots < 2)
             B.nslots = 2;
         if (B.nslots > VKB_SLOTS)
             B.nslots = VKB_SLOTS;
         B.ring_size = VKB_RING_ALL / (uint32_t)B.nslots;
-        if (B.ring_size < (32u << 20))
-            B.ring_size = 32u << 20;
     }
     for (i = 0; i < B.nslots; i++) {
         Slot *s = &B.slot[i];
