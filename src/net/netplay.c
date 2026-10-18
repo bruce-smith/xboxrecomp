@@ -47,7 +47,7 @@ enum { PK_HELLO = 1, PK_WELCOME, PK_START, PK_INPUT, PK_HASH, PK_BYE };
  * event (a flag and 22 bytes, cheats.c's request), so a cheat applies on every
  * peer at the same frame. NP_PROTO is in the join identity: peers whose
  * records differ cannot join each other. */
-#define NP_PROTO    2
+#define NP_PROTO    3
 #define NP_REC      (18 + 1 + 22)
 #define NP_EV_FLAG  18
 #define NP_EV       19
@@ -61,6 +61,18 @@ static NpIn s_in[NP_MAXP][NP_RING];
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static uint32_t s_sampled;                       /* local frames sampled so far */
 static uint64_t s_exe_hash;
+/* How every peer renders. The guest's render targets are part of the sync
+ * hash, so this is the session's choice (the host's), not each player's:
+ * - NP_MODE_SOFTWARE: the software renderer draws everything (as before);
+ *   RECOMP_NET_VK=1 lets a player present through Vulkan on top.
+ * - NP_MODE_DEPTH: Vulkan draws what is seen; the software executor does
+ *   only what the guest can see of it -- depth, stencil, coverage and the
+ *   visibility reports -- and no colour reaches guest memory (P10's
+ *   renderer side: RECOMP_SW_DEPTH_ONLY). Much cheaper on a slow CPU.
+ * The host takes RECOMP_NET_RENDER=software|depth (default software). */
+enum { NP_MODE_SOFTWARE = 0, NP_MODE_DEPTH = 1 };
+static int s_mode = NP_MODE_SOFTWARE;
+static const char *const k_mode_name[] = { "software", "depth-only + Vulkan display" };
 static char s_why[256];                          /* why the session did not start */
 static char s_host_info[400];                    /* the host's status lines */
 static uint32_t s_hash_f[NP_MAXP];
@@ -94,7 +106,8 @@ int xbox_NetplayPlayers(void) { return s_np; }
 /* ---- packets --------------------------------------------------------------- */
 
 #pragma pack(push, 1)
-typedef struct { uint8_t type, player, players, delay; uint64_t exe; } PkHello;
+/* mode (WELCOME): how every peer renders, chosen by the host (NP_MODE_*). */
+typedef struct { uint8_t type, player, players, delay; uint64_t exe; uint8_t mode, pad[3]; } PkHello;
 typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][NP_REC]; } PkInput;
 typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t hash; } PkHash;
 /* A refused hello is answered with a BYE whose reason says why. */
@@ -763,10 +776,10 @@ static int handshake_host(int port, const char *save_src)
         char ips[200];
         local_addresses(ips, sizeof ips);
         snprintf(s_host_info, sizeof s_host_info,
-                 "Hosting a network game for %d players on port %d.\n\n"
+                 "Hosting a network game for %d players on port %d (rendering: %s).\n\n"
                  "The others choose Join and enter this PC's address (%s) and port "
                  "%d. This PC's firewall must let the game in (UDP and TCP).",
-                 s_np, port, ips[0] ? ips : "see ipconfig", port);
+                 s_np, port, k_mode_name[s_mode], ips[0] ? ips : "see ipconfig", port);
     }
     while (joined < s_np - 1) {
         char buf[256];
@@ -804,6 +817,7 @@ static int handshake_host(int port, const char *save_src)
         w.players = (uint8_t)s_np;
         w.delay = (uint8_t)s_delay;
         w.exe = s_exe_hash;
+        w.mode = (uint8_t)s_mode;
         send_to(&from, &w, sizeof w);
     }
     {   /* the saves, to every joiner */
@@ -918,6 +932,7 @@ static int handshake_join(const char *ip, int port)
             s_me = w->player;
             s_np = w->players;
             s_delay = w->delay;
+            s_mode = w->mode <= NP_MODE_DEPTH ? w->mode : NP_MODE_SOFTWARE;
             got_welcome = 1;
             np_status("Connected: you are player %d of %d.\n\nReceiving the host's "
                       "saves (TCP port %d) ...", s_me + 1, s_np, port);
@@ -988,7 +1003,9 @@ int xbox_NetplayStart(const char *game_dir)
     np_status("Starting the network game ...");
     stat_open();
     if (!strncmp(e, "host:", 5)) {
-        const char *sd = getenv("RECOMP_SAVE_DIR");
+        const char *sd = getenv("RECOMP_SAVE_DIR"), *rm = getenv("RECOMP_NET_RENDER");
+        if (rm && !strcmp(rm, "depth"))
+            s_mode = NP_MODE_DEPTH;
         s_is_host = 1;
         ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
     } else if (!strncmp(e, "join:", 5)) {
@@ -1048,7 +1065,14 @@ int xbox_NetplayStart(const char *game_dir)
     }
     {
         const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
-        if (vk && *vk == '1' && !(hl && *hl == '1')) {
+        int headless = hl && *hl == '1';
+        if (s_mode == NP_MODE_DEPTH) {
+            np_setenv("RECOMP_GPU", "vulkan");
+            np_setenv("RECOMP_SW_DEPTH_ONLY", "1");
+            np_setenv("RECOMP_VK_READBACK", "0");
+            if (!headless)
+                np_setenv("RECOMP_VK_PRESENT", "1");
+        } else if (vk && *vk == '1' && !headless) {
             np_setenv("RECOMP_GPU", "vulkan");
             np_setenv("RECOMP_VK_SHADOW", "1");
             np_setenv("RECOMP_VK_PRESENT", "1");
@@ -1068,8 +1092,9 @@ int xbox_NetplayStart(const char *game_dir)
     s_on = 1;
     usb_gamepad_set_override(xbox_NetplayPadState);
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
-    fprintf(stderr, "[NET] network game: player %d of %d, input delay %d frames; "
-            "saves: %s\n", s_me + 1, s_np, s_delay, s_session);
+    fprintf(stderr, "[NET] network game: player %d of %d, input delay %d frames, "
+            "rendering: %s; saves: %s\n", s_me + 1, s_np, s_delay, k_mode_name[s_mode],
+            s_session);
     fflush(stderr);
     return 1;
 }
