@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -259,11 +260,31 @@ void xbox_IrqlDumpHolders(void)
             xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
-        if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+        if (t) {
+            /* The absolute host address is useless after the run (ASLR): add
+             * module + offset, which a PDB resolves later. */
+            char mod[64] = "?";
+            uintptr_t off = 0;
+#ifdef _WIN32
+            HMODULE h = NULL;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)s_holders[i].ra, &h) && h) {
+                char path[MAX_PATH];
+                const char *base;
+                if (GetModuleFileNameA(h, path, sizeof path)) {
+                    base = strrchr(path, '\\');
+                    snprintf(mod, sizeof mod, "%s", base ? base + 1 : path);
+                }
+                off = (uintptr_t)s_holders[i].ra - (uintptr_t)h;
+            }
+#endif
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p (%s+0x%llX), "
                     "guest ret %08X (esp %08X)\n",
-                    (unsigned long)t, s_holders[i].ra,
+                    (unsigned long)t, s_holders[i].ra, mod,
+                    (unsigned long long)off,
                     s_holders[i].guest_ra, s_holders[i].guest_esp);
+        }
     }
     fflush(stderr);
 }
