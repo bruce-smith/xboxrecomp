@@ -842,6 +842,7 @@ int      xbox_SchedMode(void);                  /* 0 off, 1 record, 2 replay */
 int      xbox_SchedReplaying(void);
 void     xbox_SchedBind(int agent);             /* this host thread is that agent */
 int      xbox_SchedAgent(void);
+int      xbox_SchedAgentOfThread(DWORD tid);    /* 0: not an agent (diagnostics) */
 int      xbox_SchedNewGuestAgent(void);         /* next guest thread's number */
 int      xbox_SchedEnter(void);                 /* take the CPU if not held */
 void     xbox_SchedLeave(int entered);

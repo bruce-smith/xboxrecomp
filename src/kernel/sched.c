@@ -1545,6 +1545,19 @@ DWORD xbox_SchedSuspendSelf(HANDLE self)
     return prev;
 }
 
+/* Which agent a host thread is (0: none bound), for diagnostics. Agents bind
+ * in every mode (xbox_SchedBind), so this answers in normal play too. */
+int xbox_SchedAgentOfThread(DWORD tid)
+{
+    int a;
+    if (!tid)
+        return 0;
+    for (a = 1; a < SCHED_AGENTS; a++)
+        if (s_agent_tid[a] == tid)
+            return a;
+    return 0;
+}
+
 static int sched_agent_of(HANDLE h)
 {
     DWORD tid = GetThreadId(h);

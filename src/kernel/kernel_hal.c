@@ -279,10 +279,16 @@ void xbox_IrqlDumpHolders(void)
                 off = (uintptr_t)s_holders[i].ra - (uintptr_t)h;
             }
 #endif
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p (%s+0x%llX), "
-                    "guest ret %08X (esp %08X)\n",
-                    (unsigned long)t, s_holders[i].ra, mod,
-                    (unsigned long long)off,
+            /* ... and which thread it is: a raise from host code is a DPC or
+             * a device model holding DISPATCH (agents bind in every mode). */
+            int agent = xbox_SchedAgentOfThread((DWORD)t);
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu (%s, agent %d) raised from host %p "
+                    "(%s+0x%llX), guest ret %08X (esp %08X)\n",
+                    (unsigned long)t,
+                    agent == 1 ? "timer/DPC" : agent == 2 ? "OHCI" : agent == 3 ? "APU"
+                    : agent == 4 ? "NV2A" : agent == 16 ? "main" : agent ? "guest thread"
+                    : "not an agent", agent,
+                    s_holders[i].ra, mod, (unsigned long long)off,
                     s_holders[i].guest_ra, s_holders[i].guest_esp);
         }
     }
