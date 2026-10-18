@@ -2069,6 +2069,7 @@ static struct {
     struct {
         uint64_t key;
         uint32_t count, tris, n, prim, tex0, rt, prog_n, zdraws, repeats;
+        int32_t vx, vy;                  /* viewport offset (c[59]) */
         uint32_t last_attr;
         uint64_t last_cst;
     } sig[DS_SIGS];
@@ -2137,7 +2138,9 @@ static void ds_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
     pk = g->prog ? hash_bytes((const uint8_t *)g->prog, (size_t)g->prog_n * 16,
                               1469598103934665603ull) : 0;
     key = pk ^ ((uint64_t)st->tex[0].offset << 1) ^ ((uint64_t)g->prim << 40)
-        ^ ((uint64_t)g->n << 44) ^ ((uint64_t)st->color_addr * 0x9E3779B97F4A7C15ull);
+        ^ ((uint64_t)g->n << 44) ^ ((uint64_t)st->color_addr * 0x9E3779B97F4A7C15ull)
+        ^ ((uint64_t)(uint32_t)(int32_t)st->vp_offset[1] * 0xC2B2AE3D27D4EB4Full)
+        ^ ((uint64_t)(uint32_t)(int32_t)st->vp_offset[0] << 20);
     attr = g->v ? 0 : g->attr[0].offset;
     cst = g->constants ? hash_bytes((const uint8_t *)g->constants, NV2A_VSH_CONSTANTS * 16,
                                     1469598103934665603ull) : 0;
@@ -2160,6 +2163,8 @@ static void ds_draw(const Nv2aDrawState *st, const Nv2aDrawGeom *g)
         DS.sig[i].tex0 = st->tex[0].valid ? st->tex[0].offset : 0;
         DS.sig[i].rt = st->color_addr;
         DS.sig[i].prog_n = g->prog ? g->prog_n : 0;
+        DS.sig[i].vx = (int32_t)st->vp_offset[0];
+        DS.sig[i].vy = (int32_t)st->vp_offset[1];
     }
     DS.sig[i].count++;
     DS.sig[i].tris += tris;
@@ -2220,9 +2225,44 @@ static void ds_print(const char *when)
         for (i = 0; i < n && i < 15; i++) {
             const unsigned j = idx[i];
             fprintf(stderr, "[VKDRAWS]     %6u x prim %u n %u (%u tris) prog %u words tex0 %08X"
-                    " -> %08X; %u counted, %u exact repeats\n", DS.sig[j].count,
+                    " -> %08X view %d,%d; %u counted, %u exact repeats\n", DS.sig[j].count,
                     DS.sig[j].prim, DS.sig[j].n, DS.sig[j].tris, DS.sig[j].prog_n,
-                    DS.sig[j].tex0, DS.sig[j].rt, DS.sig[j].zdraws, DS.sig[j].repeats);
+                    DS.sig[j].tex0, DS.sig[j].rt, DS.sig[j].vx, DS.sig[j].vy,
+                    DS.sig[j].zdraws, DS.sig[j].repeats);
+        }
+        {
+            /* By viewport (split screen): draws per vertex-program size. */
+            struct { int32_t vx, vy; uint32_t draws, np; uint32_t pn[12], pc[12]; } v[8];
+            unsigned nv = 0, k, m;
+            memset(v, 0, sizeof v);
+            for (i = 0; i < n; i++) {
+                const unsigned j = idx[i];
+                for (k = 0; k < nv && (v[k].vx != DS.sig[j].vx || v[k].vy != DS.sig[j].vy); k++)
+                    ;
+                if (k == nv) {
+                    if (nv == 8)
+                        continue;
+                    v[nv].vx = DS.sig[j].vx;
+                    v[nv].vy = DS.sig[j].vy;
+                    nv++;
+                }
+                v[k].draws += DS.sig[j].count;
+                for (m = 0; m < v[k].np && v[k].pn[m] != DS.sig[j].prog_n; m++)
+                    ;
+                if (m == v[k].np && m < 12) {
+                    v[k].pn[m] = DS.sig[j].prog_n;
+                    v[k].np++;
+                }
+                if (m < 12)
+                    v[k].pc[m] += DS.sig[j].count;
+            }
+            for (k = 0; k < nv; k++) {
+                fprintf(stderr, "[VKDRAWS]   view %d,%d: %u draws; by program size:", v[k].vx,
+                        v[k].vy, v[k].draws);
+                for (m = 0; m < v[k].np; m++)
+                    fprintf(stderr, " %uw x%u", v[k].pn[m], v[k].pc[m]);
+                fprintf(stderr, "\n");
+            }
         }
     }
     fflush(stderr);
