@@ -32,6 +32,10 @@ extern "C" {
  * and the caller keeps its own presentation path. */
 int  xbox_vk_present_init(void *native_window);
 
+/* 1 if this machine has a Vulkan device the renderer can use (no device is
+ * created). Network play asks before joining a game that renders with it. */
+int  xbox_vk_usable(void);
+
 /* Show a w x h frame of 32-bit pixels, 0x00RRGGBB (as the framebuffer
  * window converts every surface format to), scaled to the window with its
  * aspect ratio kept and black bars around it. `linear`: bilinear scaling,

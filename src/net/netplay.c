@@ -71,6 +71,24 @@ static uint64_t s_exe_hash;
  *   renderer side: RECOMP_SW_DEPTH_ONLY). Much cheaper on a slow CPU.
  * The host takes RECOMP_NET_RENDER=software|depth (default software). */
 enum { NP_MODE_SOFTWARE = 0, NP_MODE_DEPTH = 1 };
+enum { NP_CAN_VULKAN = 1 };
+
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+extern int xbox_vk_usable(void);                 /* src/gpu_vk */
+#endif
+
+/* Whether this PC can render a depth-only game (it needs Vulkan). */
+static int vulkan_usable(void)
+{
+    static int ok = -1;
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (ok < 0)
+        ok = xbox_vk_usable() ? 1 : 0;
+#else
+    ok = 0;
+#endif
+    return ok;
+}
 static int s_mode = NP_MODE_SOFTWARE;
 static const char *const k_mode_name[] = { "software", "depth-only + Vulkan display" };
 static char s_why[256];                          /* why the session did not start */
@@ -106,12 +124,13 @@ int xbox_NetplayPlayers(void) { return s_np; }
 /* ---- packets --------------------------------------------------------------- */
 
 #pragma pack(push, 1)
-/* mode (WELCOME): how every peer renders, chosen by the host (NP_MODE_*). */
+/* mode: in WELCOME, how every peer renders, chosen by the host (NP_MODE_*);
+ * in HELLO, what the joiner can do (NP_CAN_*). */
 typedef struct { uint8_t type, player, players, delay; uint64_t exe; uint8_t mode, pad[3]; } PkHello;
 typedef struct { uint8_t type, player; uint16_t count; uint32_t first; uint8_t s[NP_REDUND][NP_REC]; } PkInput;
 typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t hash; } PkHash;
 /* A refused hello is answered with a BYE whose reason says why. */
-enum { BYE_LEFT = 0, BYE_BUILD = 1, BYE_FULL = 2 };
+enum { BYE_LEFT = 0, BYE_BUILD = 1, BYE_FULL = 2, BYE_NOVULKAN = 3 };
 typedef struct { uint8_t type, player; uint16_t reason; uint32_t desync_frame; } PkBye;
 
 static void send_to(const struct sockaddr_in *a, const void *p, int n);
@@ -799,6 +818,12 @@ static int handshake_host(int port, const char *save_src)
             if (s_peer[i].sin_addr.s_addr == from.sin_addr.s_addr
                 && s_peer[i].sin_port == from.sin_port)
                 known = i;
+        if (s_mode == NP_MODE_DEPTH && !(((PkHello *)buf)->mode & NP_CAN_VULKAN)) {
+            refuse(&from, BYE_NOVULKAN);
+            fprintf(stderr, "[NET] a player without usable Vulkan tried to join a "
+                    "depth-only game; refused\n");
+            continue;
+        }
         if (((PkHello *)buf)->exe != s_exe_hash) {
             refuse(&from, BYE_BUILD);              /* so it can say why */
             fprintf(stderr, "[NET] a player with a different build or game files tried to join; refused\n");
@@ -898,6 +923,7 @@ static int handshake_join(const char *ip, int port)
     memset(&h, 0, sizeof h);
     h.type = PK_HELLO;
     h.exe = s_exe_hash;
+    h.mode = (uint8_t)(vulkan_usable() ? NP_CAN_VULKAN : 0);
     for (;;) {
         char buf[256];
         struct sockaddr_in from;
@@ -961,6 +987,10 @@ static int handshake_join(const char *ip, int port)
             if (((PkBye *)buf)->reason == BYE_FULL)
                 snprintf(s_why, sizeof s_why, "The host's game is full or has already "
                          "started. Ask the host to start a new network game.");
+            else if (((PkBye *)buf)->reason == BYE_NOVULKAN)
+                snprintf(s_why, sizeof s_why, "This network game needs Vulkan on every "
+                         "PC, and this PC has no usable Vulkan. Ask the host to choose "
+                         "Compatibility rendering.");
             else if (((PkBye *)buf)->reason == BYE_BUILD)
                 snprintf(s_why, sizeof s_why, "The host refused: it runs a different build "
                          "or different game files. Every player needs the same build of "
@@ -1006,8 +1036,13 @@ int xbox_NetplayStart(const char *game_dir)
         const char *sd = getenv("RECOMP_SAVE_DIR"), *rm = getenv("RECOMP_NET_RENDER");
         if (rm && !strcmp(rm, "depth"))
             s_mode = NP_MODE_DEPTH;
-        s_is_host = 1;
-        ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
+        if (s_mode == NP_MODE_DEPTH && !vulkan_usable()) {
+            snprintf(s_why, sizeof s_why, "Fast rendering needs Vulkan, and this PC has "
+                     "no usable Vulkan. Choose Compatibility rendering to host.");
+        } else {
+            s_is_host = 1;
+            ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
+        }
     } else if (!strncmp(e, "join:", 5)) {
         char ip[64];
         const char *c = strrchr(e + 5, ':');

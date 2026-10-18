@@ -85,6 +85,10 @@ if(XBOXRECOMP_VULKAN)
     # The executor installs the backend when RECOMP_GPU=vulkan.
     target_link_libraries(xbox_kernel PRIVATE xbox_gpu_vk)
     target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_HAVE_VULKAN)
+    # Network play asks whether Vulkan works here before joining a game
+    # that renders with it (xbox_vk_usable).
+    target_link_libraries(xbox_net PRIVATE xbox_gpu_vk)
+    target_compile_definitions(xbox_net PRIVATE XBOXRECOMP_HAVE_VULKAN)
 endif()
 
 # Shared FMV player (Media Foundation -> D3D8 texture)

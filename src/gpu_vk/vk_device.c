@@ -131,6 +131,38 @@ static const char *unsuitable(VkPhysicalDevice pd, const VkPhysicalDevicePropert
 
 static int device_init_locked(VkSurfaceKHR surface);
 
+/* Whether this machine has a device the backend could use (the rules of
+ * device_init_locked: suitable, and not a CPU implementation unless
+ * RECOMP_VK_DEVICE names it), without creating one. For network play: a
+ * PC joining a game that renders with Vulkan says whether it can
+ * (src/net/netplay.c). The instance it creates is the one the backend
+ * keeps using. */
+int xbox_vk_usable(void)
+{
+    VkPhysicalDevice pds[16];
+    uint32_t n = 16, i;
+    const char *sel = getenv("RECOMP_VK_DEVICE");
+    if (!vk_instance_init())
+        return 0;
+    if (vkEnumeratePhysicalDevices(g_vk.instance, &n, pds) < 0 || !n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        VkPhysicalDeviceProperties p;
+        int named = 0;
+        vkGetPhysicalDeviceProperties(pds[i], &p);
+        if (unsuitable(pds[i], &p, pick_queue(pds[i], VK_NULL_HANDLE)))
+            continue;
+        if (sel && *sel) {
+            char *end;
+            unsigned long k = strtoul(sel, &end, 10);
+            named = (*end == 0) ? k == i : strstr(p.deviceName, sel) != NULL;
+        }
+        if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU || named)
+            return 1;
+    }
+    return 0;
+}
+
 int vk_device_init(VkSurfaceKHR surface)
 {
     int ok;

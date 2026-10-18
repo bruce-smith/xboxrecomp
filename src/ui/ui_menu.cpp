@@ -422,7 +422,7 @@ void section_cheats()
  * starts from power-on for everyone, so starting one restarts the game with
  * RECOMP_NET set; during one, this shows who is who. */
 void start_network_game(int host, const char *addr, int port, int players, int delay,
-                        int vk_display)
+                        int vk_display, int fast)
 {
 #if !defined(_WIN32)
     /* POSIX: the same restart, by exec'ing ourselves with the variables set. */
@@ -438,6 +438,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     snprintf(v, sizeof v, "%d", delay);
     setenv("RECOMP_NET_DELAY", v, 1);
     setenv("RECOMP_NET_VK", vk_display ? "1" : "0", 1);
+    setenv("RECOMP_NET_RENDER", fast ? "depth" : "software", 1);   /* the host's choice */
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
         exe[n] = 0;
@@ -457,6 +458,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     snprintf(v, sizeof v, "%d", delay);
     SetEnvironmentVariableA("RECOMP_NET_DELAY", v);
     SetEnvironmentVariableA("RECOMP_NET_VK", vk_display ? "1" : "0");
+    SetEnvironmentVariableA("RECOMP_NET_RENDER", fast ? "depth" : "software");
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     snprintf(dir, sizeof dir, "%s", exe);
     if ((slash = strrchr(dir, '\\')) != nullptr)
@@ -491,7 +493,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
 void section_network()
 {
     static bool loaded;
-    static int mode, port, players, delay;
+    static int mode, port, players, delay, render;
     static bool vk_display;
     static char addr[64];
     bool changed = false;
@@ -511,6 +513,9 @@ void section_network()
         players = xbox_setting_get("network", "players", 2);
         delay = xbox_setting_get("network", "delay", 3);
         vk_display = xbox_setting_get("network", "vk_display", 0) != 0;
+        /* Compatibility until the depth-only software pass exists
+         * (blinx2project-11); then Fast becomes the default. */
+        render = xbox_setting_get("network", "render", 0);
         xbox_setting_get_str("network", "host", "192.168.1.2", addr, sizeof addr);
         loaded = true;
     }
@@ -531,19 +536,29 @@ void section_network()
                            "port (allow it through the firewall). Your saves are sent to "
                            "every player for this game. More delay hides more lag; 3 "
                            "frames (50 ms) suits a LAN or a VPN.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Rendering (the same for every player):");
+        changed |= ImGui::RadioButton("Fast (needs Vulkan on every PC)", &render, 1);
+        ImGui::SameLine();
+        changed |= ImGui::RadioButton("Compatibility (software)", &render, 0);
+        ImGui::TextWrapped(render ? "The graphics card draws the game; a PC without usable "
+                                    "Vulkan cannot join."
+                                  : "Every PC draws the game on its processor: works "
+                                    "everywhere, but a slow PC slows the game for everyone.");
     } else {
         ImGui::SetNextItemWidth(220.0f * s_scale);
         changed |= ImGui::InputText("Host's address", addr, sizeof addr);
         ImGui::TextWrapped("The host decides the number of players and the delay, and "
                            "sends its saves. You get the next free controller port.");
     }
-    changed |= ImGui::Checkbox("Vulkan display (AA)", &vk_display);
+    changed |= ImGui::Checkbox("Vulkan display (AA) in Compatibility games", &vk_display);
     ImGui::TextWrapped("Off: the software renderer draws and shows the game. On: it still "
                        "draws everything the game reads back, so the players stay in step, "
                        "and Vulkan shows the picture, smoothed. Not faster, and the first "
                        "time an effect appears it may hitch. Only your own screen changes.");
     if (changed) {
         xbox_setting_set("network", "vk_display", vk_display ? 1 : 0);
+        xbox_setting_set("network", "render", render);
         xbox_setting_set("network", "mode", mode);
         xbox_setting_set("network", "port", port);
         xbox_setting_set("network", "players", players);
@@ -555,7 +570,8 @@ void section_network()
     ImGui::TextWrapped("Starting restarts the game: everyone begins from power-on together, "
                        "and the host's game waits until every player has joined.");
     if (ImGui::Button(mode == 0 ? "Start network game (host)" : "Join network game"))
-        start_network_game(mode == 0, addr, port, players, delay, vk_display ? 1 : 0);
+        start_network_game(mode == 0, addr, port, players, delay, vk_display ? 1 : 0,
+                           render);
 }
 
 void section_about()
