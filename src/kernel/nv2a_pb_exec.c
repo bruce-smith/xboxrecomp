@@ -5763,6 +5763,64 @@ static void split_flip(void)
     s_split_n = 0;
 }
 
+/* RECOMP_TEST_SCRAMBLE_COLOR=1 (a test, software renderer): every colour
+ * surface drawn into is overwritten with 0x5A at the next flip, once its
+ * frame is done. If an exact replay still replays, nothing the title does
+ * depends on colour pixels -- only on depth and the visibility counts --
+ * which is the precondition for net games rendering colour on Vulkan with a
+ * depth-only software pass for the reports. */
+static struct { uint32_t lo, bytes; } s_scr[64];
+static int s_scr_n, s_scr_on = -1;
+
+static void scramble_note(void)
+{
+    const SwzTable *swz;
+    uint32_t lo, bytes, bpp;
+    int k;
+    if (s_scr_on < 0)
+        s_scr_on = getenv("RECOMP_TEST_SCRAMBLE_COLOR") != NULL;
+    if (!s_scr_on || !s_gpu.color_offset)
+        return;
+    swz = surface_swizzled();
+    bpp = surface_bpp();
+    lo = dma_resolve(s_gpu.color_offset);
+    bytes = swz ? swz->w * swz->h * bpp : (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
+    for (k = 0; k < s_scr_n; k++)
+        if (s_scr[k].lo == lo) {
+            if (bytes > s_scr[k].bytes)
+                s_scr[k].bytes = bytes;
+            return;
+        }
+    if (s_scr_n < 64) {
+        s_scr[s_scr_n].lo = lo;
+        s_scr[s_scr_n].bytes = bytes;
+        s_scr_n++;
+    }
+}
+
+static void scramble_flip(void)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    int k;
+    if (s_scr_on <= 0 || !s_scr_n)
+        return;
+    rq_sync();                           /* the frame's pixels are all there */
+    {
+        static unsigned flips_done;
+        uint64_t total = 0;
+        for (k = 0; k < s_scr_n; k++)
+            if (s_scr[k].lo && s_scr[k].bytes && s_scr[k].bytes < (64u << 20)) {
+                memset(mem + s_scr[k].lo, 0x5A, s_scr[k].bytes);
+                total += s_scr[k].bytes;
+            }
+        if (!(flips_done++ % 600))
+            fprintf(stderr, "[SCRAMBLE] flip %u: %d colour surfaces, %llu bytes overwritten"
+                    " (first %08X)\n", s_gpu.flips, s_scr_n, (unsigned long long)total,
+                    s_scr[0].lo);
+    }
+    s_scr_n = 0;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -5771,6 +5829,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
+    scramble_note();
     /* A progress marker, rare enough to cost nothing: every 200 draws was
      * ~270 lines a second in Blinx 2's hub, and the executor then waited on
      * stderr's lock behind every other thread's logging. */
@@ -6685,6 +6744,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.flips++;
         frame_trace_flip();
         split_flip();
+        scramble_flip();                 /* RECOMP_TEST_SCRAMBLE_COLOR */
         return;
 
     case NV097_FLIP_STALL:
