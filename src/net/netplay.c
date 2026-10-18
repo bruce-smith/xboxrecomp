@@ -67,6 +67,7 @@ static uint32_t s_hash_f[NP_MAXP];
 static uint64_t s_hash_v[NP_MAXP][2];            /* last two checks per player */
 static uint32_t s_hash_fr[NP_MAXP][2];
 static volatile LONG s_failed;
+static uint64_t s_wait_ticks;                    /* QPC ticks spent waiting for input */
 static volatile DWORD s_heard[NP_MAXP];          /* when each player was last heard from */
 static void broadcast(const void *p, int n, int except);
 static void dump_pages(uint32_t f);         /* below, with the hashing */
@@ -1200,6 +1201,8 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
     uint32_t f = (uint32_t)(xbox_SchedVirtualNs() / NP_FRAME_NS);
     static uint32_t checked;
     DWORD t0;
+    LARGE_INTEGER q0;
+    int waited;
 
     /* RECOMP_NET_TEST_CHEAT=<frame> (testing the cheat path): this peer sends
      * three requests (op 0xEE, ignored by cheats.c) at that frame; every
@@ -1295,9 +1298,23 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         pk.hash = hash_guest(f);
         note_hash(s_me, f, pk.hash);
         if (f % (NP_CHECK * 10) == 0) {     /* a line every 10 s of play */
-            fprintf(stderr, "[NET] frame %u: guest hash %016llX\n", f,
-                    (unsigned long long)pk.hash);
+            /* ... and how long this peer stood waiting for the others' input
+             * since the last line: the cost of the lockstep itself (a slower
+             * peer, or input arriving later than the delay covers). */
+            static LARGE_INTEGER qf, last;
+            LARGE_INTEGER now;
+            if (!qf.QuadPart)
+                QueryPerformanceFrequency(&qf);
+            QueryPerformanceCounter(&now);
+            fprintf(stderr, "[NET] frame %u: guest hash %016llX; waited for the "
+                    "others %.0f ms of the last %.0f ms\n", f,
+                    (unsigned long long)pk.hash,
+                    s_wait_ticks * 1000.0 / (double)qf.QuadPart,
+                    last.QuadPart ? (now.QuadPart - last.QuadPart) * 1000.0
+                                    / (double)qf.QuadPart : 0.0);
             fflush(stderr);
+            s_wait_ticks = 0;
+            last = now;
         }
         broadcast(&pk, sizeof pk, -1);
     }
@@ -1307,6 +1324,7 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         return 0;
     }
     t0 = GetTickCount();
+    waited = 0;
     for (;;) {
         NpIn *e = &s_in[port][f % NP_RING];
         int ok, due = 0;
@@ -1327,8 +1345,18 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
             fprintf(stderr, "[NET] frame %u: cheat request %u from player %d due\n",
                     f, ev[0], port + 1);
         }
-        if (ok)
+        if (ok) {
+            if (waited) {
+                LARGE_INTEGER q1;
+                QueryPerformanceCounter(&q1);
+                s_wait_ticks += (uint64_t)(q1.QuadPart - q0.QuadPart);
+            }
             return 1;
+        }
+        if (!waited) {
+            waited = 1;
+            QueryPerformanceCounter(&q0);
+        }
         /* A slower player is waited for as long as it takes -- a slow disk,
          * or one OS logging slower than another, can put a peer many
          * seconds behind -- but one not heard from at all for 15 s is gone:
