@@ -3646,15 +3646,18 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 }
 
 /* Carve an aligned piece from a freed block, keeping the rest free. Only
- * blocks ending at or below `limit` (a window VA) are considered. */
-static uint32_t contig_reuse(uint32_t size, uint32_t alignment, uint32_t limit)
+ * pieces starting at or above `lo` and ending at or below `limit` (window
+ * VAs) are considered. */
+static uint32_t contig_reuse_in(uint32_t size, uint32_t alignment, uint32_t lo,
+                                uint32_t limit)
 {
     int i;
     for (i = 0; i < g_contig_block_count; i++) {
         uint32_t a, end, front, back;
         if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size)
             continue;
-        a = (g_contig_blocks[i].addr + alignment - 1) & ~(alignment - 1);
+        a = g_contig_blocks[i].addr > lo ? g_contig_blocks[i].addr : lo;
+        a = (a + alignment - 1) & ~(alignment - 1);
         end = g_contig_blocks[i].addr + g_contig_blocks[i].size;
         if ((uint64_t)a + size > end || (uint64_t)a + size > limit)
             continue;
@@ -3690,10 +3693,93 @@ static uint32_t contig_bump(uint32_t *next, uint32_t limit, uint32_t size,
     return result;
 }
 
+static uint32_t contig_reuse(uint32_t size, uint32_t alignment, uint32_t limit)
+{
+    return contig_reuse_in(size, alignment, 0, limit);
+}
+
+/* MmAllocateContiguousMemoryEx's "highest" (and "lowest"), when the arena's
+ * own choice breaks them.
+ *
+ * The arena is a bump allocator from physical 0x1000, so by the time a title
+ * is well under way everything below 16 MB is handed out -- and a request
+ * that needs low memory gets a block wherever the bump pointer is. D3D asks
+ * for each 4 KB visibility-report page below 16 MB, because NV2A's
+ * GET_REPORT offset is 24 bits: Blinx 2's second page (split screen's second
+ * view, from Vs. Mode on; stage 01-03 uses one too) landed at 0x01982000,
+ * GET_REPORT wrote its reports 16 MB lower, the title saw every test of that
+ * view "incomplete" and drew none of player 2's characters.
+ *
+ * A small reserve just under 16 MB serves such requests (after freed blocks
+ * inside the range). An allocation that already meets its limits is made by
+ * the ordinary path, as before (xbox_ContiguousAllocIn tries that first);
+ * the one change is that the bump pointer steps over the 16 KB reserve, so
+ * blocks bumped after it sit up to 16 KB higher. Exact replays do not mind
+ * (stage 01-03's recording replays to its end with only that shift). */
+#define CONTIG_LOW_RES_LO 0x00FFC000u
+#define CONTIG_LOW_RES_HI 0x01000000u
+static uint32_t g_contig_res_next = XBOX_CONTIG_BASE + CONTIG_LOW_RES_LO;
+
+/* RECOMP_CONTIG_RANGE=0: ignore lowest/highest and keep no reserve, exactly
+ * as before -- for replaying a recording made then (one that had a block out
+ * of range diverges at that allocation otherwise). */
+static int xbox_ContiguousRangeOn(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_RANGE");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* The main bump pointer must not run into the reserve: step over it. */
+static void contig_skip_reserve(uint32_t size, uint32_t alignment, int reclaim)
+{
+    uint32_t lo = XBOX_CONTIG_BASE + CONTIG_LOW_RES_LO;
+    uint32_t hi = XBOX_CONTIG_BASE + CONTIG_LOW_RES_HI;
+    uint32_t a = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    if (g_contig_next >= hi || (uint64_t)a + size <= lo)
+        return;
+    if (reclaim && g_contig_next < lo) {      /* the rest below stays usable */
+        int at = 0;
+        while (at < g_contig_block_count && g_contig_blocks[at].addr < g_contig_next)
+            at++;
+        contig_insert(at, g_contig_next, lo - g_contig_next, 1);
+    }
+    g_contig_next = hi;
+}
+
+/* A block inside [lo, hi] (window VAs, inclusive end), from freed blocks or
+ * the reserve; 0 if none. Caller holds the lock under reclaim. */
+static uint32_t contig_alloc_range(uint32_t size, uint32_t alignment,
+                                   uint32_t lo, uint32_t hi, int reclaim)
+{
+    uint32_t a, limit = hi + 1u;
+    if (reclaim) {
+        a = contig_reuse_in(size, alignment, lo, limit);
+        if (a)
+            return a;
+    }
+    a = (g_contig_res_next + alignment - 1) & ~(alignment - 1);
+    if (a < lo || (uint64_t)a + size > XBOX_CONTIG_BASE + CONTIG_LOW_RES_HI
+            || (uint64_t)a + size > limit)
+        return 0;
+    if (reclaim) {
+        int at = 0;
+        while (at < g_contig_block_count && g_contig_blocks[at].addr < a)
+            at++;
+        contig_insert(at, a, size, 0);
+    }
+    g_contig_res_next = a + size;
+    return a;
+}
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result = 0;
     int reclaim = xbox_HeapReclaimEnabled();
+    int honour = xbox_ContiguousRangeOn();
     uint32_t top = (uint32_t)((uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
                               - XBOX_GPU_INSTANCE_DEFAULT);
     uint32_t low_limit = XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT;
@@ -3707,8 +3793,11 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         if (size == 0) size = 4096;
         result = contig_reuse(size, alignment, low_limit);
     }
-    if (!result)
+    if (!result) {
+        if (honour)
+            contig_skip_reserve(size, alignment, reclaim);
         result = contig_bump(&g_contig_next, low_limit, size, alignment, reclaim);
+    }
     if (!result && reclaim)
         result = contig_reuse(size, alignment, top);
     if (!result && top > XBOX_CONTIG_BASE + CONTIG_PHYS_LIMIT) {
@@ -3734,6 +3823,39 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     }
     return result;
+}
+
+int xbox_ContiguousFree(uint32_t addr);      /* below */
+
+uint32_t xbox_ContiguousAllocIn(uint32_t size, uint32_t alignment,
+                                uint32_t low, uint32_t high)
+{
+    uint32_t r = xbox_ContiguousAlloc(size, alignment), phys, alt;
+    int reclaim = xbox_HeapReclaimEnabled();
+    uint32_t psize = (size + 4095u) & ~4095u;
+    int honour = xbox_ContiguousRangeOn();
+
+    if (!r || !high || !honour)
+        return r;
+    if (psize == 0) psize = 4096;
+    if (alignment < 4096) alignment = 4096;
+    phys = r - XBOX_CONTIG_BASE;
+    if (phys >= low && (uint64_t)phys + psize - 1 <= high)
+        return r;                              /* as before */
+    if (reclaim)
+        AcquireSRWLockExclusive(&g_contig_lock);
+    alt = contig_alloc_range(psize, alignment, XBOX_CONTIG_BASE + low,
+                             (uint32_t)((uint64_t)XBOX_CONTIG_BASE + high > 0xFFFFFFFFull
+                                        ? 0xFFFFFFFFu : XBOX_CONTIG_BASE + high),
+                             reclaim);
+    if (reclaim)
+        ReleaseSRWLockExclusive(&g_contig_lock);
+    if (!alt)
+        return r;                              /* nothing fits: the caller warns */
+    xbox_ContiguousFree(r);                    /* back to the arena (reclaim only) */
+    xbox_WatchCheck(alt, psize, "contig alloc");
+    memset((void *)((uintptr_t)alt + g_memory_offset), 0, psize);
+    return alt;
 }
 
 /* Give a block back (RECOMP_HEAP_RECLAIM only). Returns 0 when the address is
@@ -3823,6 +3945,8 @@ int xbox_ContiguousOwnsPhys(uint32_t phys)
      * by accident; with the arena above the image it has to be said. */
     if (phys && phys < 0x1000u)
         return 1;
+    if (phys >= CONTIG_LOW_RES_LO && phys < g_contig_res_next - XBOX_CONTIG_BASE)
+        return 1;                              /* the low reserve, above */
     return (phys >= g_contig_lo && phys < g_contig_next - XBOX_CONTIG_BASE)
         || (phys >= CONTIG_PHYS_LIMIT
             && phys < g_contig_next_hi - XBOX_CONTIG_BASE);

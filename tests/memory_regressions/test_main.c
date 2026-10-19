@@ -316,6 +316,29 @@ int main(int argc, char **argv)
         }
     }
 
+    /* 7. MmAllocateContiguousMemoryEx's "highest" is honoured once the arena
+     *    is past it (D3D's second visibility-report page, Blinx 2 split
+     *    screen), and a request the arena already meets is placed as before. */
+    if (!ext) {
+        extern int xbox_ContiguousFree(uint32_t addr);
+        uint32_t fill = xbox_ContiguousAlloc(20u * 1024 * 1024, 4096);
+        uint32_t low = xbox_ContiguousAllocIn(4096, 4096, 0, 0x00FFFFFFu);
+        uint32_t plain, wide;
+
+        snprintf(d, sizeof d, "fill 0x%08X, got 0x%08X", fill, low);
+        check(fill && low && low - 0x80000000u + 4096 - 1 <= 0x00FFFFFFu,
+              "a block asked for below 16 MB lands there", d);
+        /* Where the plain arena would put the next page (under reclaim it
+         * is given back and handed out again; without it the arena only
+         * grows) -- a request whose range includes that must get it. */
+        plain = xbox_ContiguousAlloc(4096, 4096);
+        xbox_ContiguousFree(plain);
+        wide = xbox_ContiguousAllocIn(4096, 4096, 0, 0x03FFFFFFu);
+        snprintf(d, sizeof d, "plain arena 0x%08X, got 0x%08X", plain, wide);
+        check(plain && wide == plain + (reclaim ? 0 : 4096),
+              "a block the arena already places in range is not moved", d);
+    }
+
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
     {
         const uint32_t hi = 0x76000000u;

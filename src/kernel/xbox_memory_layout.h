@@ -227,6 +227,13 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* The same, but the block's physical address must lie in [low, high]
+ * (MmAllocateContiguousMemoryEx's lowest/highest). An allocation the plain
+ * arena already places there is made exactly as by xbox_ContiguousAlloc;
+ * otherwise freed blocks in range, then a small reserve under 16 MB. Returns
+ * the out-of-range block when nothing fits (high == 0: no limit). */
+uint32_t xbox_ContiguousAllocIn(uint32_t size, uint32_t alignment,
+                                uint32_t low, uint32_t high);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

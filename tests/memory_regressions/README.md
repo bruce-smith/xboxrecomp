@@ -15,7 +15,7 @@ One test per mode, one process each, because the switches are read once and cach
 
 | Test | What it checks |
 |---|---|
-| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, contiguous memory is never reused, an explicit high base is not honoured. A change to the default fails here. |
+| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, contiguous memory is never reused, an explicit high base is not honoured, a contiguous block asked for below 16 MB lands there while one the arena already places in range is not moved. A change to the default fails here. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
