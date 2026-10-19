@@ -3355,6 +3355,15 @@ static int bridge_is_cdrom_device(const char *path)
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
 
+/* Opens, queries and the other host file calls let go of the guest CPU for
+ * the host call when recording or replaying at level 2 (sched.c), as reads
+ * do (NtReadFile). Only the host call: handle tokens are still handed out
+ * holding it, in schedule order. */
+static int bridge_fs_letgo(void)
+{
+    return xbox_SchedIoLetGo() >= 2 ? xbox_SchedBlockBegin() : 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -3384,8 +3393,12 @@ static NTSTATUS bridge_create_file_impl(
 
     memset(&ios, 0, sizeof(ios));
 
-    st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
-                           file_attrs, share, disposition, options);
+    {
+        int letgo = bridge_fs_letgo();
+        st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
+                               file_attrs, share, disposition, options);
+        xbox_SchedBlockEnd(letgo);
+    }
 
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
@@ -3983,9 +3996,13 @@ static void bridge_NtQueryInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
-    g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
-                XBOX_TO_NATIVE(info_va), length,
-                (XBOX_FILE_INFORMATION_CLASS)infoclass);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
+                    XBOX_TO_NATIVE(info_va), length,
+                    (XBOX_FILE_INFORMATION_CLASS)infoclass);
+        xbox_SchedBlockEnd(letgo);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -4155,14 +4172,20 @@ static void bridge_NtSetInformationFile(void)
         return;
     }
     if (infoclass == 10 && length >= 16) {   /* FileRenameInformation */
+        int letgo = bridge_fs_letgo();
         NTSTATUS st = bridge_rename_file(handle, info_va);
+        xbox_SchedBlockEnd(letgo);
         bridge_write_iostatus(ios_va, st, 0);
         g_eax = (uint32_t)st;
         return;
     }
-    g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
-                XBOX_TO_NATIVE(info_va), length,
-                (XBOX_FILE_INFORMATION_CLASS)infoclass);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
+                    XBOX_TO_NATIVE(info_va), length,
+                    (XBOX_FILE_INFORMATION_CLASS)infoclass);
+        xbox_SchedBlockEnd(letgo);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -4182,9 +4205,13 @@ static void bridge_NtQueryVolumeInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
-    g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
-                XBOX_TO_NATIVE(info_va), length,
-                (XBOX_FS_INFORMATION_CLASS)infoclass);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
+                    XBOX_TO_NATIVE(info_va), length,
+                    (XBOX_FS_INFORMATION_CLASS)infoclass);
+        xbox_SchedBlockEnd(letgo);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -4198,8 +4225,12 @@ static void bridge_NtQueryFullAttributesFile(void)
 
     bridge_build_oa(obj_attrs, &oa, &name);
     if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
-    g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
-                (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
+                    (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
+        xbox_SchedBlockEnd(letgo);
+    }
 }
 
 /* ── NtFlushBuffersFile (ordinal 198, 2 args = 8 bytes) ─── */
@@ -4210,7 +4241,11 @@ static void bridge_NtFlushBuffersFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
-    g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
+        xbox_SchedBlockEnd(letgo);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -4222,7 +4257,11 @@ static void bridge_NtDeleteFile(void)
 
     bridge_build_oa(STACK_ARG(0), &oa, &name);
     if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
-    g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
+        xbox_SchedBlockEnd(letgo);
+    }
 }
 
 /* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
@@ -4248,9 +4287,13 @@ static void bridge_NtQueryDirectoryFile(void)
         fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
         if (fn.Buffer) pfn = &fn;
     }
-    g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
-                pfn, (BOOLEAN)restart);
+    {
+        int letgo = bridge_fs_letgo();
+        g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
+                    pfn, (BOOLEAN)restart);
+        xbox_SchedBlockEnd(letgo);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 

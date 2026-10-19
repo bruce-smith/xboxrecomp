@@ -48,8 +48,10 @@
  * File: "BX2SCHED", u32 version, then tagged records (0x03 is written only
  * when it says something, so a file without it is what older builds wrote):
  *   0x03 varint flags                           bit 0: RECOMP_PORTABLE_MATH
- *                                               bit 1: file I/O lets go of the
- *                                               CPU (xbox_SchedIoLetGo)
+ *                                               bit 1: file reads and writes let
+ *                                               go of the CPU (xbox_SchedIoLetGo)
+ *                                               bit 2: so do opens, queries and
+ *                                               the other file calls
  *   0x01 varint agent, varint count            a run
  *   0x02 varint agent, varint kind, zigzag-varint delta   a value (delta
  *        from the previous value of that agent and kind)
@@ -85,9 +87,12 @@ static int s_mode = -1;                 /* 0 off, 1 record, 2 replay, 3 virtual 
  * console. Holding it, a slow disk stopped every other agent: a pack loader
  * held it for 3 s of 64 KB reads in a recorded boot, the USB control
  * transfer XPP was waiting for timed out meanwhile, and the boot stalled at
- * the logo movie. Recordings say whether they were made so (tag 0x03 bit 1);
- * older ones were not, and replay as made. */
-static int s_io_letgo = 1;
+ * the logo movie. Level 2 adds opens, queries and the other host file
+ * calls: on a loaded PC main held the CPU for 3 s at a time in boot's ~700
+ * opens and probes, and USB came up 10 s late. Recordings say which level
+ * they were made at (tag 0x03 bits 1 and 2); older ones used none and
+ * replay as made. RECOMP_SCHED_IO_LETGO=0|1|2 picks the level to record. */
+static int s_io_letgo = 2;
 
 /* Recording and replay only. In virtual mode time does not move during a
  * host read, so nothing times out, and a buffer still filling while another
@@ -97,7 +102,7 @@ static int s_io_letgo = 1;
  * next; the guest state itself replays exactly.) */
 int xbox_SchedIoLetGo(void)
 {
-    return (s_mode == 1 || s_mode == 2) && s_io_letgo;
+    return (s_mode == 1 || s_mode == 2) ? s_io_letgo : 0;
 }
 /* 2: every wait's outcome is recorded, not only a finite one's. */
 #define SCHED_FILE_VER 2
@@ -367,7 +372,7 @@ static int sched_load(const char *path)
             if (!sched_get_varint((const uint8_t **)&p, end, &a))
                 break;
             recomp_set_portable_math((int)(a & 1));
-            s_io_letgo = (int)((a >> 1) & 1);
+            s_io_letgo = (a & 4) ? 2 : (int)((a >> 1) & 1);
             if (a & 1)
                 fprintf(stderr, "  [SCHED] recorded with RECOMP_PORTABLE_MATH: "
                         "portable math on for this replay\n");
@@ -433,12 +438,13 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                 fwrite(&ver, 4, 1, s_out);
                 {   /* RECOMP_SCHED_IO_LETGO=0: record as older builds did */
                     const char *lg = getenv("RECOMP_SCHED_IO_LETGO");
-                    if (lg && *lg == '0')
-                        s_io_letgo = 0;
+                    if (lg && *lg >= '0' && *lg <= '2')
+                        s_io_letgo = *lg - '0';
                 }
                 fputc(0x03, s_out);
                 sched_put_varint((recomp_portable_math_enabled() ? 1u : 0u)
-                                 | (s_io_letgo ? 2u : 0u));
+                                 | (s_io_letgo >= 1 ? 2u : 0u)
+                                 | (s_io_letgo >= 2 ? 4u : 0u));
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));
@@ -658,6 +664,65 @@ static void sched_describe(uint64_t v, char *buf, size_t n)
         snprintf(buf, n, "0x%08llX", (unsigned long long)v);
 }
 
+#if defined(_WIN32) && defined(_M_X64)
+/* The holder's host stack, for a wait that has gone on for seconds: what it
+ * does without letting go. The frames are taken while it is suspended, with
+ * nothing allocated (it may hold the heap lock), and named after it resumes. */
+static void sched_holder_stack(int agent)
+{
+    DWORD tid = agent > 0 && agent < SCHED_AGENTS ? s_agent_tid[agent] : 0;
+    DWORD64 pc[16];
+    int n = 0, i;
+    HANDLE th;
+    CONTEXT ctx;
+
+    if (!tid || tid == GetCurrentThreadId())
+        return;
+    th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+    if (!th)
+        return;
+    if (SuspendThread(th) != (DWORD)-1) {
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(th, &ctx))
+            while (n < 16 && ctx.Rip) {
+                DWORD64 base = 0;
+                PVOID hd = NULL;
+                ULONG64 est = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                pc[n++] = ctx.Rip;
+                if (!rf) {                      /* a leaf: the return address */
+                    ctx.Rip = *(DWORD64 *)ctx.Rsp;
+                    ctx.Rsp += 8;
+                } else
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx,
+                                     &hd, &est, NULL);
+            }
+        ResumeThread(th);
+    }
+    CloseHandle(th);
+    {
+        static int sym;
+        if (!sym) {
+            SymInitialize(GetCurrentProcess(), NULL, TRUE);
+            sym = 1;
+        }
+    }
+    fprintf(stderr, "  [SCHED] agent %d (the holder) is in:\n", agent);
+    for (i = 0; i < n; i++) {
+        char buf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO *si = (SYMBOL_INFO *)buf;
+        DWORD64 off = 0;
+        memset(buf, 0, sizeof buf);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        fprintf(stderr, "      #%d %s+0x%llx\n", i,
+                SymFromAddr(GetCurrentProcess(), pc[i], &off, si) ? si->Name : "?",
+                (unsigned long long)off);
+    }
+}
+#endif
+
 static void sched_stuck(DWORD waited_ms)
 {
     if (InterlockedIncrement(&s_desync_reports) > 20)
@@ -692,10 +757,17 @@ static void sched_stuck(DWORD waited_ms)
                 "of %zu is agent %d (%u left), holder %d\n", t_agent,
                 (unsigned long)waited_ms, s_cur, s_nruns, s_turn, s_left,
                 s_holder);
-    else
+    else {
+        static LONG stacks;
+        int holder = s_holder;
         fprintf(stderr, "  [SCHED] agent %d waited %lu ms for the CPU; agent %d "
                 "holds it (spinning without a yield point?)\n", t_agent,
-                (unsigned long)waited_ms, s_holder);
+                (unsigned long)waited_ms, holder);
+#if defined(_WIN32) && defined(_M_X64)
+        if (InterlockedIncrement(&stacks) <= 6)
+            sched_holder_stack(holder);
+#endif
+    }
     fflush(stderr);
 }
 
