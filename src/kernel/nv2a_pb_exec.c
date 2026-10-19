@@ -852,10 +852,32 @@ typedef struct {
     Nv2aCombinerPrep rcp;               /* constants unpacked per draw */
     Texture texs[4];
     uint32_t self_sample;               /* a stage samples the colour surface */
+    uint32_t kills;                     /* a CLIPPLANE stage may discard pixels */
 } PixState;
 
 static NV_TLS const PixState *P;
 static PixState s_live;
+
+/* Depth-only software rendering (RECOMP_VK_SHADOW=depth for network play,
+ * RECOMP_SW_DEPTH_ONLY=1 on its own for testing): every draw still decides
+ * coverage, stencil, depth and the visibility counts exactly as before, but
+ * no colour is computed or written -- the pixel state's colour mask is 0 --
+ * except where the fragment's colour decides whether the pixel survives
+ * (alpha test, a CLIPPLANE texture stage), and colour clears are skipped.
+ * The title reads only depth-derived results (RECOMP_TEST_SCRAMBLE_COLOR),
+ * so guest state is the same; the picture comes from the Vulkan renderer. */
+static int s_depth_only = -1;
+
+static int depth_only(void)
+{
+    if (s_depth_only < 0) {
+        const char *sh = getenv("RECOMP_VK_SHADOW");
+        s_depth_only = (sh && !strcmp(sh, "depth")) || getenv("RECOMP_SW_DEPTH_ONLY") != NULL;
+        if (s_depth_only)
+            fprintf(stderr, "  [GPU] software: depth, stencil and visibility only (no colour)\n");
+    }
+    return s_depth_only;
+}
 
 static uint32_t tex_face_stride(const Texture *t);
 
@@ -867,7 +889,7 @@ static void pix_capture(PixState *ps)
     ps->pitch = s_gpu.pitch;
     ps->clip_x = s_gpu.clip_x; ps->clip_y = s_gpu.clip_y;
     ps->clip_w = s_gpu.clip_w; ps->clip_h = s_gpu.clip_h;
-    ps->color_mask = s_gpu.color_mask;
+    ps->color_mask = depth_only() ? 0 : s_gpu.color_mask;
     ps->alpha_test = s_gpu.alpha_test;
     ps->alpha_func = s_gpu.alpha_func;
     ps->alpha_ref = s_gpu.alpha_ref;
@@ -894,6 +916,12 @@ static void pix_capture(PixState *ps)
     ps->st_zpass = s_gpu.st_zpass;
     ps->zpass_enable = s_gpu.zpass_enable;
     ps->clip_plane_mode = s_gpu.clip_plane_mode;
+    {
+        int st;
+        for (st = 0; st < 4; st++)
+            if (((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) == 5)
+                ps->kills = 1;
+    }
     ps->other_stage_input = s_gpu.other_stage_input;
     ps->report_epoch = s_gpu.report_epoch;
     nv2a_rc_prepare(&s_gpu.rc, &ps->rcp);
@@ -972,7 +1000,7 @@ static void clear_surface(uint32_t param)
 
     if (!rq_async())
         rq_sync();                        /* queued pixels land first */
-    if (!(param & NV097_CLEAR_COLOR_MASK))
+    if (!(param & NV097_CLEAR_COLOR_MASK) || depth_only())
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
@@ -2450,7 +2478,7 @@ static void xf_rows_span_scalar(const XfTri *T, int y0, int y1, int step,
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
-                int shade = (P->color_mask & 0x01010101u) || P->alpha_test;
+                int shade = (P->color_mask & 0x01010101u) || P->alpha_test || P->kills;
                 /* Stencil test, depth test, then shade, then alpha test, and
                  * only then the depth write: an alpha-tested texel that is
                  * cut away must not leave its depth behind (foliage, fences).
@@ -2633,7 +2661,7 @@ static void xf_rows_span4(const XfTri *T, int y0, int y1, XfCount *cnt)
             float zl[4], zs[4];
             uint32_t argb[4] = {0, 0, 0, 0};
             int mask, n = T->maxx - x < 4 ? T->maxx - x : 4;
-            int shade = (P->color_mask & 0x01010101u) || P->alpha_test;
+            int shade = (P->color_mask & 0x01010101u) || P->alpha_test || P->kills;
             uint8_t *sr = P->st_test && T->zb
                         ? zbuf_stencil(T->zb) + (size_t)y * NV_ZBUF_W + x : NULL;
             uint32_t pend[4] = {0, 0, 0, 0};
