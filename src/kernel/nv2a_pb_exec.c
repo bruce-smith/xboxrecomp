@@ -870,6 +870,36 @@ static int s_depth_only = -1;
 static int s_depth_test;            /* RECOMP_GPU=software + RECOMP_SW_DEPTH_ONLY: test */
 static const Nv2aBackend *s_backend;    /* the GPU renderer, if any (below) */
 
+/* RECOMP_VK_SHADOW=fixed (network play's "Fastest"): no software rendering
+ * at all while the GPU renderer draws the picture, and every visibility
+ * test answered at once with one constant count (RECOMP_VK_FIXED_COUNT,
+ * default 100000 = visible), the same on every PC -- deterministic, at the
+ * cost of drawing what the title would have found hidden (flares behind
+ * walls). Without a GPU renderer software draws the picture, and the
+ * reports stay fixed so such a peer stays in step. */
+static int s_fixed = -1;
+static uint32_t s_fixed_count = 100000u;
+
+static int fixed_reports(void)
+{
+    if (s_fixed < 0) {
+        const char *sh = getenv("RECOMP_VK_SHADOW"), *n = getenv("RECOMP_VK_FIXED_COUNT");
+        s_fixed = sh && !strcmp(sh, "fixed");
+        if (n)
+            s_fixed_count = (uint32_t)strtoul(n, NULL, 0);
+        if (s_fixed)
+            fprintf(stderr, "  [GPU] visibility tests answered with a fixed count (%u);"
+                    " no software rendering while the GPU renderer draws\n", s_fixed_count);
+    }
+    return s_fixed;
+}
+
+/* Fixed mode with the GPU renderer up: the software side draws nothing. */
+static int fixed_no_raster(void)
+{
+    return fixed_reports() && s_backend;
+}
+
 /* Only while a GPU renderer draws the picture: when it could not start or
  * its device is lost (s_backend NULL), software draws full colour again --
  * the guest-visible results are the same either way, so a network game
@@ -1017,7 +1047,7 @@ static void clear_surface(uint32_t param)
 
     if (!rq_async())
         rq_sync();                        /* queued pixels land first */
-    if (!(param & NV097_CLEAR_COLOR_MASK) || depth_only())
+    if (!(param & NV097_CLEAR_COLOR_MASK) || depth_only() || fixed_no_raster())
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
@@ -5492,6 +5522,8 @@ static void raster_batch(void)
         if (!s_backend_compare)
             return;
     }
+    if (fixed_no_raster())
+        return;                          /* RECOMP_VK_SHADOW=fixed */
     /* Depth-only: a draw that writes no depth, no stencil and counts for no
      * visibility test changes nothing here -- its colour is not written in
      * this mode anyway -- so its vertices, set-up and coverage are skipped
@@ -6621,6 +6653,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 force = getenv("RECOMP_ZPASS_FORCE") != NULL;
             stamp = (uint64_t)s_gpu.reports++ * 1000u;
             s_backend->report(at, stamp, force);   /* written when known */
+            break;
+        }
+        if (fixed_reports()) {
+            /* RECOMP_VK_SHADOW=fixed: every visibility test answered at
+             * once with one constant count, the same on every PC. */
+            uint32_t zc = s_fixed_count;
+            stamp = (uint64_t)s_gpu.reports++ * 1000u;
+            memcpy(mem + at, &stamp, 8);
+            memcpy(mem + at + 8, &zc, 4);
+            memset(mem + at + 12, 0, 4);
             break;
         }
         if (rq_async() && !rep_sync) {
