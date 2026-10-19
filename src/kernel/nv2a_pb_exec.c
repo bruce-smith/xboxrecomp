@@ -888,8 +888,10 @@ static int fixed_reports(void)
         if (n)
             s_fixed_count = (uint32_t)strtoul(n, NULL, 0);
         if (s_fixed)
-            fprintf(stderr, "  [GPU] visibility tests answered with a fixed count (%u);"
-                    " no software rendering while the GPU renderer draws\n", s_fixed_count);
+            fprintf(stderr, "  [GPU] visibility tests answered with a fixed count (%u); %s\n",
+                    s_fixed_count, s_backend
+                    ? "no software rendering while the GPU renderer draws"
+                    : "no GPU renderer: software draws the picture");
     }
     return s_fixed;
 }
