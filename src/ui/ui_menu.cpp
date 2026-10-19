@@ -513,9 +513,8 @@ void section_network()
         players = xbox_setting_get("network", "players", 2);
         delay = xbox_setting_get("network", "delay", 3);
         vk_display = xbox_setting_get("network", "vk_display", 0) != 0;
-        /* Compatibility until the depth-only software pass exists
-         * (blinx2project-11); then Fast becomes the default. */
-        render = xbox_setting_get("network", "render", 0);
+        /* Fast (depth-only software + Vulkan display) by default. */
+        render = xbox_setting_get("network", "render", 1);
         xbox_setting_get_str("network", "host", "192.168.1.2", addr, sizeof addr);
         loaded = true;
     }
@@ -537,14 +536,17 @@ void section_network()
                            "every player for this game. More delay hides more lag; 3 "
                            "frames (50 ms) suits a LAN or a VPN.");
         ImGui::Separator();
-        ImGui::TextUnformatted("Rendering (the same for every player):");
-        changed |= ImGui::RadioButton("Fast (needs Vulkan on every PC)", &render, 1);
+        ImGui::TextUnformatted("Rendering (for every player):");
+        changed |= ImGui::RadioButton("Fast", &render, 1);
         ImGui::SameLine();
-        changed |= ImGui::RadioButton("Compatibility (software)", &render, 0);
-        ImGui::TextWrapped(render ? "The graphics card draws the game; a PC without usable "
-                                    "Vulkan cannot join."
-                                  : "Every PC draws the game on its processor: works "
-                                    "everywhere, but a slow PC slows the game for everyone.");
+        changed |= ImGui::RadioButton("Compatibility", &render, 0);
+        ImGui::TextWrapped(render ? "The graphics card shows the game and the processor "
+                                    "only works out what the game needs to know: about "
+                                    "twice as fast. A PC without usable Vulkan draws the "
+                                    "whole picture in software instead (slower)."
+                                  : "Every PC draws the whole picture in software: the old "
+                                    "way, for when Fast misbehaves. A slow PC slows the game "
+                                    "for everyone.");
     } else {
         ImGui::SetNextItemWidth(220.0f * s_scale);
         changed |= ImGui::InputText("Host's address", addr, sizeof addr);
