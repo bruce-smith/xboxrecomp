@@ -69,8 +69,12 @@ static uint64_t s_exe_hash;
  *   only what the guest can see of it -- depth, stencil, coverage and the
  *   visibility reports -- and no colour reaches guest memory
  *   (RECOMP_VK_SHADOW=depth, blinx2project-11). Much cheaper on a slow CPU.
- * The host takes RECOMP_NET_RENDER=software|depth (default software). */
-enum { NP_MODE_SOFTWARE = 0, NP_MODE_DEPTH = 1 };
+ * - NP_MODE_FIXED ("Fastest"): Vulkan draws; the software executor draws
+ *   nothing, and every visibility test gets one fixed answer, the same on
+ *   every PC (RECOMP_VK_SHADOW=fixed). The cheapest, at the cost of some
+ *   things drawn that the title would have found hidden (flares).
+ * The host takes RECOMP_NET_RENDER=software|depth|fixed (default software). */
+enum { NP_MODE_SOFTWARE = 0, NP_MODE_DEPTH = 1, NP_MODE_FIXED = 2 };
 enum { NP_CAN_VULKAN = 1 };
 
 #if defined(XBOXRECOMP_HAVE_VULKAN)
@@ -90,7 +94,8 @@ static int vulkan_usable(void)
     return ok;
 }
 static int s_mode = NP_MODE_SOFTWARE;
-static const char *const k_mode_name[] = { "software", "depth-only + Vulkan display" };
+static const char *const k_mode_name[] = { "software", "depth-only + Vulkan display",
+                                           "fixed visibility + Vulkan display" };
 static char s_why[256];                          /* why the session did not start */
 static char s_host_info[400];                    /* the host's status lines */
 static uint32_t s_hash_f[NP_MAXP];
@@ -818,7 +823,7 @@ static int handshake_host(int port, const char *save_src)
             if (s_peer[i].sin_addr.s_addr == from.sin_addr.s_addr
                 && s_peer[i].sin_port == from.sin_port)
                 known = i;
-        if (s_mode == NP_MODE_DEPTH && !(((PkHello *)buf)->mode & NP_CAN_VULKAN)
+        if (s_mode != NP_MODE_SOFTWARE && !(((PkHello *)buf)->mode & NP_CAN_VULKAN)
             && known < 0)
             fprintf(stderr, "[NET] a player without usable Vulkan joins; it renders "
                     "in software (slower for everyone if its CPU is slow)\n");
@@ -956,7 +961,7 @@ static int handshake_join(const char *ip, int port)
             s_me = w->player;
             s_np = w->players;
             s_delay = w->delay;
-            s_mode = w->mode <= NP_MODE_DEPTH ? w->mode : NP_MODE_SOFTWARE;
+            s_mode = w->mode <= NP_MODE_FIXED ? w->mode : NP_MODE_SOFTWARE;
             got_welcome = 1;
             np_status("Connected: you are player %d of %d.\n\nReceiving the host's "
                       "saves (TCP port %d) ...", s_me + 1, s_np, port);
@@ -1034,6 +1039,8 @@ int xbox_NetplayStart(const char *game_dir)
         const char *sd = getenv("RECOMP_SAVE_DIR"), *rm = getenv("RECOMP_NET_RENDER");
         if (rm && !strcmp(rm, "depth"))
             s_mode = NP_MODE_DEPTH;
+        else if (rm && !strcmp(rm, "fixed"))
+            s_mode = NP_MODE_FIXED;
         s_is_host = 1;
         ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
     } else if (!strncmp(e, "join:", 5)) {
@@ -1094,7 +1101,18 @@ int xbox_NetplayStart(const char *game_dir)
     {
         const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
         int headless = hl && *hl == '1';
-        if (s_mode == NP_MODE_DEPTH && !vulkan_usable()) {
+        if (s_mode == NP_MODE_FIXED && !vulkan_usable()) {
+            /* Software draws the picture; the visibility answers stay the
+             * fixed ones, so this PC stays in step (blinx2project-11). */
+            fprintf(stderr, "[NET] no usable Vulkan on this PC: rendering in software\n");
+            np_setenv("RECOMP_GPU", "software");
+            np_setenv("RECOMP_VK_SHADOW", "fixed");
+        } else if (s_mode == NP_MODE_FIXED) {
+            np_setenv("RECOMP_GPU", "vulkan");
+            np_setenv("RECOMP_VK_SHADOW", "fixed");
+            if (!headless)
+                np_setenv("RECOMP_VK_PRESENT", "1");
+        } else if (s_mode == NP_MODE_DEPTH && !vulkan_usable()) {
             /* No usable Vulkan here: full software. Everything the guest
              * reads -- depth, stencil, coverage, visibility counts -- is the
              * same code as depth-only, so it stays in step with the others;

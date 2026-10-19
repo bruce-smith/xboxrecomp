@@ -422,8 +422,12 @@ void section_cheats()
  * starts from power-on for everyone, so starting one restarts the game with
  * RECOMP_NET set; during one, this shows who is who. */
 void start_network_game(int host, const char *addr, int port, int players, int delay,
-                        int vk_display, int fast)
+                        int vk_display, int render)
 {
+    /* render: the host's choice for every player, 0 Compatibility (software),
+     * 1 Fast (depth-only), 2 Fastest (fixed visibility answers). */
+    static const char *const k_render[] = { "software", "depth", "fixed" };
+    const char *rm = k_render[render >= 0 && render <= 2 ? render : 1];
 #if !defined(_WIN32)
     /* POSIX: the same restart, by exec'ing ourselves with the variables set. */
     char v[96], exe[4096];
@@ -438,7 +442,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     snprintf(v, sizeof v, "%d", delay);
     setenv("RECOMP_NET_DELAY", v, 1);
     setenv("RECOMP_NET_VK", vk_display ? "1" : "0", 1);
-    setenv("RECOMP_NET_RENDER", fast ? "depth" : "software", 1);   /* the host's choice */
+    setenv("RECOMP_NET_RENDER", rm, 1);   /* the host's choice */
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
         exe[n] = 0;
@@ -458,7 +462,7 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     snprintf(v, sizeof v, "%d", delay);
     SetEnvironmentVariableA("RECOMP_NET_DELAY", v);
     SetEnvironmentVariableA("RECOMP_NET_VK", vk_display ? "1" : "0");
-    SetEnvironmentVariableA("RECOMP_NET_RENDER", fast ? "depth" : "software");
+    SetEnvironmentVariableA("RECOMP_NET_RENDER", rm);
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     snprintf(dir, sizeof dir, "%s", exe);
     if ((slash = strrchr(dir, '\\')) != nullptr)
@@ -537,16 +541,24 @@ void section_network()
                            "frames (50 ms) suits a LAN or a VPN.");
         ImGui::Separator();
         ImGui::TextUnformatted("Rendering (for every player):");
+        changed |= ImGui::RadioButton("Fastest", &render, 2);
+        ImGui::SameLine();
         changed |= ImGui::RadioButton("Fast", &render, 1);
         ImGui::SameLine();
         changed |= ImGui::RadioButton("Compatibility", &render, 0);
-        ImGui::TextWrapped(render ? "The graphics card shows the game and the processor "
-                                    "only works out what the game needs to know: about "
-                                    "twice as fast. A PC without usable Vulkan draws the "
-                                    "whole picture in software instead (slower)."
-                                  : "Every PC draws the whole picture in software: the old "
-                                    "way, for when Fast misbehaves. A slow PC slows the game "
-                                    "for everyone.");
+        ImGui::TextWrapped(render == 2 ? "The graphics card draws the game and the processor "
+                                         "draws nothing: the fastest, for a slow PC. The game "
+                                         "is told everything is in view, so a few things "
+                                         "that should hide behind walls (light flares) still "
+                                         "show. A PC without usable Vulkan draws the picture "
+                                         "in software instead (slower)."
+                         : render == 1 ? "The graphics card shows the game and the processor "
+                                         "only works out what the game needs to know: about "
+                                         "twice as fast. A PC without usable Vulkan draws the "
+                                         "whole picture in software instead (slower)."
+                                       : "Every PC draws the whole picture in software: the old "
+                                         "way, for when Fast misbehaves. A slow PC slows the game "
+                                         "for everyone.");
     } else {
         ImGui::SetNextItemWidth(220.0f * s_scale);
         changed |= ImGui::InputText("Host's address", addr, sizeof addr);
