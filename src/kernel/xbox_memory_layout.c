@@ -3855,6 +3855,9 @@ uint32_t xbox_ContiguousAllocIn(uint32_t size, uint32_t alignment,
     xbox_ContiguousFree(r);                    /* back to the arena (reclaim only) */
     xbox_WatchCheck(alt, psize, "contig alloc");
     memset((void *)((uintptr_t)alt + g_memory_offset), 0, psize);
+    /* A few a run at most (Blinx 2: D3D's report pages for views 2-4). */
+    fprintf(stderr, "  [CONTIG] %u bytes for highest 0x%08X moved below it: physical "
+            "0x%08X, not 0x%08X\n", psize, high, alt - XBOX_CONTIG_BASE, phys);
     return alt;
 }
 
