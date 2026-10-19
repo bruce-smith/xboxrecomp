@@ -1985,13 +1985,26 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 
     (void)unused;
     if (s_watchdog_stall) {
+        /* A boot that hangs before its first flip never starts the stall
+         * clock, so give it 3*n seconds from here to present one. Its own
+         * line, so it is not read as a stall in play. */
+        DWORD start = GetTickCount();
+        int first = 0;
         for (;;) {
             DWORD flip = g_frame_counter_flip_ms;
             Sleep(1000);
             if (flip && GetTickCount() - flip > s_watchdog_stall * 1000u)
                 break;
+            if (!flip && GetTickCount() - start > 3u * s_watchdog_stall * 1000u) {
+                first = 1;
+                break;
+            }
         }
-        fprintf(stderr, "[WATCHDOG] no flip for %us\n", s_watchdog_stall);
+        if (first)
+            fprintf(stderr, "[WATCHDOG] no first flip in %us\n",
+                    3u * s_watchdog_stall);
+        else
+            fprintf(stderr, "[WATCHDOG] no flip for %us\n", s_watchdog_stall);
     } else {
         Sleep(s_watchdog_secs * 1000u);
     }
