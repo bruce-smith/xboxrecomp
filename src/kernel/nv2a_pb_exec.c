@@ -5055,12 +5055,16 @@ static void backend_select(void)
         s_backend = xbox_vk_backend();
 #endif
     /* RECOMP_VK_SHADOW (netplay): the same split as compare mode -- software
-     * owns every guest-visible result -- with Vulkan only presenting. */
+     * owns every guest-visible result -- with Vulkan only presenting.
+     * RECOMP_SW_DEPTH_ONLY with the Vulkan renderer means the same (the
+     * depth-only software side must answer the guest, never the GPU). */
     s_backend_compare = s_backend && (getenv("RECOMP_VK_COMPARE") != NULL
-                                      || getenv("RECOMP_VK_SHADOW") != NULL);
+                                      || getenv("RECOMP_VK_SHADOW") != NULL
+                                      || getenv("RECOMP_SW_DEPTH_ONLY") != NULL);
     /* Shadow mode names software: it answers the guest, and tools that pick
      * a replay's renderer from this line (replay_blinx2.bat) must too. */
-    if (s_backend && s_backend_compare && getenv("RECOMP_VK_SHADOW"))
+    if (s_backend && s_backend_compare
+        && (getenv("RECOMP_VK_SHADOW") || getenv("RECOMP_SW_DEPTH_ONLY")))
         fprintf(stderr, "  [GPU] renderer: software (%s; RECOMP_VK_SHADOW: %s displays)\n",
                 why, s_backend->name);
     else if (s_backend)

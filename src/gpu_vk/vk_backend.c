@@ -3829,7 +3829,8 @@ static int backend_init(void)
         if (!VK_OK(vkCreateSemaphore(g_vk.device, &sci, NULL, &B.timeline)))
             return 0;
     }
-    B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL || getenv("RECOMP_VK_SHADOW") != NULL;
+    B.compare_mode = getenv("RECOMP_VK_COMPARE") != NULL || getenv("RECOMP_VK_SHADOW") != NULL
+                     || getenv("RECOMP_SW_DEPTH_ONLY") != NULL;
     {
         const char *e = getenv("RECOMP_VK_REBIND");
         B.rebind = e && *e == '1';
@@ -3897,7 +3898,7 @@ static void vk_compare(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t w, 
      * the menu included). Nothing from it reaches guest memory; no diff. */
     static int shadow = -1;
     if (shadow < 0)
-        shadow = getenv("RECOMP_VK_SHADOW") != NULL;
+        shadow = getenv("RECOMP_VK_SHADOW") != NULL || getenv("RECOMP_SW_DEPTH_ONLY") != NULL;
     if (shadow) {
         if (!B.ok || g_vk.lost)
             return;
