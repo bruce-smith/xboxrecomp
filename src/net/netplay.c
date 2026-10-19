@@ -67,8 +67,8 @@ static uint64_t s_exe_hash;
  *   RECOMP_NET_VK=1 lets a player present through Vulkan on top.
  * - NP_MODE_DEPTH: Vulkan draws what is seen; the software executor does
  *   only what the guest can see of it -- depth, stencil, coverage and the
- *   visibility reports -- and no colour reaches guest memory (P10's
- *   renderer side: RECOMP_SW_DEPTH_ONLY). Much cheaper on a slow CPU.
+ *   visibility reports -- and no colour reaches guest memory
+ *   (RECOMP_VK_SHADOW=depth, blinx2project-11). Much cheaper on a slow CPU.
  * The host takes RECOMP_NET_RENDER=software|depth (default software). */
 enum { NP_MODE_SOFTWARE = 0, NP_MODE_DEPTH = 1 };
 enum { NP_CAN_VULKAN = 1 };
@@ -1102,9 +1102,12 @@ int xbox_NetplayStart(const char *game_dir)
         const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
         int headless = hl && *hl == '1';
         if (s_mode == NP_MODE_DEPTH) {
+            /* The shadow split: the software executor stays authoritative
+             * for everything the guest reads, skipping colour (depth,
+             * stencil, coverage, visibility counts); Vulkan only displays and
+             * never writes guest memory. */
             np_setenv("RECOMP_GPU", "vulkan");
-            np_setenv("RECOMP_SW_DEPTH_ONLY", "1");
-            np_setenv("RECOMP_VK_READBACK", "0");
+            np_setenv("RECOMP_VK_SHADOW", "depth");
             if (!headless)
                 np_setenv("RECOMP_VK_PRESENT", "1");
         } else if (vk && *vk == '1' && !headless) {
