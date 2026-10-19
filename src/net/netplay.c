@@ -818,12 +818,10 @@ static int handshake_host(int port, const char *save_src)
             if (s_peer[i].sin_addr.s_addr == from.sin_addr.s_addr
                 && s_peer[i].sin_port == from.sin_port)
                 known = i;
-        if (s_mode == NP_MODE_DEPTH && !(((PkHello *)buf)->mode & NP_CAN_VULKAN)) {
-            refuse(&from, BYE_NOVULKAN);
-            fprintf(stderr, "[NET] a player without usable Vulkan tried to join a "
-                    "depth-only game; refused\n");
-            continue;
-        }
+        if (s_mode == NP_MODE_DEPTH && !(((PkHello *)buf)->mode & NP_CAN_VULKAN)
+            && known < 0)
+            fprintf(stderr, "[NET] a player without usable Vulkan joins; it renders "
+                    "in software (slower for everyone if its CPU is slow)\n");
         if (((PkHello *)buf)->exe != s_exe_hash) {
             refuse(&from, BYE_BUILD);              /* so it can say why */
             fprintf(stderr, "[NET] a player with a different build or game files tried to join; refused\n");
@@ -1036,13 +1034,8 @@ int xbox_NetplayStart(const char *game_dir)
         const char *sd = getenv("RECOMP_SAVE_DIR"), *rm = getenv("RECOMP_NET_RENDER");
         if (rm && !strcmp(rm, "depth"))
             s_mode = NP_MODE_DEPTH;
-        if (s_mode == NP_MODE_DEPTH && !vulkan_usable()) {
-            snprintf(s_why, sizeof s_why, "Fast rendering needs Vulkan, and this PC has "
-                     "no usable Vulkan. Choose Compatibility rendering to host.");
-        } else {
-            s_is_host = 1;
-            ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
-        }
+        s_is_host = 1;
+        ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
     } else if (!strncmp(e, "join:", 5)) {
         char ip[64];
         const char *c = strrchr(e + 5, ':');
@@ -1101,7 +1094,15 @@ int xbox_NetplayStart(const char *game_dir)
     {
         const char *vk = getenv("RECOMP_NET_VK"), *hl = getenv("RECOMP_HEADLESS");
         int headless = hl && *hl == '1';
-        if (s_mode == NP_MODE_DEPTH) {
+        if (s_mode == NP_MODE_DEPTH && !vulkan_usable()) {
+            /* No usable Vulkan here: full software. Everything the guest
+             * reads -- depth, stencil, coverage, visibility counts -- is the
+             * same code as depth-only, so it stays in step with the others;
+             * the colour it adds lies outside the synced memory (checked:
+             * colour surfaces are not in 0x10000-0x4000000). */
+            fprintf(stderr, "[NET] no usable Vulkan on this PC: rendering in software\n");
+            np_setenv("RECOMP_GPU", "software");
+        } else if (s_mode == NP_MODE_DEPTH) {
             /* The shadow split: the software executor stays authoritative
              * for everything the guest reads, skipping colour (depth,
              * stencil, coverage, visibility counts); Vulkan only displays and
