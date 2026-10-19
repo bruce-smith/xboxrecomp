@@ -5475,6 +5475,19 @@ static void raster_batch(void)
         if (!s_backend_compare)
             return;
     }
+    /* Depth-only: a draw that writes no depth, no stencil and counts for no
+     * visibility test changes nothing here -- its colour is not written in
+     * this mode anyway -- so its vertices, set-up and coverage are skipped
+     * (HUD, particles, sky, transparent effects, colour-only passes). */
+    if (depth_only() && !s_gpu.depth_mask && !s_gpu.zpass_enable
+        && !(s_gpu.st_test && (s_gpu.st_wmask & 0xFF)
+             && (s_gpu.st_fail != 0x1E00 || s_gpu.st_zfail != 0x1E00
+                 || s_gpu.st_zpass != 0x1E00))) {
+        static uint32_t skipped;
+        if (++skipped % 100000u == 0)
+            fprintf(stderr, "  [GPU] depth-only: %u colour-only draws skipped\n", skipped);
+        return;
+    }
     static int no_vsh = -1;
     if (no_vsh < 0)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
