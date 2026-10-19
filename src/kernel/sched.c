@@ -48,6 +48,8 @@
  * File: "BX2SCHED", u32 version, then tagged records (0x03 is written only
  * when it says something, so a file without it is what older builds wrote):
  *   0x03 varint flags                           bit 0: RECOMP_PORTABLE_MATH
+ *                                               bit 1: file I/O lets go of the
+ *                                               CPU (xbox_SchedIoLetGo)
  *   0x01 varint agent, varint count            a run
  *   0x02 varint agent, varint kind, zigzag-varint delta   a value (delta
  *        from the previous value of that agent and kind)
@@ -77,6 +79,26 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define SCHED_KINDS      16
 
 static int s_mode = -1;                 /* 0 off, 1 record, 2 replay, 3 virtual */
+
+/* File I/O lets go of the guest CPU for the host read or write (bridge
+ * NtReadFile/NtWriteFile), as a thread blocked on the disk does on the
+ * console. Holding it, a slow disk stopped every other agent: a pack loader
+ * held it for 3 s of 64 KB reads in a recorded boot, the USB control
+ * transfer XPP was waiting for timed out meanwhile, and the boot stalled at
+ * the logo movie. Recordings say whether they were made so (tag 0x03 bit 1);
+ * older ones were not, and replay as made. */
+static int s_io_letgo = 1;
+
+/* Recording and replay only. In virtual mode time does not move during a
+ * host read, so nothing times out, and a buffer still filling while another
+ * agent hashes guest memory (network play's sync check) would read
+ * differently on two PCs. (A recording's own RECOMP_INPUT_HASH checkpoints can
+ * catch such a buffer half-filled: ~40 KB at an odd checkpoint, gone at the
+ * next; the guest state itself replays exactly.) */
+int xbox_SchedIoLetGo(void)
+{
+    return (s_mode == 1 || s_mode == 2) && s_io_letgo;
+}
 /* 2: every wait's outcome is recorded, not only a finite one's. */
 #define SCHED_FILE_VER 2
 static uint32_t s_file_ver = SCHED_FILE_VER;
@@ -296,8 +318,10 @@ static int sched_load(const char *path)
     memcpy(&ver, buf + 8, 4);
     s_file_ver = ver;
     /* How the recording computed the x87 transcendentals; absent: the C
-     * library's. A replay must match it whatever the environment says. */
+     * library's. A replay must match it whatever the environment says.
+     * Likewise whether file I/O let go of the CPU: absent, it did not. */
     recomp_set_portable_math(0);
+    s_io_letgo = 0;
     p = buf + 12;
     end = buf + size;
     s_runs = (SchedRun *)malloc(cap * sizeof(SchedRun));
@@ -343,6 +367,7 @@ static int sched_load(const char *path)
             if (!sched_get_varint((const uint8_t **)&p, end, &a))
                 break;
             recomp_set_portable_math((int)(a & 1));
+            s_io_letgo = (int)((a >> 1) & 1);
             if (a & 1)
                 fprintf(stderr, "  [SCHED] recorded with RECOMP_PORTABLE_MATH: "
                         "portable math on for this replay\n");
@@ -406,10 +431,14 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                 setvbuf(s_out, NULL, _IOFBF, 1 << 20);
                 fwrite("BX2SCHED", 1, 8, s_out);
                 fwrite(&ver, 4, 1, s_out);
-                if (recomp_portable_math_enabled()) {
-                    fputc(0x03, s_out);
-                    sched_put_varint(1);
+                {   /* RECOMP_SCHED_IO_LETGO=0: record as older builds did */
+                    const char *lg = getenv("RECOMP_SCHED_IO_LETGO");
+                    if (lg && *lg == '0')
+                        s_io_letgo = 0;
                 }
+                fputc(0x03, s_out);
+                sched_put_varint((recomp_portable_math_enabled() ? 1u : 0u)
+                                 | (s_io_letgo ? 2u : 0u));
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));

@@ -3866,8 +3866,22 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {   /* the disk read lets go of the CPU, as a blocked thread does (sched.c) */
+        int letgo = xbox_SchedIoLetGo() ? xbox_SchedBlockBegin() : 0;
+        NTSTATUS st = xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                                      XBOX_TO_NATIVE(buffer_va), length, poff);
+        {   /* RECOMP_TEST_READ_DELAY=<ms> (testing): a slow disk */
+            static int delay = -1;
+            if (delay < 0) {
+                const char *e = getenv("RECOMP_TEST_READ_DELAY");
+                delay = e ? atoi(e) : 0;
+            }
+            if (delay > 0)
+                Sleep((DWORD)delay);
+        }
+        xbox_SchedBlockEnd(letgo);
+        g_eax = (uint32_t)st;
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
@@ -3941,8 +3955,13 @@ static void bridge_NtWriteFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {   /* the disk write lets go of the CPU, as a blocked thread does (sched.c) */
+        int letgo = xbox_SchedIoLetGo() ? xbox_SchedBlockBegin() : 0;
+        NTSTATUS st = xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+                                       XBOX_TO_NATIVE(buffer_va), length, poff);
+        xbox_SchedBlockEnd(letgo);
+        g_eax = (uint32_t)st;
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
