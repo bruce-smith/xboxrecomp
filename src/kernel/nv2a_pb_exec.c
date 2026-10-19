@@ -867,14 +867,31 @@ static PixState s_live;
  * The title reads only depth-derived results (RECOMP_TEST_SCRAMBLE_COLOR),
  * so guest state is the same; the picture comes from the Vulkan renderer. */
 static int s_depth_only = -1;
+static int s_depth_test;            /* RECOMP_GPU=software + RECOMP_SW_DEPTH_ONLY: test */
+static const Nv2aBackend *s_backend;    /* the GPU renderer, if any (below) */
 
+/* Only while a GPU renderer draws the picture: when it could not start or
+ * its device is lost (s_backend NULL), software draws full colour again --
+ * the guest-visible results are the same either way, so a network game
+ * stays in step (a full-software peer matches depth-only ones). The test
+ * mode, explicitly software, stays depth-only with nothing drawn. */
 static int depth_only(void)
 {
     if (s_depth_only < 0) {
-        const char *sh = getenv("RECOMP_VK_SHADOW");
+        const char *sh = getenv("RECOMP_VK_SHADOW"), *gpu = getenv("RECOMP_GPU");
         s_depth_only = (sh && !strcmp(sh, "depth")) || getenv("RECOMP_SW_DEPTH_ONLY") != NULL;
+        s_depth_test = s_depth_only && getenv("RECOMP_SW_DEPTH_ONLY")
+                       && gpu && !strcmp(gpu, "software");
         if (s_depth_only)
-            fprintf(stderr, "  [GPU] software: depth, stencil and visibility only (no colour)\n");
+            fprintf(stderr, "  [GPU] software: depth, stencil and visibility only (no colour)%s\n",
+                    s_depth_test ? "; nothing is drawn (test)"
+                                 : " while the GPU renderer draws the picture");
+    }
+    if (s_depth_only && !s_depth_test && !s_backend) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [GPU] no GPU renderer: software draws full colour\n");
+        return 0;
     }
     return s_depth_only;
 }
