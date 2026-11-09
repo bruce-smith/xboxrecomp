@@ -31,6 +31,7 @@
 #include <string.h>
 
 #include "netplay.h"
+#include "net_tree.h"
 #include "../kernel/kernel.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../usb/usb_gamepad.h"
@@ -41,13 +42,13 @@
 #define NP_FRAME_NS 16666667ull
 #define NP_CHECK    60
 
-enum { PK_HELLO = 1, PK_WELCOME, PK_START, PK_INPUT, PK_HASH, PK_BYE };
+enum { PK_HELLO = 1, PK_WELCOME, PK_START, PK_INPUT, PK_HASH, PK_BYE, PK_END, PK_DONE };
 
 /* One player's frame: the 18 bytes of pad state, then an optional cheat
  * event (a flag and 22 bytes, cheats.c's request), so a cheat applies on every
  * peer at the same frame. NP_PROTO is in the join identity: peers whose
  * records differ cannot join each other. */
-#define NP_PROTO    3
+#define NP_PROTO    4
 #define NP_REC      (18 + 1 + 22)
 #define NP_EV_FLAG  18
 #define NP_EV       19
@@ -104,6 +105,14 @@ static uint32_t s_hash_fr[NP_MAXP][2];
 static volatile LONG s_failed;
 static uint64_t s_wait_ticks;                    /* QPC ticks spent waiting for input */
 static volatile DWORD s_heard[NP_MAXP];          /* when each player was last heard from */
+/* Journey Bags (netbag.c). s_saves: this player's real saves (RECOMP_SAVE_DIR
+ * before the session replaced it, else the game folder); s_root: netbag's
+ * folder; s_bag_mask: bit p = player p brought a bag, which sits on the
+ * memory unit of controller p + 1 (<session>/MU/<2p>). */
+static char s_saves[MAX_PATH], s_root[MAX_PATH], s_mybag[MAX_PATH];
+static int s_saves_explicit, s_have_bag;
+static uint32_t s_bag_mask;
+
 static void broadcast(const void *p, int n, int except);
 static void dump_pages(uint32_t f);         /* below, with the hashing */
 
@@ -137,6 +146,12 @@ typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t ha
 /* A refused hello is answered with a BYE whose reason says why. */
 enum { BYE_LEFT = 0, BYE_BUILD = 1, BYE_FULL = 2, BYE_NOVULKAN = 3 };
 typedef struct { uint8_t type, player; uint16_t reason; uint32_t desync_frame; } PkBye;
+/* A clean end (xbox_NetplayEnd): the host names the frame everyone stops at;
+ * there each peer sends a hash of guest memory and of every memory unit's
+ * files (the Journey Bags), and only when all agree do joiners take their
+ * bags home (netbag.c). */
+typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; } PkEnd;
+typedef struct { uint8_t type, player; uint16_t pad; uint32_t frame; uint64_t guest, mu; } PkDone;
 
 static void send_to(const struct sockaddr_in *a, const void *p, int n);
 
@@ -278,6 +293,41 @@ static void note_hash(int p, uint32_t f, uint64_t v)
     check_hashes(p);
 }
 
+/* ---- the clean end ------------------------------------------------------------- */
+
+static volatile uint32_t s_end_frame;            /* 0: no end announced */
+static volatile LONG s_ending;                   /* this peer has stopped at it */
+static PkDone s_done[NP_MAXP];
+static int s_done_have;                          /* bit p: player p's DONE is here (s_lock) */
+
+static void note_done(const PkDone *d)
+{
+    if (d->player >= NP_MAXP)
+        return;
+    AcquireSRWLockExclusive(&s_lock);
+    s_done[d->player] = *d;
+    s_done_have |= 1 << d->player;
+    ReleaseSRWLockExclusive(&s_lock);
+}
+
+int xbox_NetplayEnd(void)
+{
+    PkEnd e;
+    int k;
+    if (!s_on || !s_is_host || s_end_frame)
+        return 0;
+    /* Ahead of every peer: none is more than the input delay past the host. */
+    s_end_frame = s_sampled + 120u;
+    fprintf(stderr, "[NET] ending the network game at frame %u\n", s_end_frame);
+    fflush(stderr);
+    memset(&e, 0, sizeof e);
+    e.type = PK_END;
+    e.frame = s_end_frame;
+    for (k = 0; k < 5; k++)
+        broadcast(&e, sizeof e, -1);
+    return 1;
+}
+
 /* Receives inputs and hashes (the host relays them), and resends this
  * peer's recent inputs every 10 ms so a lost packet is repaired at once. */
 static DWORD WINAPI net_thread(LPVOID unused)
@@ -317,10 +367,24 @@ static DWORD WINAPI net_thread(LPVOID unused)
                 st.type = PK_START;
                 st.players = (uint8_t)s_np;
                 st.delay = (uint8_t)s_delay;
+                st.pad[0] = (uint8_t)s_bag_mask;   /* who brought a Journey Bag */
                 send_to(&from, &st, sizeof st);
             } else {
                 refuse(&from, BYE_FULL);
             }
+        } else if (n >= (int)sizeof(PkEnd) && buf[0] == PK_END && !s_is_host) {
+            if (!s_end_frame) {
+                s_end_frame = ((PkEnd *)buf)->frame;
+                fprintf(stderr, "[NET] the host ends the network game at frame %u\n",
+                        s_end_frame);
+                fflush(stderr);
+            }
+        } else if (n >= (int)sizeof(PkDone) && buf[0] == PK_DONE) {
+            note_done((PkDone *)buf);
+            if (s_is_host)
+                broadcast(buf, n, ((PkDone *)buf)->player);
+        } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE && s_ending) {
+            /* stopped at the end already: a peer leaving now changes nothing */
         } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
             PkBye *b = (PkBye *)buf;
             char why[160];
@@ -462,9 +526,13 @@ static int send_tree(SOCKET s, const char *root, const char *rel)
     return 1;
 }
 
-static int recv_tree(SOCKET s, const char *root)
+/* max_bytes / max_files: 0 for no limit (the host's saves); a joiner's
+ * Journey Bag is capped, and must lie under prefix ("UDATA/"). */
+static int recv_tree_cap(SOCKET s, const char *root, uint64_t max_bytes, int max_files,
+                         const char *prefix)
 {
     int files = 0;
+    uint64_t bytes = 0;
     for (;;) {
         uint16_t len;
         uint64_t size;
@@ -479,6 +547,10 @@ static int recv_tree(SOCKET s, const char *root)
         r[len] = 0;
         if (strstr(r, "..") || r[0] == '/' || r[0] == '\\' || strchr(r, ':'))
             return -1;                          /* nothing outside the session */
+        bytes += size;
+        if ((max_bytes && bytes > max_bytes) || (max_files && files >= max_files)
+            || (prefix && strncmp(r, prefix, strlen(prefix))))
+            return -1;
         np_native_path(r);
         snprintf(full, sizeof full, "%s%c%s", root, NP_SEP, r);
         slash = strrchr(full, NP_SEP);
@@ -505,6 +577,11 @@ static int recv_tree(SOCKET s, const char *root)
     }
 }
 
+static int recv_tree(SOCKET s, const char *root)
+{
+    return recv_tree_cap(s, root, 0, 0, NULL);
+}
+
 /* Host: the saves into its own session, then to each joiner. */
 static void copy_tree(const char *src, const char *dst)
 {
@@ -524,6 +601,10 @@ static void copy_tree(const char *src, const char *dst)
     np_dir_close(&d);
 }
 
+void np_tree_rm(const char *dir) { rm_tree(dir); }
+void np_tree_mk(const char *path) { mk_dirs(path); }
+void np_tree_copy(const char *src, const char *dst) { copy_tree(src, dst); }
+
 /* ---- the session ------------------------------------------------------------ */
 
 static const char *s_build_id;    /* xbox_NetplaySetBuild */
@@ -531,6 +612,32 @@ static const char *s_build_id;    /* xbox_NetplaySetBuild */
 void xbox_NetplaySetBuild(const char *id)
 {
     s_build_id = id;
+}
+
+/* The game folder (saves live there unless RECOMP_SAVE_DIR moves them), so
+ * the menu can make a Journey Bag before any session exists. */
+static char s_game_dir_cfg[MAX_PATH];
+
+void xbox_NetplaySetGameDir(const char *dir)
+{
+    snprintf(s_game_dir_cfg, sizeof s_game_dir_cfg, "%s", dir && *dir ? dir : ".");
+}
+
+void xbox_NetBagPaths(char *saves, size_t sn, char *root, size_t rn, int *explicit_dir)
+{
+    const char *sd = getenv("RECOMP_SAVE_DIR");
+    int ex = sd && *sd;
+    if (s_on) {                     /* RECOMP_SAVE_DIR is the session's now */
+        snprintf(saves, sn, "%s", s_saves);
+        snprintf(root, rn, "%s", s_root);
+        if (explicit_dir)
+            *explicit_dir = s_saves_explicit;
+        return;
+    }
+    snprintf(saves, sn, "%s", ex ? sd : (s_game_dir_cfg[0] ? s_game_dir_cfg : "."));
+    xbox_NetBagRoot(ex ? sd : NULL, root, rn);
+    if (explicit_dir)
+        *explicit_dir = ex;
 }
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n)
@@ -848,13 +955,15 @@ static int handshake_host(int port, const char *save_src)
         w.mode = (uint8_t)s_mode;
         send_to(&from, &w, sizeof w);
     }
-    {   /* the saves, to every joiner */
-        int k;
+    {   /* Each joiner's Journey Bag in (u8 player, u8 has a bag, then the
+         * bag's files), then the saves -- with every bag -- out to all. */
+        SOCKET cs[NP_MAXP];
+        int k, nc = 0;
         for (k = 0; k < s_np - 1; k++) {
             SOCKET c;
-            uint16_t end = 0;
+            uint8_t hdr[2];
             DWORD t0 = GetTickCount();
-            np_status("%s\n\nAll players joined. Sending the saves (%d of %d)...",
+            np_status("%s\n\nAll players joined. Collecting their Journey Bags (%d of %d)...",
                       s_host_info, k + 1, s_np - 1);
             /* A joiner fetches them right after its welcome; one that cannot
              * reach TCP (a firewall) would block this for ever. */
@@ -877,11 +986,44 @@ static int handshake_host(int port, const char *save_src)
                 closesocket(ls);
                 return 0;
             }
-            send_tree(c, s_session, "UDATA");
-            send_tree(c, s_session, "TDATA");
-            send_all(c, &end, 2);
-            shutdown(c, SD_SEND);
-            closesocket(c);
+            if (!recv_all(c, hdr, 2) || hdr[0] < 1 || hdr[0] >= s_np) {
+                snprintf(s_why, sizeof s_why, "A player's connection broke while it "
+                         "joined. Start the network game again.");
+                closesocket(c);
+                closesocket(ls);
+                return 0;
+            }
+            if (hdr[1]) {
+                char mu[MAX_PATH];
+                int p = hdr[0], files;
+                snprintf(mu, sizeof mu, "%s%cMU%c%d", s_session, NP_SEP, NP_SEP, 2 * p);
+                rm_tree(mu);
+                mk_dirs(mu);
+                files = recv_tree_cap(c, mu, 1u << 20, 16, "UDATA/");
+                if (files <= 0) {
+                    snprintf(s_why, sizeof s_why, "Player %d's Journey Bag did not arrive "
+                             "whole (or is not one). Start the network game again.", p + 1);
+                    closesocket(c);
+                    closesocket(ls);
+                    return 0;
+                }
+                s_bag_mask |= 1u << p;
+                fprintf(stderr, "[NET] player %d brought a Journey Bag (%d files, %016llX)\n",
+                        p + 1, files, (unsigned long long)xbox_NetBagHashTree(mu));
+            } else
+                fprintf(stderr, "[NET] player %d brought no Journey Bag\n", hdr[0] + 1);
+            cs[nc++] = c;
+        }
+        for (k = 0; k < nc; k++) {
+            uint16_t end = 0;
+            np_status("%s\n\nAll players joined. Sending the saves (%d of %d)...",
+                      s_host_info, k + 1, nc);
+            send_tree(cs[k], s_session, "UDATA");
+            send_tree(cs[k], s_session, "TDATA");
+            send_tree(cs[k], s_session, "MU");
+            send_all(cs[k], &end, 2);
+            shutdown(cs[k], SD_SEND);
+            closesocket(cs[k]);
         }
         closesocket(ls);
         fprintf(stderr, "[NET] saves sent to %d player(s)\n", s_np - 1);
@@ -893,6 +1035,7 @@ static int handshake_host(int port, const char *save_src)
         st.type = PK_START;
         st.players = (uint8_t)s_np;
         st.delay = (uint8_t)s_delay;
+        st.pad[0] = (uint8_t)s_bag_mask;           /* who brought a Journey Bag */
         for (k = 0; k < 5; k++)                     /* UDP: say it a few times */
             broadcast(&st, sizeof st, -1);
     }
@@ -974,6 +1117,23 @@ static int handshake_join(const char *ip, int port)
                          "UDP.", port);
                 return 0;
             }
+            {   /* this player's Journey Bag first (netbag.c), if it has one */
+                uint8_t hdr[2];
+                uint16_t end = 0;
+                hdr[0] = (uint8_t)s_me;
+                hdr[1] = (uint8_t)(s_have_bag ? 1 : 0);
+                if (s_have_bag)
+                    np_status("Connected: you are player %d of %d.\n\nSending your Journey "
+                              "Bag, then receiving the host's saves ...", s_me + 1, s_np);
+                if (!send_all(c, hdr, 2)
+                    || (s_have_bag && (!send_tree(c, s_mybag, "UDATA")
+                                       || !send_all(c, &end, 2)))) {
+                    snprintf(s_why, sizeof s_why, "The connection to the host broke while "
+                             "sending your Journey Bag.");
+                    closesocket(c);
+                    return 0;
+                }
+            }
             files = recv_tree(c, s_session);
             closesocket(c);
             if (files < 0) {
@@ -985,6 +1145,7 @@ static int handshake_join(const char *ip, int port)
                       "the host to start: it starts when all %d players have joined.",
                       s_me + 1, s_np, s_np);
         } else if (n >= (int)sizeof(PkHello) && buf[0] == PK_START && got_welcome) {
+            s_bag_mask = ((PkHello *)buf)->pad[0];
             return 1;
         } else if (n >= (int)sizeof(PkBye) && buf[0] == PK_BYE) {
             if (((PkBye *)buf)->reason == BYE_FULL)
@@ -1016,6 +1177,24 @@ int xbox_NetplayStart(const char *game_dir)
 {
     const char *e = getenv("RECOMP_NET");
     int ok = 0;
+    /* RECOMP_NET_RESTORE_LAST=1: put back the save the last network game
+     * changed, from its backup (the Network tab's Restore button, for a
+     * build or a PC without the menu), and exit: 0 restored, 1 nothing to. */
+    {
+        const char *rl = getenv("RECOMP_NET_RESTORE_LAST");
+        if (rl && *rl == '1') {
+            char saves[MAX_PATH], root[MAX_PATH], msg[600];
+            int r;
+            xbox_NetplaySetGameDir(game_dir);
+            xbox_NetBagPaths(saves, sizeof saves, root, sizeof root, NULL);
+            r = xbox_NetBagRestoreLast(saves, root, msg, sizeof msg);
+            fprintf(stderr, "[NET] %s\n", msg);
+            fflush(stderr);
+            if (!getenv("RECOMP_HEADLESS"))
+                MessageBoxA(NULL, msg, "Blinx 2 network game", MB_OK | MB_TOPMOST);
+            exit(r ? 0 : 1);
+        }
+    }
     if (!e || !*e)
         return 0;
     if (getenv("RECOMP_NET_PLAYERS"))
@@ -1033,21 +1212,47 @@ int xbox_NetplayStart(const char *game_dir)
         return 0;
     np_rcvtimeo(s_sock, 200);                       /* handshake polls */
     s_exe_hash = build_identity(game_dir);
+    {   /* this player's real saves, before the session takes RECOMP_SAVE_DIR */
+        const char *sd = getenv("RECOMP_SAVE_DIR");
+        s_saves_explicit = sd && *sd;
+        snprintf(s_saves, sizeof s_saves, "%s",
+                 s_saves_explicit ? sd : (game_dir ? game_dir : "."));
+        xbox_NetBagRoot(s_saves_explicit ? sd : NULL, s_root, sizeof s_root);
+    }
     np_status("Starting the network game ...");
     stat_open();
     if (!strncmp(e, "host:", 5)) {
-        const char *sd = getenv("RECOMP_SAVE_DIR"), *rm = getenv("RECOMP_NET_RENDER");
+        const char *rm = getenv("RECOMP_NET_RENDER"), *kh = getenv("RECOMP_NET_KEEP_HOST");
         if (rm && !strcmp(rm, "depth"))
             s_mode = NP_MODE_DEPTH;
         else if (rm && !strcmp(rm, "fixed"))
             s_mode = NP_MODE_FIXED;
         s_is_host = 1;
-        ok = handshake_host(atoi(e + 5), sd && *sd ? sd : (game_dir ? game_dir : "."));
+        if (!(kh && *kh == '0')) {          /* keep the host's progress (RECOMP_NET_KEEP_HOST=0: not) */
+            xbox_NetBagHostBaseline(s_saves, s_root);
+            fprintf(stderr, "[NET] the host's progress will be kept after a clean end\n");
+        }
+        ok = handshake_host(atoi(e + 5), s_saves);
     } else if (!strncmp(e, "join:", 5)) {
         char ip[64];
-        const char *c = strrchr(e + 5, ':');
+        const char *c = strrchr(e + 5, ':'), *bg = getenv("RECOMP_NET_BAG");
         size_t n = c ? (size_t)(c - (e + 5)) : 0;
-        if (c && n < sizeof ip) {
+        /* RECOMP_NET_BAG: "ready" (the menu has made it), a save slot (make it
+         * now), or unset / 0 (no Journey Bag: play on the host's save). */
+        if (bg && !strcmp(bg, "ready")) {
+            s_have_bag = xbox_NetBagReady(s_root, s_mybag, sizeof s_mybag);
+            if (!s_have_bag)
+                snprintf(s_why, sizeof s_why, "Your Journey Bag is missing (%s).", s_root);
+        } else if (bg && *bg >= '1' && *bg <= '9') {
+            char why[300];
+            np_status("Packing your Journey Bag (save %d) ...\n\nThe game makes it itself, "
+                      "in the background: about a minute.", atoi(bg));
+            if (xbox_NetBagPrepare(s_saves, s_root, atoi(bg), why, sizeof why))
+                s_have_bag = xbox_NetBagReady(s_root, s_mybag, sizeof s_mybag);
+            else
+                snprintf(s_why, sizeof s_why, "Your Journey Bag could not be made: %s.", why);
+        }
+        if (c && n < sizeof ip && (!bg || !*bg || *bg == '0' || s_have_bag)) {
             memcpy(ip, e + 5, n);
             ip[n] = 0;
             ok = handshake_join(ip, atoi(c + 1));
@@ -1093,6 +1298,20 @@ int xbox_NetplayStart(const char *game_dir)
      * mode). Headless there is nothing to present. */
     np_setenv("RECOMP_SCHED_VIRTUAL", "1");
     np_setenv("RECOMP_SAVE_DIR", s_session);
+    {   /* each Journey Bag on its owner's controller's memory unit (kernel_mu.c) */
+        char mu[16];
+        int p, k = 0;
+        for (p = 0; p < NP_MAXP; p++)
+            if (s_bag_mask & (1u << p)) {
+                if (k)
+                    mu[k++] = ',';
+                mu[k++] = (char)('1' + p);
+            }
+        mu[k] = 0;
+        np_setenv("RECOMP_NET_MU", k ? mu : "0");
+        if (k)
+            fprintf(stderr, "[NET] Journey Bags on the memory units of controller(s) %s\n", mu);
+    }
     {
         char n[8];
         snprintf(n, sizeof n, "%d", s_np);
@@ -1275,6 +1494,142 @@ static void dump_pages(uint32_t f)
         }
 }
 
+/* After this peer stopped at the end frame: every player's DONE, then (all
+ * equal) this joiner's Journey Bag goes home (netbag.c), or the host keeps
+ * its progress (unless RECOMP_NET_KEEP_HOST=0). Nothing is taken home
+ * after a mismatch or a silent peer. The process ends here: exit 0, 5 (no
+ * clean end) or 6 (clean, but taking the bag home failed). */
+static DWORD WINAPI end_thread(LPVOID unused)
+{
+    PkDone me;
+    DWORD t0 = GetTickCount(), last = 0;
+    int all = (1 << s_np) - 1, have, p, result = -1, code = 0;
+    char msg[800], detail[500] = "";
+    const char *kh = getenv("RECOMP_NET_KEEP_HOST");
+    (void)unused;
+    AcquireSRWLockShared(&s_lock);
+    me = s_done[s_me];
+    ReleaseSRWLockShared(&s_lock);
+    for (;;) {
+        AcquireSRWLockShared(&s_lock);
+        have = s_done_have;
+        ReleaseSRWLockShared(&s_lock);
+        /* Our own DONE goes out before anything else: a joiner that already
+         * had everyone's used to stop at once, and the host never heard it. */
+        if (GetTickCount() - last >= 200) {
+            broadcast(&me, sizeof me, -1);
+            if (s_is_host) {                      /* the END and the others' DONEs again */
+                PkEnd e;
+                memset(&e, 0, sizeof e);
+                e.type = PK_END;
+                e.frame = s_end_frame;
+                broadcast(&e, sizeof e, -1);
+                for (p = 1; p < s_np; p++)
+                    if (have & (1 << p))
+                        broadcast(&s_done[p], sizeof s_done[p], p);
+            }
+            last = GetTickCount();
+        }
+        if (have == all || GetTickCount() - t0 > 30000)
+            break;
+        Sleep(20);
+    }
+    {   /* Say it a while longer (UDP), so every peer hears every DONE: the
+         * host relays the others' too. */
+        DWORD t1 = GetTickCount();
+        while (GetTickCount() - t1 < 3000) {
+            broadcast(&me, sizeof me, -1);
+            if (s_is_host)
+                for (p = 1; p < s_np; p++)
+                    if (have & (1 << p))
+                        broadcast(&s_done[p], sizeof s_done[p], p);
+            Sleep(200);
+        }
+    }
+    if (have != all) {
+        snprintf(msg, sizeof msg, "The network game ended, but not every player answered "
+                 "within 30 s. Nothing was taken home: every save is as it was.");
+        code = 5;
+    } else {
+        for (p = 0; p < s_np; p++)
+            if (s_done[p].frame != me.frame || s_done[p].guest != me.guest
+                || s_done[p].mu != me.mu) {
+                fprintf(stderr, "[NET] end: player %d frame %u guest %016llX mu %016llX, "
+                        "here frame %u guest %016llX mu %016llX\n", p + 1, s_done[p].frame,
+                        (unsigned long long)s_done[p].guest, (unsigned long long)s_done[p].mu,
+                        me.frame, (unsigned long long)me.guest, (unsigned long long)me.mu);
+                code = 5;
+            }
+        if (code)
+            snprintf(msg, sizeof msg, "The network game ended, but the players' games did "
+                     "not match at the end. Nothing was taken home: every save is as it was.");
+    }
+    if (!code) {
+        fprintf(stderr, "[NET] the network game ended cleanly at frame %u (every player "
+                "agrees: guest %016llX, memory units %016llX)\n", me.frame,
+                (unsigned long long)me.guest, (unsigned long long)me.mu);
+        fflush(stderr);
+        if (!s_is_host && s_have_bag) {
+            char bag[MAX_PATH];
+            snprintf(bag, sizeof bag, "%s%cMU%c%d", s_session, NP_SEP, NP_SEP, 2 * s_me);
+            stat_open();
+            np_status("The network game ended.\n\nBringing your Journey Bag home: the game "
+                      "returns it to your save itself (about a minute) ...");
+            result = xbox_NetBagFinish(s_saves, s_root, s_saves_explicit, bag, detail,
+                                       sizeof detail);
+            stat_close();
+        } else if (s_is_host && !(kh && *kh == '0')) {
+            stat_open();
+            np_status("The network game ended.\n\nKeeping your progress ...");
+            result = xbox_NetBagHostCommit(s_saves, s_root, s_saves_explicit, s_session,
+                                           detail, sizeof detail);
+            stat_close();
+        }
+        if (result == 0)
+            code = 6;
+        snprintf(msg, sizeof msg, "The network game ended.%s%s", detail[0] ? "\n\n" : "",
+                 detail);
+    }
+    fprintf(stderr, "[NET] %s\n", msg);
+    fflush(stderr);
+    {
+        FILE *f = fopen("netplay_report.txt", "a");
+        if (f) {
+            fprintf(f, "%s\n", msg);
+            fclose(f);
+        }
+    }
+    if (!getenv("RECOMP_HEADLESS"))
+        MessageBoxA(NULL, msg, "Blinx 2 network game",
+                    MB_OK | (code ? MB_ICONWARNING : MB_ICONINFORMATION) | MB_TOPMOST);
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    return 0;
+}
+
+/* At the end frame's first pad report: stop here for good, and start the end. */
+static void end_reached(uint32_t f)
+{
+    if (!InterlockedExchange(&s_ending, 1)) {
+        PkDone d;
+        char mu[MAX_PATH];
+        memset(&d, 0, sizeof d);
+        d.type = PK_DONE;
+        d.player = (uint8_t)s_me;
+        d.frame = f;
+        d.guest = hash_guest(f);
+        snprintf(mu, sizeof mu, "%s%cMU", s_session, NP_SEP);
+        d.mu = xbox_NetBagHashTree(mu);
+        fprintf(stderr, "[NET] stopped at the end, frame %u%s: guest %016llX, memory "
+                "units %016llX\n", f, f == s_end_frame ? "" : " (LATE: no clean end)",
+                (unsigned long long)d.guest, (unsigned long long)d.mu);
+        fflush(stderr);
+        note_done(&d);
+        CloseHandle(CreateThread(NULL, 0, end_thread, NULL, 0, NULL));
+    }
+    for (;;)
+        Sleep(1000);                              /* the game stays stopped */
+}
+
 /* The emulated pad of `port` for the current frame (usb_gamepad.c): exactly
  * that player's input, waited for if it has not arrived. Runs in the OHCI
  * agent's turn, so a wait pauses the whole guest, the same on every peer. */
@@ -1285,6 +1640,23 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
     DWORD t0;
     LARGE_INTEGER q0;
     int waited;
+
+    /* RECOMP_NET_TEST_END=<frame> (testing): the host ends the game there. */
+    if (s_is_host) {
+        static int te = -1;
+        static uint32_t at;
+        if (te < 0) {
+            const char *e = getenv("RECOMP_NET_TEST_END");
+            te = e && *e;
+            at = te ? (uint32_t)atoi(e) : 0;
+        }
+        if (te && f >= at) {
+            te = 0;
+            xbox_NetplayEnd();
+        }
+    }
+    if (s_end_frame && f >= s_end_frame)
+        end_reached(f);                           /* does not return */
 
     /* RECOMP_NET_TEST_CHEAT=<frame> (testing the cheat path): this peer sends
      * three requests (op 0xEE, ignored by cheats.c) at that frame; every

@@ -68,7 +68,7 @@ add_subdirectory(src/input)
 
 # Network play: lockstep input over UDP (RECOMP_NET). Winsock on Windows,
 # BSD sockets elsewhere (src/net/net_os.h), so the two can play together.
-add_library(xbox_net STATIC src/net/netplay.c)
+add_library(xbox_net STATIC src/net/netplay.c src/net/netbag.c)
 target_include_directories(xbox_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
 target_link_libraries(xbox_net PUBLIC platform xbox_usb)
 if(WIN32)

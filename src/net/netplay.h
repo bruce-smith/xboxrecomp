@@ -2,6 +2,7 @@
 #ifndef XBOX_NETPLAY_H
 #define XBOX_NETPLAY_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -34,6 +35,27 @@ int xbox_NetplayPadState(int port, uint8_t *state18);
  * one was returned; call it in a loop at the poll and apply each. */
 int xbox_NetplayCheatSend(const uint8_t ev[22]);
 int xbox_NetplayCheatNext(uint8_t ev[22]);
+
+/* Journey Bags (netbag.c): a joiner's own team, made and returned by the
+ * game's own code in headless passes, on a work copy of its saves. See the
+ * header of netbag.c. root: xbox_NetBagRoot's folder. */
+void xbox_NetBagRoot(const char *explicit_save_dir, char *out, size_t n);
+/* The game folder (main.c), and this player's real saves and netbag folder. */
+void xbox_NetplaySetGameDir(const char *dir);
+void xbox_NetBagPaths(char *saves, size_t sn, char *root, size_t rn, int *explicit_dir);
+int  xbox_NetBagPrepare(const char *saves, const char *root, int slot, char *why, size_t n);
+int  xbox_NetBagReady(const char *root, char *bagdir, size_t n);
+int  xbox_NetBagFinish(const char *saves, const char *root, int explicit_dir,
+                       const char *session_bag, char *msg, size_t n);
+int  xbox_NetBagHostBaseline(const char *saves, const char *root);
+int  xbox_NetBagHostCommit(const char *saves, const char *root, int explicit_dir,
+                           const char *session, char *msg, size_t n);
+int  xbox_NetBagRestoreLast(const char *saves, const char *root, char *msg, size_t n);
+uint64_t xbox_NetBagHashTree(const char *dir);
+/* The host ends the network game cleanly (the menu's End network game):
+ * every peer stops at the same frame, compares, and joiners take their
+ * Journey Bags home. 1 if an end was started. */
+int  xbox_NetplayEnd(void);
 
 #ifdef __cplusplus
 }

@@ -30,6 +30,10 @@
 #include <string.h>
 #include <math.h>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <thread>
 
 #include "imgui.h"
 #if defined(_WIN32)
@@ -42,6 +46,11 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 extern "C" int xbox_NetplayActive(void);           /* src/net */
 extern "C" int xbox_NetplayPlayer(void);
 extern "C" int xbox_NetplayPlayers(void);
+extern "C" int xbox_NetplayEnd(void);
+extern "C" void xbox_NetBagPaths(char *saves, size_t sn, char *root, size_t rn, int *explicit_dir);
+extern "C" int xbox_NetBagPrepare(const char *saves, const char *root, int slot, char *why,
+                                  size_t n);
+extern "C" int xbox_NetBagRestoreLast(const char *saves, const char *root, char *msg, size_t n);
 extern "C" int xbox_settings_enum(const char *section, int i, const char **key,
                                   const char **label, int *type, int *lo, int *hi,
                                   const char *const **names, int *n,
@@ -422,8 +431,10 @@ void section_cheats()
  * starts from power-on for everyone, so starting one restarts the game with
  * RECOMP_NET set; during one, this shows who is who. */
 void start_network_game(int host, const char *addr, int port, int players, int delay,
-                        int vk_display, int render)
+                        int vk_display, int render, const char *bag, int keep_host)
 {
+    /* bag: a joiner's Journey Bag (src/net/netbag.c): "ready" (made by this
+     * menu), or "0" for none. keep_host: the host keeps its progress. */
     /* render: the host's choice for every player, 0 Compatibility (software),
      * 1 Fast (depth-only), 2 Fastest (fixed visibility answers). */
     static const char *const k_render[] = { "software", "depth", "fixed" };
@@ -443,6 +454,8 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     setenv("RECOMP_NET_DELAY", v, 1);
     setenv("RECOMP_NET_VK", vk_display ? "1" : "0", 1);
     setenv("RECOMP_NET_RENDER", rm, 1);   /* the host's choice */
+    setenv("RECOMP_NET_BAG", bag ? bag : "0", 1);
+    setenv("RECOMP_NET_KEEP_HOST", keep_host ? "1" : "0", 1);
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n > 0) {
         exe[n] = 0;
@@ -463,6 +476,8 @@ void start_network_game(int host, const char *addr, int port, int players, int d
     SetEnvironmentVariableA("RECOMP_NET_DELAY", v);
     SetEnvironmentVariableA("RECOMP_NET_VK", vk_display ? "1" : "0");
     SetEnvironmentVariableA("RECOMP_NET_RENDER", rm);
+    SetEnvironmentVariableA("RECOMP_NET_BAG", bag ? bag : "0");
+    SetEnvironmentVariableA("RECOMP_NET_KEEP_HOST", keep_host ? "1" : "0");
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     snprintf(dir, sizeof dir, "%s", exe);
     if ((slash = strrchr(dir, '\\')) != nullptr)
@@ -494,12 +509,43 @@ void start_network_game(int host, const char *addr, int port, int players, int d
 #endif
 }
 
+/* A joiner's Journey Bag, made in the background (src/net/netbag.c: the game
+ * itself creates it, headless, on a copy of this player's saves) while the
+ * player sets up the join. */
+static std::atomic<int> s_bag_state{0};          /* 0 none, 1 making, 2 ready, 3 failed */
+static std::mutex s_bag_mx;
+static std::string s_bag_why;
+static int s_bag_slot;
+static double s_bag_t0;
+
+static void bag_start(int slot)
+{
+    int st = s_bag_state.load();
+    if (st == 1 || !s_bag_state.compare_exchange_strong(st, 1))
+        return;
+    s_bag_slot = slot;
+    s_bag_t0 = ImGui::GetTime();
+    std::thread([slot] {
+        char saves[1024], root[1024], why[300] = "";
+        int ok;
+        xbox_NetBagPaths(saves, sizeof saves, root, sizeof root, nullptr);
+        ok = xbox_NetBagPrepare(saves, root, slot, why, sizeof why);
+        {
+            std::lock_guard<std::mutex> g(s_bag_mx);
+            s_bag_why = why;
+        }
+        s_bag_state = ok ? 2 : 3;
+    }).detach();
+}
+
 void section_network()
 {
-    static bool loaded;
-    static int mode, port, players, delay, render;
+    static bool loaded, keep_host, end_sent;
+    static int mode, port, players, delay, render, team;
     static bool vk_display;
     static char addr[64];
+    static int restore_click;
+    static std::string restore_msg;
     bool changed = false;
 
     if (xbox_NetplayActive()) {
@@ -508,7 +554,23 @@ void section_network()
         ImGui::TextWrapped("Every player runs the whole game and only pad input travels, "
                            "so everyone sees the same game. If the games ever drift apart, "
                            "the game stops and says so (netplay_report.txt next to the exe). "
-                           "Your own saves are not touched: a network game plays on a copy.");
+                           "A network game plays on a copy of the saves.");
+        ImGui::Separator();
+        if (xbox_NetplayPlayer() == 0) {
+            if (!end_sent) {
+                if (ImGui::Button("End network game"))
+                    end_sent = xbox_NetplayEnd() != 0;
+                ImGui::TextWrapped("Ends the game for everyone, cleanly. Players who brought "
+                                   "a Journey Bag then get it back into their own save (the "
+                                   "game returns it itself, and their save is backed up "
+                                   "first). Closing the window instead ends it without that.");
+            } else
+                ImGui::TextWrapped("Ending the network game ...");
+        } else
+            ImGui::TextWrapped("When the host ends the game (End network game), your "
+                               "Journey Bag, if you brought one, comes home into your own "
+                               "save by itself. If the game ends any other way, your save "
+                               "stays as it was.");
         return;
     }
     if (!loaded) {
@@ -520,6 +582,9 @@ void section_network()
         /* Fast (depth-only software + Vulkan display) by default. */
         render = xbox_setting_get("network", "render", 1);
         xbox_setting_get_str("network", "host", "192.168.1.2", addr, sizeof addr);
+        /* Your team: a Journey Bag from save 1 by default (0 = none). */
+        team = xbox_setting_get("network", "team", 1);
+        keep_host = xbox_setting_get("network", "keep_host", 1) != 0;
         loaded = true;
     }
     changed |= ImGui::RadioButton("Host a game", &mode, 0);
@@ -559,11 +624,59 @@ void section_network()
                                        : "Every PC draws the whole picture in software: the old "
                                          "way, for when Fast misbehaves. A slow PC slows the game "
                                          "for everyone.");
+        ImGui::Separator();
+        changed |= ImGui::Checkbox("Keep my progress from network games", &keep_host);
+        ImGui::TextWrapped("On (the default): everyone plays on a copy of your saves, and "
+                           "after a clean end (End network game, every player's game the "
+                           "same) your save gets this game's progress, after a backup, and "
+                           "only if the game loads it. Off: nothing from the network game "
+                           "is kept.");
     } else {
         ImGui::SetNextItemWidth(220.0f * s_scale);
         changed |= ImGui::InputText("Host's address", addr, sizeof addr);
         ImGui::TextWrapped("The host decides the number of players and the delay, and "
                            "sends its saves. You get the next free controller port.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Your team (a Journey Bag, as on two Xboxes):");
+        {
+            int making = s_bag_state.load() == 1;
+            if (making)
+                ImGui::BeginDisabled();
+            changed |= ImGui::RadioButton("Save 1", &team, 1);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton("Save 2", &team, 2);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton("None (play on the host's save)", &team, 0);
+            if (making)
+                ImGui::EndDisabled();
+        }
+        if (team) {
+            int st = s_bag_state.load();
+            if (st == 0 || (st == 2 && s_bag_slot != team))
+                bag_start(team);
+            st = s_bag_state.load();
+            if (st == 1) {
+                int secs = (int)(ImGui::GetTime() - s_bag_t0);
+                ImGui::TextWrapped("Packing your Journey Bag from save %d ... %d s (the game "
+                                   "makes it itself, in the background: about a minute).",
+                                   s_bag_slot, secs);
+            } else if (st == 2) {
+                ImGui::TextWrapped("Your Journey Bag from save %d is packed. After a clean "
+                                   "end it comes back into save %d with this game's "
+                                   "progress (the game returns it; your save is backed up "
+                                   "first).", s_bag_slot, s_bag_slot);
+            } else if (st == 3) {
+                std::string why;
+                {
+                    std::lock_guard<std::mutex> g(s_bag_mx);
+                    why = s_bag_why;
+                }
+                ImGui::TextWrapped("Your Journey Bag could not be made: %s",
+                                   why.empty() ? "unknown error" : why.c_str());
+                if (ImGui::Button("Try again"))
+                    bag_start(team);
+            }
+        }
     }
     changed |= ImGui::Checkbox("Vulkan display (AA) in Compatibility games", &vk_display);
     ImGui::TextWrapped("Off: the software renderer draws and shows the game. On: it still "
@@ -578,14 +691,44 @@ void section_network()
         xbox_setting_set("network", "players", players);
         xbox_setting_set("network", "delay", delay);
         xbox_setting_set_str("network", "host", addr);
+        xbox_setting_set("network", "team", team);
+        xbox_setting_set("network", "keep_host", keep_host ? 1 : 0);
         xbox_settings_save();
     }
     ImGui::Separator();
     ImGui::TextWrapped("Starting restarts the game: everyone begins from power-on together, "
                        "and the host's game waits until every player has joined.");
-    if (ImGui::Button(mode == 0 ? "Start network game (host)" : "Join network game"))
-        start_network_game(mode == 0, addr, port, players, delay, vk_display ? 1 : 0,
-                           render);
+    {
+        /* A joiner with a team waits for its Journey Bag. */
+        bool wait = mode == 1 && team && !(s_bag_state.load() == 2 && s_bag_slot == team);
+        if (wait)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(mode == 0 ? "Start network game (host)" : "Join network game"))
+            start_network_game(mode == 0, addr, port, players, delay, vk_display ? 1 : 0,
+                               render, mode == 1 && team ? "ready" : "0",
+                               mode == 0 && keep_host);
+        if (wait)
+            ImGui::EndDisabled();
+    }
+    ImGui::Separator();
+    if (ImGui::Button(restore_click ? "Click again to restore the save"
+                                    : "Restore my save from before the last network game")) {
+        if (!restore_click)
+            restore_click = 1;
+        else {
+            char saves[1024], root[1024], msg[600];
+            xbox_NetBagPaths(saves, sizeof saves, root, sizeof root, nullptr);
+            xbox_NetBagRestoreLast(saves, root, msg, sizeof msg);
+            restore_msg = msg;
+            restore_click = 0;
+        }
+    }
+    if (!restore_msg.empty())
+        ImGui::TextWrapped("%s", restore_msg.c_str());
+    else
+        ImGui::TextWrapped("Puts back the save a network game last changed (a returned "
+                           "Journey Bag, or the host's kept progress), from its backup. "
+                           "Restart the game afterwards.");
 }
 
 void section_about()
