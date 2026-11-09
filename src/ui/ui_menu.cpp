@@ -47,6 +47,8 @@ extern "C" int xbox_NetplayActive(void);           /* src/net */
 extern "C" int xbox_NetplayPlayer(void);
 extern "C" int xbox_NetplayPlayers(void);
 extern "C" int xbox_NetplayEnd(void);
+extern "C" int xbox_NetplayEndNow(void);
+extern "C" const char *xbox_NetplayEndStatus(void);
 extern "C" void xbox_NetBagPaths(char *saves, size_t sn, char *root, size_t rn, int *explicit_dir);
 extern "C" int xbox_NetBagPrepare(const char *saves, const char *root, int slot, char *why,
                                   size_t n);
@@ -564,8 +566,13 @@ void section_network()
                                    "a Journey Bag then get it back into their own save (the "
                                    "game returns it itself, and their save is backed up "
                                    "first). Closing the window instead ends it without that.");
-            } else
-                ImGui::TextWrapped("Ending the network game ...");
+            } else {
+                const char *st = xbox_NetplayEndStatus();
+                ImGui::TextWrapped("%s", st ? st : "Ending the network game ...");
+                if (st && strncmp(st, "Ending", 6)
+                    && ImGui::Button("End now anyway (this match's Journey Bags are not saved)"))
+                    xbox_NetplayEndNow();
+            }
         } else
             ImGui::TextWrapped("When the host ends the game (End network game), your "
                                "Journey Bag, if you brought one, comes home into your own "

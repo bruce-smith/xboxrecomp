@@ -58,6 +58,13 @@ int  xbox_NetBagHomeClash(const char *bagdir, const char *saves, char *id, size_
  * every peer stops at the same frame, compares, and joiners take their
  * Journey Bags home. 1 if an end was started. */
 int  xbox_NetplayEnd(void);
+/* The title's gate for that (Blinx 2: not during a match, so the Journey
+ * Bags are saved): 1 when ending is safe now, else 0 and why. With a gate,
+ * xbox_NetplayEnd waits for it; xbox_NetplayEndNow does not. Status for the
+ * menu: NULL when no end is under way. */
+void xbox_NetplaySetEndGate(int (*gate)(uint32_t frame, char *why, size_t n));
+int  xbox_NetplayEndNow(void);
+const char *xbox_NetplayEndStatus(void);
 
 #ifdef __cplusplus
 }

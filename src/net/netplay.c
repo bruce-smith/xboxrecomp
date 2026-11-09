@@ -310,7 +310,51 @@ static void note_done(const PkDone *d)
     ReleaseSRWLockExclusive(&s_lock);
 }
 
+/* The title's say on when ending is safe (xbox_NetplaySetEndGate): Blinx 2
+ * writes the Journey Bags on the team-select screen after a match, so an end
+ * during a match would lose them. Asked on the host at each frame while an
+ * end is pending; it reads guest state only. */
+static int (*s_end_gate)(uint32_t frame, char *why, size_t n);
+static volatile LONG s_end_pending;
+static char s_end_why[160];
+
+void xbox_NetplaySetEndGate(int (*gate)(uint32_t frame, char *why, size_t n))
+{
+    s_end_gate = gate;
+}
+
+const char *xbox_NetplayEndStatus(void)
+{
+    return s_end_frame ? "Ending the network game ..."
+         : s_end_pending ? s_end_why : NULL;
+}
+
+static int end_now(void);
+
 int xbox_NetplayEnd(void)
+{
+    if (!s_on || !s_is_host || s_end_frame)
+        return 0;
+    if (!s_end_gate)
+        return end_now();
+    snprintf(s_end_why, sizeof s_end_why, "Waiting for a safe point to end ...");
+    if (!InterlockedExchange(&s_end_pending, 1)) {
+        fprintf(stderr, "[NET] the host asked to end the network game; waiting for the "
+                "title's safe point\n");
+        fflush(stderr);
+    }
+    return 1;
+}
+
+int xbox_NetplayEndNow(void)
+{
+    if (!s_on || !s_is_host || s_end_frame)
+        return 0;
+    fprintf(stderr, "[NET] the host ends the network game now, without waiting\n");
+    return end_now();
+}
+
+static int end_now(void)
 {
     PkEnd e;
     int k;
@@ -1660,6 +1704,15 @@ int xbox_NetplayPadState(int port, uint8_t *state18)
         if (te && f >= at) {
             te = 0;
             xbox_NetplayEnd();
+        }
+        /* A pending end goes once the title says it is safe. */
+        if (s_end_pending && !s_end_frame && s_end_gate) {
+            char why[160] = "";
+            if (s_end_gate(f, why, sizeof why)) {
+                fprintf(stderr, "[NET] frame %u: safe to end\n", f);
+                end_now();
+            } else if (why[0])
+                snprintf(s_end_why, sizeof s_end_why, "%s", why);
         }
     }
     if (s_end_frame && f >= s_end_frame)
