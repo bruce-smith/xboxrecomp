@@ -52,6 +52,8 @@ int  xbox_NetBagHostCommit(const char *saves, const char *root, int explicit_dir
                            const char *session, char *msg, size_t n);
 int  xbox_NetBagRestoreLast(const char *saves, const char *root, char *msg, size_t n);
 uint64_t xbox_NetBagHashTree(const char *dir);
+/* 1 (and the save's folder) if one of `saves` is the home of the bag in bagdir. */
+int  xbox_NetBagHomeClash(const char *bagdir, const char *saves, char *id, size_t n);
 /* The host ends the network game cleanly (the menu's End network game):
  * every peer stops at the same frame, compares, and joiners take their
  * Journey Bags home. 1 if an end was started. */

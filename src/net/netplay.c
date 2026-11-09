@@ -1010,6 +1010,13 @@ static int handshake_host(int port, const char *save_src)
                 s_bag_mask |= 1u << p;
                 fprintf(stderr, "[NET] player %d brought a Journey Bag (%d files, %016llX)\n",
                         p + 1, files, (unsigned long long)xbox_NetBagHashTree(mu));
+                {
+                    char home[128];
+                    if (xbox_NetBagHomeClash(mu, s_session, home, sizeof home))
+                        fprintf(stderr, "[NET] warning: player %d's Journey Bag has its home "
+                                "among the host's saves (%s): the game would put that "
+                                "player's results there, not into the bag\n", p + 1, home);
+                }
             } else
                 fprintf(stderr, "[NET] player %d brought no Journey Bag\n", hdr[0] + 1);
             cs[nc++] = c;

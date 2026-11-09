@@ -654,6 +654,67 @@ int xbox_NetBagPrepare(const char *saves, const char *root, int slot, char *why,
     return 1;
 }
 
+/* Blinx 2: Create writes a 16-byte token at 0x83CC into the bag and its home
+ * save (and sets the home's 0x83C4 to 1). A console that holds the bag's home
+ * banks a match's result there, not into the bag (P11, 2026-11-08). The
+ * joiner made its bag on its own copy, so the host should never hold that
+ * home; if it does, say so: the result would land in the host's save.
+ * Returns 1 and the save's folder name on a match. */
+static int first_data_file(const char *dir, char *out, size_t n)
+{
+    NpDir d;
+    int found = 0;
+    if (!np_dir_open(&d, dir))
+        return 0;
+    while (!found && np_dir_next(&d)) {
+        char p[MAX_PATH];
+        join_path(p, sizeof p, dir, d.name);
+        if (d.is_dir)
+            found = first_data_file(p, out, n);
+        else if (!strcmp(d.name, "blinx2data.bin")) {
+            snprintf(out, n, "%s", p);
+            found = 1;
+        }
+    }
+    np_dir_close(&d);
+    return found;
+}
+
+int xbox_NetBagHomeClash(const char *bagdir, const char *saves, char *id, size_t n)
+{
+    unsigned char tok[16], other[16];
+    char bagfile[MAX_PATH];
+    SaveSum s[64];
+    int ns, i, clash = 0;
+    FILE *f;
+    if (!first_data_file(bagdir, bagfile, sizeof bagfile) || !(f = fopen(bagfile, "rb")))
+        return 0;
+    fseek(f, 0x83CC, SEEK_SET);
+    i = fread(tok, 1, 16, f) == 16;
+    fclose(f);
+    if (!i)
+        return 0;
+    ns = save_sums(saves, s, 64);
+    for (i = 0; i < ns && !clash; i++) {
+        char p[MAX_PATH];
+        unsigned char flag = 0;
+        snprintf(p, sizeof p, "%s%cUDATA%c%s%cblinx2data.bin", saves, NP_SEP, NP_SEP, s[i].id,
+                 NP_SEP);
+        if (!(f = fopen(p, "rb")))
+            continue;
+        fseek(f, 0x83C4, SEEK_SET);
+        if (fread(&flag, 1, 1, f) == 1 && flag == 1) {
+            fseek(f, 0x83CC, SEEK_SET);
+            if (fread(other, 1, 16, f) == 16 && !memcmp(tok, other, 16)) {
+                snprintf(id, n, "%s", s[i].id);
+                clash = 1;
+            }
+        }
+        fclose(f);
+    }
+    return clash;
+}
+
 int xbox_NetBagReady(const char *root, char *bagdir, size_t n)
 {
     char work[MAX_PATH], ready[MAX_PATH], mu[MAX_PATH];
