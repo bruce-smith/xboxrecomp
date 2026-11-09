@@ -982,6 +982,8 @@ int      xbox_MuMaskFor(int sched_mode);   /* the recorder, while writing its he
 uint32_t xbox_MuMount(uint32_t port, uint32_t slot, char *drive);
 uint32_t xbox_MuUnmount(uint32_t port, uint32_t slot);
 int      xbox_SchedMuMask(void);   /* a replay's recorded mask, or -1 */
+int      xbox_SchedUsbLayout(void);  /* a replay's recorded pad layout, or -1 */
+int      xbox_UsbLayoutFor(int sched_mode);   /* usb/ohci.c: (layout << 8) | pads */
 BOOL     xbox_path_mkdirs(const char* xbox_path);
 
 /* ============================================================================

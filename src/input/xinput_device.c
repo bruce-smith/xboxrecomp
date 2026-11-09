@@ -270,6 +270,16 @@ int xbox_input_blocked(void)
     return s_blocked != 0;
 }
 
+/* What drives controller port `port` (0-3): its host pad (-1 none) and whether
+ * the keyboard does (usb/ohci.c: how many emulated pads to plug in). */
+void xbox_input_port_use(int port, int *pad, int *keyboard)
+{
+    XboxPortMap m;
+    xbox_input_map_get(port, &m);
+    *pad = m.pad;
+    *keyboard = m.keyboard;
+}
+
 int xbox_input_host_pad_connected(int pad)
 {
     XINPUT_STATE st;

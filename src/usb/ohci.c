@@ -172,12 +172,61 @@ static int s_npads = 1;          /* RECOMP_USB_PADS */
 
 /* The root-hub port XAPI numbers controller port N+1 -- measured in Blinx 2's
  * four-player split screen, and the same table xemu uses: root ports 3, 4,
- * 1, 2 are players 1-4. With more than one pad, pad N goes where the game
- * looks for player N; a single pad keeps root port 1 (titles take player 1
- * from any port, and recorded inputs depend on its enumeration). */
+ * 1, 2 are players 1-4. Pad N goes where the game looks for player N.
+ *
+ * The layout (xbox_UsbLayoutFor): 1 = pads on those player ports, a 4-port
+ * root hub, as many pads as the menu's controller ports in use (the keyboard
+ * on, or a connected host pad), more plugged in live when a port comes into
+ * use. 0 = the old layout: one pad on root port 1 of a 2-port hub, which
+ * XAPI calls controller 3 -- a single player did not notice, two players in
+ * Vs. did. Recordings made before the layout was recorded (sched.c tag 0x05)
+ * replay with the old one, as do input replays. */
 static const unsigned k_player_port[4] = { 2, 3, 0, 1 };
+static int s_layout = 1;
+static int s_pads_fixed;         /* no live plugging: a recording, replay, game */
 static int s_enabled;
 static int s_trace;
+
+/* src/input: the menu's controller ports. */
+extern void xbox_input_port_use(int port, int *pad, int *keyboard);
+extern int  xbox_input_host_pad_connected(int pad);
+
+/* How many controller ports are in use: the highest with the keyboard on, or
+ * with a host pad that is connected. At least 1. */
+static int ohci_ports_wanted(void)
+{
+    int p, want = 1;
+    for (p = 0; p < 4; p++) {
+        int pad = -1, kb = 0;
+        xbox_input_port_use(p, &pad, &kb);
+        if (kb || (pad >= 0 && xbox_input_host_pad_connected(pad)))
+            want = p + 1;
+    }
+    return want;
+}
+
+int xbox_SchedUsbLayout(void);           /* sched.c: a replay's, or -1 */
+
+/* (layout << 8) | pads, decided once. sched_mode: the scheduler's mode, which
+ * the recorder passes in while writing its header (asking xbox_SchedMode()
+ * there would re-enter its one-time init). */
+int xbox_UsbLayoutFor(int sched_mode)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *padspec = getenv("RECOMP_USB_PADS");
+        int rec = sched_mode == 2 ? xbox_SchedUsbLayout() : -1;
+        if (padspec && atoi(padspec) >= 1 && atoi(padspec) <= USB_GAMEPAD_MAX)
+            v = (1 << 8) | atoi(padspec);
+        else if (sched_mode == 2)
+            v = rec >= 0 ? rec : (0 << 8) | 1;     /* recorded before the tag: old */
+        else if (getenv("RECOMP_INPUT_REPLAY"))
+            v = (0 << 8) | 1;
+        else
+            v = (1 << 8) | ohci_ports_wanted();
+    }
+    return v;
+}
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -1229,7 +1278,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * mapping can be found by measurement rather than assumed. */
             const char *pspec = getenv("RECOMP_USB_PORT");
             unsigned port = pspec ? (unsigned)atoi(pspec)
-                          : s_npads > 1 ? k_player_port[0] : 0u;
+                          : s_layout ? k_player_port[0] : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             STATUS_SET(hc, INTR_RHSC);
@@ -1246,10 +1295,28 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * configured, on the next port, so the driver enumerates them in
          * turn and there is only ever one device at the default address.
          * RECOMP_USB_PADS sets how many (1-4). */
+        /* A controller port that came into use (the menu, a host pad plugged
+         * in) gets its pad now; checked once a second, since asking XInput
+         * about an empty slot is slow. Never in a recording, replay or
+         * network game, where the pads are part of what must repeat. */
+        if (plugged && !s_pads_fixed && s_npads < USB_GAMEPAD_MAX) {
+            static unsigned long last_check;
+            unsigned long now = (unsigned long)GetTickCount();
+            if (now - last_check >= 1000) {
+                int want = ohci_ports_wanted();
+                last_check = now;
+                if (want > s_npads) {
+                    fprintf(stderr, "  [OHCI0] controller port %d is in use now: plugging "
+                            "its pad in\n", want);
+                    fflush(stderr);
+                    s_npads = want;
+                }
+            }
+        }
         if (plugged && s_plugged_pads < s_npads
             && usb_gamepad_configured(s_plugged_pads - 1)) {
             if (++settle > 50) {                 /* ~1 s after the last */
-                unsigned port = s_npads > 1 ? k_player_port[s_plugged_pads]
+                unsigned port = s_layout ? k_player_port[s_plugged_pads]
                               : (first_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
                 STATUS_SET(hc, INTR_RHSC);
@@ -1459,17 +1526,22 @@ void xbox_OhciInit(void)
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
-        const char *padspec = getenv("RECOMP_USB_PADS");
+        int mode = xbox_SchedMode(), lv = xbox_UsbLayoutFor(mode);
+        s_layout = lv >> 8;
+        s_npads = lv & 0xFF;
+        if (s_npads < 1 || s_npads > USB_GAMEPAD_MAX)
+            s_npads = 1;
+        s_pads_fixed = mode != 0 || getenv("RECOMP_USB_PADS") != NULL
+                    || getenv("RECOMP_INPUT_REPLAY") != NULL;
+        s_ndp = s_layout || s_npads > 1 ? 4 : OHCI_PORTS;   /* every player's port */
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
-        if (padspec) {
-            int n = atoi(padspec);
-            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
-        }
-        if (s_npads > 1)
-            s_ndp = 4;                      /* every player's port */
+        fprintf(stderr, "  [OHCI] %d pad(s), %s%s\n", s_npads,
+                s_layout ? "on the player ports (pad N = controller N)"
+                         : "old layout (one pad on root port 1: controller 3)",
+                s_pads_fixed ? "" : "; more as controller ports come into use");
     }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);

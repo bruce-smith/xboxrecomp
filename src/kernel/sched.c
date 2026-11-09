@@ -56,6 +56,8 @@
  *                                               (level 3, below)
  *   0x04 varint mask                            the memory units present
  *                                               (kernel_mu.c); absent: none
+ *   0x05 varint (layout << 8) | pads            the USB pads (usb/ohci.c);
+ *                                               absent: one, the old layout
  *   0x01 varint agent, varint count            a run
  *   0x02 varint agent, varint kind, zigzag-varint delta   a value (delta
  *        from the previous value of that agent and kind)
@@ -105,6 +107,12 @@ static int s_io_letgo = 3;
 /* The memory units a recording was made with (tag 0x04, kernel_mu.c's
  * mask). A replay mounts the same; one without the tag, none. */
 static int s_mu_mask = -1;
+static int s_usb_layout = -1;            /* tag 0x05; -1 absent */
+
+int xbox_SchedUsbLayout(void)
+{
+    return s_mode == 2 ? s_usb_layout : -1;
+}
 
 int xbox_SchedMuMask(void)
 {
@@ -345,6 +353,7 @@ static int sched_load(const char *path)
     recomp_set_portable_math(0);
     s_io_letgo = 0;
     s_mu_mask = 0;                       /* absent: no memory unit */
+    s_usb_layout = -1;                   /* absent: the old pad layout */
     p = buf + 12;
     end = buf + size;
     s_runs = (SchedRun *)malloc(cap * sizeof(SchedRun));
@@ -386,6 +395,10 @@ static int sched_load(const char *path)
             q->kind[q->n] = (uint8_t)b;
             q->val[q->n] = prev;
             q->n++;
+        } else if (tag == 0x05) {
+            if (!sched_get_varint((const uint8_t **)&p, end, &a))
+                break;
+            s_usb_layout = (int)(a & 0xFFFFu);
         } else if (tag == 0x04) {
             if (!sched_get_varint((const uint8_t **)&p, end, &a))
                 break;
@@ -470,6 +483,8 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                                  | (s_io_letgo >= 3 ? 8u : 0u));
                 fputc(0x04, s_out);
                 sched_put_varint((uint64_t)xbox_MuMaskFor(1));
+                fputc(0x05, s_out);
+                sched_put_varint((uint64_t)xbox_UsbLayoutFor(1));
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));
