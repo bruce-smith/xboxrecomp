@@ -83,6 +83,8 @@ static const path_rule s_rules[] = {
     { "\\??\\Y:\\",                           0, NULL,         NULL          },
     { "\\??\\y:\\",                           0, NULL,         NULL          },
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
+    /* Memory units (kernel_mu.c): \Device\MU_<n> is <save dir>\MU\<n>. */
+    { "\\Device\\MU_",                        1, "\\MU",       "/MU"         },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 
@@ -566,6 +568,16 @@ translate:
 }
 
 /* ======================================================================== */
+/* Create the host directory an Xbox path names, with its parents. */
+BOOL xbox_path_mkdirs(const char* xbox_path)
+{
+    WCHAR host[MAX_PATH];
+    if (!xbox_translate_path(xbox_path, host, MAX_PATH))
+        return FALSE;
+    return SHCreateDirectoryExW(NULL, host, NULL) == ERROR_SUCCESS
+        || GetFileAttributesW(host) != INVALID_FILE_ATTRIBUTES;
+}
+
 #else /* !_WIN32  -- POSIX / Linux */
 /* ======================================================================== */
 
@@ -870,6 +882,16 @@ translate:
         xbox_remember_host_path(host_path_buf);
         return TRUE;
     }
+}
+
+/* Create the host directory an Xbox path names, with its parents. */
+BOOL xbox_path_mkdirs(const char* xbox_path)
+{
+    char host[MAX_PATH];
+    if (!xbox_translate_path(xbox_path, host, MAX_PATH))
+        return FALSE;
+    mkdir_p(host);
+    return TRUE;
 }
 
 #endif /* _WIN32 */

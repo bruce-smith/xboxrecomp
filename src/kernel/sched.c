@@ -52,6 +52,10 @@
  *                                               go of the CPU (xbox_SchedIoLetGo)
  *                                               bit 2: so do opens, queries and
  *                                               the other file calls
+ *                                               bit 3: but not the queries
+ *                                               (level 3, below)
+ *   0x04 varint mask                            the memory units present
+ *                                               (kernel_mu.c); absent: none
  *   0x01 varint agent, varint count            a run
  *   0x02 varint agent, varint kind, zigzag-varint delta   a value (delta
  *        from the previous value of that agent and kind)
@@ -87,12 +91,25 @@ static int s_mode = -1;                 /* 0 off, 1 record, 2 replay, 3 virtual 
  * console. Holding it, a slow disk stopped every other agent: a pack loader
  * held it for 3 s of 64 KB reads in a recorded boot, the USB control
  * transfer XPP was waiting for timed out meanwhile, and the boot stalled at
- * the logo movie. Level 2 adds opens, queries and the other host file
+ * the logo movie. Level 2 added opens, queries and the other host file
  * calls: on a loaded PC main held the CPU for 3 s at a time in boot's ~700
- * opens and probes, and USB came up 10 s late. Recordings say which level
- * they were made at (tag 0x03 bits 1 and 2); older ones used none and
- * replay as made. RECOMP_SCHED_IO_LETGO=0|1|2 picks the level to record. */
-static int s_io_letgo = 2;
+ * opens and probes, and USB came up 10 s late. But a query records host
+ * values (file times, disk space), and sched_value records only while the
+ * CPU is held: level 2's queries handed a replay the live values. Level 3
+ * (the default) lets go for opens, renames, deletes and flushes, and keeps
+ * the CPU for the queries. Recordings say which level they were made at
+ * (tag 0x03 bits 1-3); older ones used none, and each replays as made.
+ * RECOMP_SCHED_IO_LETGO=0|1|2|3 picks the level to record. */
+static int s_io_letgo = 3;
+
+/* The memory units a recording was made with (tag 0x04, kernel_mu.c's
+ * mask). A replay mounts the same; one without the tag, none. */
+static int s_mu_mask = -1;
+
+int xbox_SchedMuMask(void)
+{
+    return s_mode == 2 ? (s_mu_mask < 0 ? 0 : s_mu_mask) : -1;
+}
 
 /* Recording and replay only. In virtual mode time does not move during a
  * host read, so nothing times out, and a buffer still filling while another
@@ -327,6 +344,7 @@ static int sched_load(const char *path)
      * Likewise whether file I/O let go of the CPU: absent, it did not. */
     recomp_set_portable_math(0);
     s_io_letgo = 0;
+    s_mu_mask = 0;                       /* absent: no memory unit */
     p = buf + 12;
     end = buf + size;
     s_runs = (SchedRun *)malloc(cap * sizeof(SchedRun));
@@ -368,11 +386,15 @@ static int sched_load(const char *path)
             q->kind[q->n] = (uint8_t)b;
             q->val[q->n] = prev;
             q->n++;
+        } else if (tag == 0x04) {
+            if (!sched_get_varint((const uint8_t **)&p, end, &a))
+                break;
+            s_mu_mask = (int)(a & 0xFFFFFFu);
         } else if (tag == 0x03) {
             if (!sched_get_varint((const uint8_t **)&p, end, &a))
                 break;
             recomp_set_portable_math((int)(a & 1));
-            s_io_letgo = (a & 4) ? 2 : (int)((a >> 1) & 1);
+            s_io_letgo = (a & 8) ? 3 : (a & 4) ? 2 : (int)((a >> 1) & 1);
             if (a & 1)
                 fprintf(stderr, "  [SCHED] recorded with RECOMP_PORTABLE_MATH: "
                         "portable math on for this replay\n");
@@ -438,13 +460,16 @@ static BOOL CALLBACK sched_mode_init(PINIT_ONCE o, PVOID x, PVOID *c)
                 fwrite(&ver, 4, 1, s_out);
                 {   /* RECOMP_SCHED_IO_LETGO=0: record as older builds did */
                     const char *lg = getenv("RECOMP_SCHED_IO_LETGO");
-                    if (lg && *lg >= '0' && *lg <= '2')
+                    if (lg && *lg >= '0' && *lg <= '3')
                         s_io_letgo = *lg - '0';
                 }
                 fputc(0x03, s_out);
                 sched_put_varint((recomp_portable_math_enabled() ? 1u : 0u)
                                  | (s_io_letgo >= 1 ? 2u : 0u)
-                                 | (s_io_letgo >= 2 ? 4u : 0u));
+                                 | (s_io_letgo >= 2 ? 4u : 0u)
+                                 | (s_io_letgo >= 3 ? 8u : 0u));
+                fputc(0x04, s_out);
+                sched_put_varint((uint64_t)xbox_MuMaskFor(1));
                 mode = 1;
                 atexit(sched_atexit);
                 CloseHandle(CreateThread(NULL, 0, sched_flusher, NULL, 0, NULL));

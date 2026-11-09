@@ -16,6 +16,7 @@ set(KERNEL_SOURCES
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c
+    kernel_mu.c
     kernel_crypto.c
     kernel_thunks.c
     kernel_bridge.c

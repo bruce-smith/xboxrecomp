@@ -3355,13 +3355,41 @@ static int bridge_is_cdrom_device(const char *path)
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
 
-/* Opens, queries and the other host file calls let go of the guest CPU for
- * the host call when recording or replaying at level 2 (sched.c), as reads
- * do (NtReadFile). Only the host call: handle tokens are still handed out
+/* A memory unit's volume itself ("\??\F:", kernel_mu.c), which XAPI's
+ * XMUNameFromDriveLetter opens to read the unit's name with an FSCTL. The
+ * drive is a host folder, so the open gets a synthetic handle and
+ * bridge_NtFsControlFile answers for it. Before, the open failed quietly and
+ * the name stayed whatever was on the stack (drawn as a garbled band in the
+ * game's memory-unit list, and different from run to run). */
+#define BRIDGE_MU_HANDLE 0xDECD0100u
+
+static int bridge_is_mu_volume(const char *path)
+{
+    char link[8];
+    const char *t;
+    if (!path) return 0;
+    if (_strnicmp(path, "\\??\\", 4) == 0) path += 4;
+    if (strlen(path) != 2 || path[1] != ':') return 0;
+    snprintf(link, sizeof link, "\\??\\%c:", toupper((unsigned char)path[0]));
+    t = xbox_LookupSymbolicLink(link);
+    return t && _strnicmp(t, "\\Device\\MU_", 11) == 0;
+}
+
+/* Opens, renames, deletes and flushes let go of the guest CPU for the host
+ * call when recording or replaying at level 2 or 3 (sched.c), as reads do
+ * (NtReadFile). Only the host call: handle tokens are still handed out
  * holding it, in schedule order. */
 static int bridge_fs_letgo(void)
 {
     return xbox_SchedIoLetGo() >= 2 ? xbox_SchedBlockBegin() : 0;
+}
+
+/* Queries record host values (file times, disk space), which sched_value
+ * records only while the CPU is held, so only level 2 (recordings made that
+ * way) lets go for them. */
+static int bridge_query_letgo(void)
+{
+    return xbox_SchedIoLetGo() == 2 ? xbox_SchedBlockBegin() : 0;
 }
 
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
@@ -3387,6 +3415,13 @@ static NTSTATUS bridge_create_file_impl(
                 name.Buffer);
         if (handle_va)
             BRIDGE_MEM32(handle_va) = BRIDGE_CDROM_HANDLE;
+        bridge_write_iostatus(iostatus_va, 0, 1 /* FILE_OPENED */);
+        return 0;
+    }
+
+    if (bridge_is_mu_volume(name.Buffer)) {
+        if (handle_va)
+            BRIDGE_MEM32(handle_va) = BRIDGE_MU_HANDLE;
         bridge_write_iostatus(iostatus_va, 0, 1 /* FILE_OPENED */);
         return 0;
     }
@@ -3997,7 +4032,7 @@ static void bridge_NtQueryInformationFile(void)
         return;
     }
     {
-        int letgo = bridge_fs_letgo();
+        int letgo = bridge_query_letgo();
         g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
                     XBOX_TO_NATIVE(info_va), length,
                     (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -4206,7 +4241,7 @@ static void bridge_NtQueryVolumeInformationFile(void)
         return;
     }
     {
-        int letgo = bridge_fs_letgo();
+        int letgo = bridge_query_letgo();
         g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
                     XBOX_TO_NATIVE(info_va), length,
                     (XBOX_FS_INFORMATION_CLASS)infoclass);
@@ -4226,7 +4261,7 @@ static void bridge_NtQueryFullAttributesFile(void)
     bridge_build_oa(obj_attrs, &oa, &name);
     if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
     {
-        int letgo = bridge_fs_letgo();
+        int letgo = bridge_query_letgo();
         g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
                     (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
         xbox_SchedBlockEnd(letgo);
@@ -4288,7 +4323,7 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     {
-        int letgo = bridge_fs_letgo();
+        int letgo = bridge_query_letgo();
         g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
                     XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                     pfn, (BOOLEAN)restart);
@@ -4541,6 +4576,31 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    if (STACK_ARG(0) == BRIDGE_MU_HANDLE) {
+        /* A memory unit's volume (bridge_is_mu_volume): its metadata reads
+         * back zeroed, an unnamed unit, the same on every run and PC. The
+         * read (0x9411C, XMUNameFromDriveLetter) passes a 12-byte request
+         * {offset, length, buffer} as the input; any output buffer is
+         * cleared as well. */
+        uint32_t in_va = STACK_ARG(6), in_len = STACK_ARG(7);
+        uint32_t out_va = STACK_ARG(8), out_len = STACK_ARG(9);
+        uint32_t len = 0;
+        static int shown;
+        if (in_va && in_len >= 12) {
+            uint32_t buf = BRIDGE_MEM32(in_va + 8);
+            len = BRIDGE_MEM32(in_va + 4);
+            if (buf && len && bridge_buf_ok(buf, len, "NtFsControlFile"))
+                memset(XBOX_TO_NATIVE(buf), 0, len);
+        }
+        if (out_va && out_len && bridge_buf_ok(out_va, out_len, "NtFsControlFile"))
+            memset(XBOX_TO_NATIVE(out_va), 0, out_len);
+        if (!shown++)
+            fprintf(stderr, "  [MU] volume metadata (FSCTL 0x%X): %u bytes, unnamed\n",
+                    fsctl, len + out_len);
+        bridge_write_iostatus(ios_va, 0, out_len);
+        g_eax = 0;
+        return;
+    }
     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;

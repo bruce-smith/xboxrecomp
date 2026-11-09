@@ -975,6 +975,15 @@ NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName,
 const char* xbox_LookupSymbolicLink(const char* link);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
+/* Memory units at the XAPI level (kernel_mu.c): the slots holding one
+ * (XGetDevices' mask), XMountMU and XUnmountMU. */
+int      xbox_MuMask(void);
+int      xbox_MuMaskFor(int sched_mode);   /* the recorder, while writing its header */
+uint32_t xbox_MuMount(uint32_t port, uint32_t slot, char *drive);
+uint32_t xbox_MuUnmount(uint32_t port, uint32_t slot);
+int      xbox_SchedMuMask(void);   /* a replay's recorded mask, or -1 */
+BOOL     xbox_path_mkdirs(const char* xbox_path);
+
 /* ============================================================================
  * Crypto (kernel_crypto.c)
  * ============================================================================ */
