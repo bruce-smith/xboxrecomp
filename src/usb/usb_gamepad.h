@@ -52,4 +52,16 @@ int usb_gamepad_configured(int pad);
 void usb_gamepad_set_override(int (*fn)(int pad, uint8_t *state18));
 void usb_gamepad_sample_local(uint8_t *state18);
 
+/* A title-side filter on each live pad report (NULL: none, the default). fn
+ * gets the pad (0-3) and its 18 state bytes -- byte 0/1 the digital buttons,
+ * 2-9 the analog buttons (A, B, X, Y, Black, White, LT, RT), then four
+ * little-endian int16 sticks (LX, LY, RX, RY) -- after the host pad,
+ * keyboard and pad scripts and before the in-game menu's blanking, the
+ * guest-CPU schedule, the input recording and the network game. In a network
+ * game only this machine's own player is sampled, as pad 0
+ * (usb_gamepad_sample_local); the filter maps it to xbox_NetplayPlayer()'s
+ * port itself. It must decide from guest state alone, so every peer and
+ * every replay presses the same thing. */
+void usb_gamepad_set_filter(void (*fn)(int pad, uint8_t *state18));
+
 #endif /* XBOX_USB_GAMEPAD_H */

@@ -597,6 +597,16 @@ static void pad_rest_apply(int pad, uint8_t *out)
 
 static int usb_gamepad_report_live(int pad, uint8_t *out, int max);
 
+/* The title's own pad filter (usb_gamepad_set_filter): last word on what the
+ * host, keyboard and scripts said, before the in-game menu blanks it and
+ * before the schedule, the input recording and a network game see it. */
+static void (*s_pad_filter)(int pad, uint8_t *state18);
+
+void usb_gamepad_set_filter(void (*fn)(int pad, uint8_t *state18))
+{
+    s_pad_filter = fn;
+}
+
 /* The report, through the guest-CPU schedule (sched.c): what the host pad,
  * keyboard or script said is recorded -- one value when it is the same as
  * the last report, the 18 state bytes when it changed -- and a replay hands
@@ -645,11 +655,14 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     return n;
 }
 
-/* While the in-game menu is open the game sees nothing pressed: the host
- * pad and keyboard are blocked in xinput_device.c, and scripted input
- * (RECOMP_PAD_PRESS/_SCRIPT/_LIVE), added after them, here. */
-static void menu_blank(uint8_t *out)
+/* The title's filter has its say, then: while the in-game menu is open the
+ * game sees nothing pressed: the host pad and keyboard are blocked in
+ * xinput_device.c, and scripted input (RECOMP_PAD_PRESS/_SCRIPT/_LIVE),
+ * added after them, here. */
+static void menu_blank(int pad, uint8_t *out)
 {
+    if (s_pad_filter)
+        s_pad_filter(pad, out + 2);
     if (xbox_input_blocked())
         memset(out + 2, 0, 18);
 }
@@ -710,7 +723,7 @@ static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
         out[2] = synth;
         pad_rest_apply(pad, out);
         pad_script_apply(pad, out);
-        menu_blank(out);
+        menu_blank(pad, out);
         return 20;
     }
 
@@ -729,6 +742,6 @@ static int usb_gamepad_report_live(int pad, uint8_t *out, int max)
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_rest_apply(pad, out);
     pad_script_apply(pad, out);
-    menu_blank(out);
+    menu_blank(pad, out);
     return 20;
 }
